@@ -1,0 +1,7 @@
+[project]
+name = "unica-attention"
+version = "0.0.0"
+description = "Attention kernel made for one GPU: RTX 5080 (sm_120)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
