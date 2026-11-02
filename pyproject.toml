@@ -5,3 +5,23 @@ description = "Attention kernel made for one GPU: RTX 5080 (sm_120)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+
+[dependency-groups]
+bench = ["torch>=2.14"]
+
+[tool.uv]
+default-groups = ["bench"]
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["C408"]  # dict(qk="int8") presets read like the keyword arguments they become
