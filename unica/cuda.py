@@ -4,6 +4,7 @@ No C++ extension: nothing to rebuild for each torch version.
 """
 
 import ctypes
+import functools
 import os
 import subprocess
 from pathlib import Path
@@ -36,15 +37,28 @@ def cubin(name):
     return out.read_bytes()
 
 
+@functools.cache
+def _context():
+    """The device's primary context, the one torch works in. Retained once per process and never released:
+    torch keeps it alive anyway, and the driver frees it at exit."""
+    _check(_cuda.cuInit(0))
+    ctx = ctypes.c_void_p()
+    _check(_cuda.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), torch.cuda.current_device()))
+    return ctx
+
+
+@functools.cache
+def module(name):
+    """csrc/<name>.cu, loaded once per process and kept until exit, as Triton and torch keep theirs.
+    Without unloading, repeated calls do not pile up. A changed .cu takes effect in a new process."""
+    return Module(name)
+
+
 class Module:
-    """One .cubin loaded into torch's context. module["name"] gives a kernel."""
+    """One .cubin loaded into torch's context. module["name"] gives a kernel. Use module(), not this directly."""
 
     def __init__(self, name):
-        # torch works in the device's primary context; load into the same one
-        _check(_cuda.cuInit(0))
-        ctx = ctypes.c_void_p()
-        _check(_cuda.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), torch.cuda.current_device()))
-        _check(_cuda.cuCtxSetCurrent(ctx))
+        _check(_cuda.cuCtxSetCurrent(_context()))
         self._image = cubin(name)  # keeps the bytes alive while the module exists
         self._mod = ctypes.c_void_p()
         _check(_cuda.cuModuleLoadData(ctypes.byref(self._mod), self._image))
@@ -52,12 +66,13 @@ class Module:
     def __getitem__(self, name):
         f = ctypes.c_void_p()
         _check(_cuda.cuModuleGetFunction(ctypes.byref(f), self._mod, name.encode()))
-        return Kernel(f)
+        return Kernel(f, self)
 
 
 class Kernel:
-    def __init__(self, f):
+    def __init__(self, f, module):
         self.f = f
+        self.module = module  # a CUfunction is valid only while its CUmodule is loaded
 
     def __call__(self, grid, block, *args, smem=0):
         """Launch on torch's current stream. Tensors go as pointers, int as int32, float as float32;

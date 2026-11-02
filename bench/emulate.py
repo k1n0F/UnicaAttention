@@ -59,12 +59,11 @@ def to_fmt(x, fmt):
 
 
 def quant(x, fmt, block):
-    """Quantize, then dequantize. Since the scale is constant along d, (q̂·s_q)·(k̂·s_k)
-    equals s_q·s_k·(q̂·k̂) up to FP32 rounding."""
+    """x ≈ x̂ · s: values x̂ as they enter the MMA, and a scale s per token, [..., N, 1]."""
     if fmt is None:
-        return x
+        return x, torch.ones_like(x[..., :1])
     s = token_scale(x, block, QMAX[fmt])
-    return to_fmt(x / s, fmt) * s
+    return to_fmt(x / s, fmt), s
 
 
 def emulate(
@@ -100,7 +99,7 @@ def emulate(
     q, k, v = q.float(), k.float(), v.float()
     if smooth_k:
         k = k - k.mean(-2, keepdim=True)
-    q, k = quant(q, qk, q_block), quant(k, qk, k_block)
+    (q, sq), (k, sk) = quant(q, qk, q_block), quant(k, qk, k_block)
     if v_fmt:
         sv = (v.abs().amax(-2, keepdim=True) / QMAX[v_fmt]).clamp_min(1e-12)
         v = to_fmt(v / sv, v_fmt)
@@ -115,7 +114,10 @@ def emulate(
     o = torch.zeros_like(q)
     overflow = torch.zeros((), dtype=torch.bool, device=q.device)
     for j in range(0, k.shape[-2], bc):
-        s = q @ k[..., j : j + bc, :].transpose(-1, -2) * scale
+        # the kernel's formula: an MMA over d, then the outer product of the per-token scales.
+        # For int8, q̂·k̂ is an integer with |q̂·k̂| ≤ 127²·128 < 2²⁴, so the FP32 GEMM gives exactly the INT32 MMA result
+        kt, skt = k[..., j : j + bc, :].transpose(-1, -2), sk[..., j : j + bc, :].transpose(-1, -2)
+        s = (q @ kt) * (sq * skt) * scale
         m_new = torch.maximum(m, s.amax(-1, keepdim=True))
         m_p = s.amax(-1, keepdim=True) if p_local else m_new
         alpha, beta = torch.exp2(m - m_new), torch.exp2(m_p - m_new)

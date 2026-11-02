@@ -7,7 +7,10 @@ requires-python = ">=3.10"
 dependencies = []
 
 [dependency-groups]
-bench = ["torch>=2.14"]
+bench = [
+    "torch==2.14.0",  # the SageAttention wheels are built against this ABI
+    "triton-windows==3.7.0.post26; sys_platform == 'win32'",  # SageAttention 2 imports triton
+]
 
 [tool.uv]
 default-groups = ["bench"]
