@@ -640,6 +640,62 @@ the rounding and the emulator. Not part of this step.
   the remaining 12 % of rescales and the vote. At ~1 cycle per instruction that is at most ~0.3 % more: not
   worth giving up bit-exactness with the emulator for.
 
+## M3.10 — what the softmax and the loads do in every tile (prediction, before implementation)
+
+The usual path of a tile (M3.9) is 609 instructions: 64 IMMA, 96 I2FP and 36 MUFU (free or on their own
+pipes), and the rest. Reading the SASS, three things run in every tile but are needed in few or none:
+
+| | per tile | why it is there |
+|---|---|---|
+| mask of the last tile: 32 `FSEL` + 16 `ISETP` | ~48 | `if (n_valid < KEYS_PER_TILE) mask_scores(...)`, but ptxas turned the branch into predicates: the mask is computed in every tile and selects nothing |
+| bounds checks of the next tile's copies: `ISETP`, `SEL`, `IADD`, `MOV RZ` | ~15 | key < n_keys for each 16-byte copy, true for every tile but the last |
+| moving the V fragments into pairs: `MOV` | ~48 | `ldmatrix` returns {r0, r1, r2, r3}, the IMMA wants {r0, r2} and {r1, r3} in adjacent registers |
+
+**M3.10 (this step) takes the first two:**
+
+- The last, partial tile goes through the loop body once more, after the loop, with the mask compiled in.
+  Full tiles are compiled without it. Switch `UNICA_PEEL_LAST_TILE`, default 1.
+- Copies past n_keys read the last key again instead of being zero-filled. Their scores are masked, so
+  their P is 0 and the values do not matter (int8 has no NaN). One clamp per copy instead of a check and a
+  select.
+
+The pairs of V are the next step: they need a different V8 layout.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | **identical bit for bit** (no value that reaches the output changes) |
+| usual path SASS | 609 → **~550** (−48 mask, −~10 loads) |
+| registers | ~224, no spills |
+| kernel time | **−2 … −3 %**: ~58 instructions at ~1.2 cycles (M3.9) of ~3200 cycles per tile |
+
+## M3.10 — result: the premise was wrong, nothing kept
+
+- **The mask was never computed in full tiles.** It sits behind a real uniform branch
+  (`BRA.U !UP0` around the `ISETP` / `FSEL` block), which the "usual path" count of M3.9 did not take out. My
+  misreading of the SASS, not ptxas. The executed count says the same: ncu gives **569** instructions per
+  warp and tile, not the 609 + 12 % · 64 = 617 of the static count. So the usual path of M3.9 is ~569, and
+  the mask was never among them.
+- What remained were the bounds checks of the copies, ~6 instructions per tile. Three builds, ncu (4
+  heads, 2 runs each, identical within 0.1 %) and compare.py:
+
+| build | active cycles | instructions | tensor pipe | compare.py kernel |
+|---|---|---|---|---|
+| M3.9 | 20.01 M | 2.390 G | 63.9 % | 86.4 / 87.1 ms |
+| clamp, loop written as a lambda with the last tile peeled | 20.50 M (**+2.5 %**) | 2.349 G | 62.3 % | 88.0 / 88.1 ms |
+| clamp, same lambda, last tile not peeled | 19.83 M (−0.8 %) | 2.361 G | 64.5 % | 84.6 ms (spread 8–14 %) |
+| clamp, M3.9's loop as it was | 20.36 M (**+1.7 %**) | 2.365 G (−1.1 %) | 62.8 % | 88.0 / 88.1 ms |
+
+- **Finding: ±2 % comes from how ptxas lays out the code, whatever the instruction count.** The same
+  −1.1 % of instructions is −0.8 % in one build and +1.7 % in another, and the peeled loop, with the fewest
+  instructions, is the slowest. A change of a few instructions per tile cannot be told from this
+  scheduling noise. It is not kept: the code is back to M3.9. A step must remove clearly more than ~2 %
+  of the instructions for its effect to be readable.
+- Next by the same reading: the ~48 `MOV` that pair the V fragments for the P·V IMMA (~8 % of the
+  executed instructions). Before predicting it, the executed count of what they cost will be checked
+  first, not only the static SASS.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
