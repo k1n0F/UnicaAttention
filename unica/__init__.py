@@ -18,10 +18,18 @@ WARPS_PER_BLOCK = 4  # these three must match csrc/flash.cu
 ROWS_PER_BLOCK = WARPS_PER_BLOCK * 16
 LOG2E = 1.4426950408889634
 
+# Every variant in csrc/flash.cu with the attention() signature, oldest first. All take the same grid
+# and block; bench/compare.py times them side by side.
+KERNELS = ("attention", "attention_smem")
+DEFAULT_KERNEL = "attention_smem"
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str = DEFAULT_KERNEL) -> torch.Tensor:
     """softmax(q · kᵀ / sqrt(d)) · v, non-causal. q is [batch, heads, n_queries, 128]; k and v are
-    [batch, heads, n_keys, 128], so cross-attention with a different n_keys works too."""
+    [batch, heads, n_keys, 128], so cross-attention with a different n_keys works too.
+    kernel picks a variant from KERNELS, for tests and benchmarks."""
+    if kernel not in KERNELS:
+        raise ValueError(f"unknown kernel {kernel!r}, expected one of {KERNELS}")
     if not (q.dtype == k.dtype == v.dtype == torch.bfloat16):
         raise TypeError(f"q, k, v must be bfloat16, got {q.dtype}, {k.dtype}, {v.dtype}")
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
@@ -41,5 +49,5 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
     out = torch.empty_like(q)
     grid = (math.ceil(n_queries / ROWS_PER_BLOCK), batch * heads)
     scale_log2 = HEAD_DIM**-0.5 * LOG2E
-    module("flash")["attention"](grid, WARPS_PER_BLOCK * WARP_SIZE, q, k, v, out, n_queries, n_keys, scale_log2)
+    module("flash")[kernel](grid, WARPS_PER_BLOCK * WARP_SIZE, q, k, v, out, n_queries, n_keys, scale_log2)
     return out
