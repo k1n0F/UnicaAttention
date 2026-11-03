@@ -34,6 +34,12 @@ WAN 2.2 14B attention shape, 1 × 40 heads × 32 760 tokens × 128 (81 frames at
 
 All four kernels come from the same session of `bench/harness.py`. For SageAttention 2 and UnicaAttention the times are the mean of three runs (75.9 / 77.0 / 76.4 and 76.4 / 76.0 / 76.6 ms), which scatter by more than the difference between them. SDPA and SageAttention 3 come from a single run.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/k1n0F/UnicaAttention/main/assets/speed.png" alt="Speed over sequence length" width="900">
+</p>
+
+Same session, from 1K to 32 760 tokens (`bench/speed_chart.py`). From 4K tokens up, UnicaAttention runs 0.7–5 % ahead of SageAttention 2. At 1–2K it is behind, because the fixed cost of quantizing Q, K and V still weighs on so short a call. SageAttention 3 is the fastest from 8K, at 19 % error.
+
 **On real WAN 2.2 activations** (Q, K, V captured during an image-to-video run, 34 020 tokens, rel L2 vs FP32):
 
 | Layer | UnicaAttention | SageAttention 2 | SageAttention 3 |
@@ -42,6 +48,18 @@ All four kernels come from the same session of `bench/harness.py`. For SageAtten
 | block 39, four steps | 0.21 – 0.24 % | 0.20 – 0.24 % | 1.67 – 1.99 % |
 
 Real attention is kinder than random inputs. Where a layer is hard, UnicaAttention is 1.3–1.45× more accurate than SageAttention 2. Where it is easy, both sit near the bf16 output floor.
+
+**A real video.** The setup is WAN 2.2 image-to-video 14B (NVFP4, lightx2v 4 steps, 81 frames at 480×864) in ComfyUI, with the same image, prompt and seed. Only the self-attention kernel changes. The whole run is timed after a warm-up, with the variants alternating:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/k1n0F/UnicaAttention/main/assets/compare.gif" alt="SageAttention 2, UnicaAttention and SageAttention 3 on the same seed" width="720">
+</p>
+
+| | SageAttention 2 | **UnicaAttention** | SageAttention 3 |
+|---|---|---|---|
+| whole video | 49.0 / 48.7 s | **49.5 / 48.9 / 48.8 s** | 45.7 / 45.2 s |
+
+On a 4-step video, attention is only part of the run. UnicaAttention and SageAttention 2 take the same time, and SageAttention 3 saves ~3.5 s at 6–9× their error on these activations. The three videos part ways because their arithmetic differs, not because one of them is right: one seed is an anecdote, not a verdict.
 
 **From the first correct kernel to now** (same shape, kernel or whole call as measured at the time):
 
@@ -63,6 +81,45 @@ Real attention is kinder than random inputs. Where a layer is hard, UnicaAttenti
 - **TMA** copies each tile. One thread issues it, an mbarrier says when it has landed. The TMA box is 16 bytes wider than a row: the bytes outside the tensor arrive as zeros, so tiles land padded and `ldmatrix` reads them without bank conflicts. V8 is stored in the order the P fragments need, with the keys k and k + 16 interleaved, so `ldmatrix` returns the MMA operands ready to use.
 - **The Q·Kᵀ of tile t + 1 is issued before the softmax of tile t**, so the tensor cores have work while the exponents run.
 - **Measured, not assumed.** Every step starts with a written prediction, and the result is recorded even when the prediction failed. Many did. One finding: under full load the RTX 5080 sits at its 360 W power limit, so saving cycles only helps if it also saves energy. The whole log: [LOG.md](LOG.md).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    NODES["ComfyUI nodes<br/>native · WanVideo"] --> API
+    API["Python API<br/>unica.attention(q, k, v)"] --> PY
+
+    subgraph PY["unica (Python)"]
+        direction TB
+        quant["quantize<br/>Q, K → int8 · V → s8, P order"]
+        maps["TMA tensor maps"]
+        loader["cuda.py<br/>driver API (ctypes)"]
+    end
+
+    subgraph KERNEL["attention_int8pv_tma · 4 warps per block"]
+        direction TB
+        tma["TMA + mbarrier<br/>K, V tiles → shared memory"]
+        qk["Q·Kᵀ · IMMA s8 × s8"]
+        softmax["online softmax<br/>ex2 · tile-local max · u8 P̂"]
+        pv["P·V · IMMA u8 × s8"]
+        tma --> qk --> softmax --> pv
+    end
+
+    PY --> KERNEL
+    SRC["csrc/flash.cu<br/>CUDA C++ · inline PTX"] -- nvcc --> CUBIN[".cubin · sm_120a"] --> loader
+    loader --> DRV["nvcuda.dll / libcuda.so"]
+    pv --> OUT["O · bf16"]
+```
+
+```text
+csrc/flash.cu        every kernel, from the plain M1 one to attention_int8pv_tma, and the quantizers
+csrc/peak.cu         peak rates of the instructions attention is built from
+unica/__init__.py    attention(), kernel_inputs(), quantization, tensor maps
+unica/cuda.py        nvcc → .cubin, driver API loader, kernel launch, cuTensorMapEncodeTiled
+comfyui/             the two ComfyUI nodes
+bench/               harness, emulator of every quantization step, compare, profiling, charts
+tests/               against FP32, the emulator and each other, bit for bit where they should be
+```
 
 ## Use
 

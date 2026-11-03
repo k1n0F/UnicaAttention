@@ -1424,6 +1424,42 @@ the order should not change.
   measured. Neither the partial tile nor the last wave shows.
 - Quantization grows with the tokens, 2.9 → 3.0 ms, as a pass over memory should.
 
+## M5.5 — speed over sequence length, and whole videos
+
+**Over sequence length** (`bench/speed_chart.py`, 40 heads, whole call, harness timing, one session). A first
+sweep ran while ComfyUI still held 6.9 GB of VRAM (models from the video runs): at 32 760 tokens
+SageAttention 3 took 84 ms instead of 58, and UnicaAttention 87 instead of 76, the spill rigsy.dev/bench
+warns about. After ComfyUI's `/free` (unload models), the sweep was run again:
+
+| tokens | SDPA | SageAttention 2 | SageAttention 3 | UnicaAttention | Unica vs SA2 |
+|---|---|---|---|---|---|
+| 1 024 | 42 TOPS | 96 | 23 | 81 | −16 % |
+| 2 048 | 43 | 182 | 86 | 179 | −2 % |
+| 4 096 | 41 | 239 | 232 | 244 | +2.1 % |
+| 8 192 | 41 | 244 | 325 | 256 | +4.9 % |
+| 16 384 | 42 | 272 | 379 | 274 | +0.7 % |
+| 32 760 | 42 (523.4 ms) | 290 (75.68 ms) | 381 (57.70 ms) | 292 (75.15 ms) | +0.7 % |
+
+At 1–2K tokens the fixed cost of the separate quantization passes still weighs on so short a call.
+
+**Whole videos** (the author's Rigsy workflow: WAN 2.2 I2V 14B NVFP4, lightx2v 4 steps, 81 frames at
+480 × 864, seed 42; Unica Attention (native) nodes after `PathchSageAttentionKJ` on both models, enabled or
+not; the KJ mode `sageattn_qk_int8_pv_fp8_cuda` for SageAttention 2, `sageattn3` otherwise). The variants
+alternated: an identical prompt is served from ComfyUI's cache (one SageAttention 2 rerun took 1.2 s), and
+the first run after the unload (68.7 s) included loading the models. Both are left out. Times from ComfyUI's
+history:
+
+| | runs |
+|---|---|
+| SageAttention 2 | 49.0 / 48.7 s |
+| UnicaAttention | 49.5 / 48.9 / 48.8 s |
+| SageAttention 3 | 45.7 / 45.2 s |
+
+Earlier runs by the Rigsy app's agent: SageAttention 3 46.2 / 44.1 s, UnicaAttention 51.0 / 46.5 s. On a
+4-step video UnicaAttention and SageAttention 2 tie; SageAttention 3 is ~3.5 s (7 %) faster. The three
+videos diverge visibly on one seed (assets/compare.gif). The arithmetic differs, so the trajectory does too.
+No ranking of quality follows from one seed.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
