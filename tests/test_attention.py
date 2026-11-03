@@ -44,6 +44,13 @@ TILE_VARIANTS = [
     {"WARPS_PER_BLOCK": 8, "KEYS_PER_TILE": 32},
     {"MIN_BLOCKS_PER_SM": 3},
 ]
+# M3.7: more blocks per SM for the u8 kernel; a 32-key tile is what lets 3 or 4 blocks fit in shared memory
+ASYNC_VARIANTS = [
+    {"MIN_BLOCKS_PER_SM": 3},
+    {"KEYS_PER_TILE": 32},
+    {"KEYS_PER_TILE": 32, "MIN_BLOCKS_PER_SM": 3},
+    {"KEYS_PER_TILE": 32, "MIN_BLOCKS_PER_SM": 4},
+]
 
 
 def test_every_kernel_matches_fp32_reference_on_all_shapes():
@@ -55,13 +62,15 @@ def test_every_kernel_matches_fp32_reference_on_all_shapes():
         floor = errors(ref.bfloat16().float(), ref)["rel_l2"]
 
         variants = [(kernel, {}) for kernel in unica.KERNELS] + [("attention_smem", t) for t in TILE_VARIANTS]
+        variants += [("attention_int8pv_async", t) for t in ASYNC_VARIANTS]
         for kernel, tile in variants:
             out = unica.attention(q, k, v, kernel=kernel, **tile)
             error = errors(out.float(), ref)["rel_l2"]
             name = kernel + "".join(f" {key}={value}" for key, value in tile.items())
             assert torch.isfinite(out).all(), name
             if kernel in unica.QUANTIZED:
-                emulated = emulate(q, k, v, **EMULATED[kernel])
+                # each tile has its own P max in the u8 kernels, so the emulator needs the same tiles
+                emulated = emulate(q, k, v, **EMULATED[kernel], bc=tile.get("KEYS_PER_TILE", unica.TILE["KEYS_PER_TILE"]))
                 from_emulator = errors(out.float(), emulated)["rel_l2"]
                 predicted = errors(emulated, ref)["rel_l2"]
                 print(f"{name:52} {(batch, heads, n_queries, n_keys)!s:22} rel L2 {error:.3%}, "

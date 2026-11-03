@@ -390,6 +390,87 @@ layout. The point of the probe is to know the cause.
   there. The phase between blocks may also be part of why the gain of M3.4 depended on the shape (not
   checked).
 
+## M3.7 — more warps per SM, the cheap way (prediction, before measuring)
+
+**What it attacks: latency, by giving each scheduler more warps to switch to.** M3.5 showed the kernel waits
+on chains of dependent latencies with 2 warps per scheduler, and no pipe is near its limit (tensor 62 %,
+issue 38 %). `MIN_BLOCKS_PER_SM=3` alone already brings ptxas to 168 registers with **no spills**, but three
+blocks of 36.9 KB do not fit in the 100 KB of shared memory of an SM. With a 32-key tile the double buffers
+take 18.4 KB, and only `-D` flags change.
+
+**The price of a 32-key tile:** everything done once per tile is done twice per 64 keys. That is the flush
+of the int32 accumulator into `out` (64 I2F, 64 FMUL, 64 FFMA), the max and its shuffles, alpha and beta,
+the barrier. Loop SASS per 64 keys: 676 → 958 (+42 %). The P of each 32 keys gets its own max, so the
+error changes a little; the emulator follows with `bc=32`.
+
+| build | registers, spills | blocks (warps) per SM | loop SASS per 64 keys |
+|---|---|---|---|
+| K64 (now) | 255, 0 | 2 (8) | 676 |
+| K64, MIN_BLOCKS 3 (control: the register cap alone) | 168, 0 | 2: shared memory | |
+| K32 (control: the tile alone) | 231, 0 | 2 (8) | 958 |
+| **A**: K32, MIN_BLOCKS 3 | 168, 0 | 3 (12) | 958 |
+| **B**: K32, MIN_BLOCKS 4 | 128, 12 B outside the loop | 4 (16) | 1008 |
+
+**Hypotheses** (bench/compare.py, kernel alone, all five in one run; ncu for the rest):
+
+| | predicted |
+|---|---|
+| K64, MIN_BLOCKS 3 | **±3 %**: same warps, only the schedule ptxas can choose is tighter |
+| K32 | **+10 … +25 %** slower: the per-tile overhead without anything to hide it |
+| **A** | **−5 … −20 % vs K64** (center −12 %). If the time were set purely by latency, 3 warps instead of 2 would give 1.5× the throughput. The longer chain per 64 keys of K32 (~1.2×) and the tensor pipe ceiling (62 % now) eat part of it |
+| **B** | **within 5 % of A**: a fourth warp helps less once the tensor pipe is near 75–80 %, and the code is longer |
+| error | A and B: kernel vs emulator (bc = 32) < 0.1 %; rel L2 about the same 1.7 % |
+| ncu, A | warps per scheduler 2 → 3, tensor pipe 62 → ~70–75 %, issue 38 → ~55 % |
+| bank conflicts | more blocks out of step: more conflicts, still < 0.1 % of wavefronts |
+
+## M3.7 — result
+
+All five pass against the emulator (`bc` = their tile, kernel vs emulator ≤ 0.015 %). The 32-key tile is
+even a little more accurate, since each 32 keys get their own P max: 1.66 % vs 1.69 % at 4 × 4096.
+
+bench/compare.py, 40 × 32760, 5 rounds, kernel alone:
+
+| build | kernel | vs K64 | predicted |
+|---|---|---|---|
+| K64 (now) | 88.2 ms | | |
+| K64, MIN_BLOCKS 3 | 91.6 ms | +3.9 % | ±3 %: just outside |
+| K32 | 103.1 ms | +16.9 % | +10 … +25 %: **held** |
+| **A**: K32, 3 blocks | 92.1 ms | **+4.4 %** (−10.7 % vs K32) | −5 … −20 %: **missed** |
+| **B**: K32, 4 blocks | 90.3 ms | **+2.4 %** (−12.4 % vs K32) | within 5 % of A: held |
+
+Nsight Compute (4 heads; its durations wander between runs with the clock, so read them only within a run):
+
+| | K64 | K32 | A | B |
+|---|---|---|---|---|
+| duration | 9.70 ms | 11.06 ms | 10.01 ms | 9.64 ms |
+| warps per scheduler | 1.97 | 1.97 | **2.92** | **3.85** |
+| instructions | 2.64 G | 3.82 G | 3.82 G | 3.97 G |
+| issue slots busy | 38.4 % | 46.4 % | 55.7 % | 59.2 % |
+| **tensor pipe** | **62.5 %** | 52.2 % | **62.7 %** | **63.9 %** |
+| FMA / ALU / SFU | 14 / 15 / 18 % | 20 / 17 / 16 % | 24 / 21 / 20 % | 24 / 21 / 20 % |
+| stalls per instruction: math pipe / wait / barrier / not selected | 1.04 / 1.23 / 0.17 / 0.40 | 0.41 / 1.11 / 0.27 / 0.41 | 0.89 / 0.92 / 0.47 / 0.79 | 1.35 / 1.22 / 0.51 / 1.07 |
+| `op_ld` bank conflicts, of wavefronts | 214 K, 0.04 % | 118 K | 3.9 M, 0.7 % | 8.0 M, 1.5 % |
+
+Calibration: on `peak_u8s8` (447 TOPS) ncu reads the tensor pipe at **99.6 %**, so 62–64 % is real idle time,
+not a scale of the metric.
+
+**Findings:**
+
+- More warps do what they should, for the same tile: 2 → 3 → 4 warps per scheduler take K32 from 103.1 to
+  92.1 and 90.3 ms, and its tensor pipe from 52 % to 63–64 %. But that only buys back the price of the
+  smaller tile. Net, against K64: +4 % and +2 %. Neither A nor B is worth keeping.
+- **The tensor pipe stops at ~63–64 %** whether a scheduler has 2, 3 or 4 warps, with issue slots, FMA, ALU
+  and SFU all far from their limits. What grows with the warps is the math-pipe stall (0.41 → 0.89 → 1.35 in
+  the K32 series): warps queue for the tensor pipe at some moments while it idles a third of the time at
+  others. A guess, not checked: the warps of a scheduler bunch up in the same phase (all in MMA, then all
+  in softmax) instead of interleaving.
+- **The register cap alone costs ~4 %** (K64 with 168 registers, same 2 blocks).
+- Bank conflicts grow with the blocks per SM as M3.6 led to expect, but faster than predicted: 1.5 % of
+  wavefronts at 4 blocks (predicted < 0.1 %). Still small next to the rest.
+- **For C** (K64, 3 blocks, swizzled tiles of ~33 KB): what these numbers predict is not encouraging.
+  K64 is already at the same ~63 % tensor wall with 2 warps, and C would pay the ~4 % of the register
+  cap. Expectation before any work: 0 … −5 %.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
