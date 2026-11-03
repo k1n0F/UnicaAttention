@@ -1379,6 +1379,51 @@ cos: unica ≥ 0.99992, SageAttention 2 ≥ 0.99985, SageAttention 3 ≥ 0.9939.
   heads per call.
 - The `*_ms` columns time 2 heads with a cold first call, and say nothing about speed.
 
+## M5.4 — tile settings at the real shape, 34 020 tokens (prediction, before measuring)
+
+The author's question: every tile choice was measured at 32 760 tokens, the real call has 34 020. What
+changes:
+
+| | 32 760 | 34 020 |
+|---|---|---|
+| K64 tiles per head | 512, the last with 56 keys | 532, the last with 36 keys |
+| query blocks per head (64 rows) | 512 | 532 |
+| blocks / slots (84 SMs × 2) | 20 480 / 168 = 121.9 waves | 21 280 / 168 = 126.7 waves |
+
+**K128** does not compile: `K_SCALE_BLOCK` is 64 and a tile must share one K scale. It would need two K scales
+per tile or K scales per 128 tokens (an accuracy change), and it would not fit anyway. Its tiles take ~83 KB
+of shared memory, so 1 block (4 warps) per SM. Two sets of 64 scores in the pipeline plus `out` exceed 255
+registers. Not measured.
+
+**Hypotheses** (compare.py, 1 × 40 × 34 020, whole call and kernel alone, one run with all variants):
+
+| build | predicted vs K64 4 warps |
+|---|---|
+| K64, 4 warps | the reference; 7.8 % more work than at 32 760 (34 020² / 32 760² = 1.078), so ~+7.8 % time |
+| K32 | **+12 … +19 %**, as at 32 760 |
+| K32, 3 blocks | **+10 … +13 %** |
+| 8 warps, K64 | **a tie within ±2 %** (power limit, M3.22) |
+| 8 warps, K32 | **+15 … +25 %** |
+
+The partial last tile (36 of 64 keys) costs ~0.2 % of the tiles, the partly filled last wave of blocks ~0.3 %:
+the order should not change.
+
+**Result** (one run, all five, spread 0.8–2.3 %):
+
+| build | whole call | kernel alone | vs K64 4 warps (whole / kernel) | predicted |
+|---|---|---|---|---|
+| **K64, 4 warps** | **81.2 ms** | **79.7 ms** | | |
+| K32 | 101.1 ms | 98.5 ms | +24.5 % / +23.6 % | +12 … +19 %: missed, worse |
+| K32, 3 blocks | 91.0 ms | 88.1 ms | +12.1 % / +10.5 % | +10 … +13 %: held |
+| 8 warps, K64 | 81.5 ms | 78.8 ms | +0.4 % / −1.1 % | a tie: held |
+| 8 warps, K32 | 102.2 ms | 98.5 ms | +25.9 % / +23.6 % | +15 … +25 %: held, at the edge |
+
+- **The order is the same as at 32 760**, and K64 with 4 warps stays. 8 warps tie again, as the power limit
+  predicts.
+- The time scales with the work: 76.3 ms at 32 760 (M3.17, harness) × 1.078 = 82.3 ms, against 81.2 ms
+  measured. Neither the partial tile nor the last wave shows.
+- Quantization grows with the tokens, 2.9 → 3.0 ms, as a pass over memory should.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
