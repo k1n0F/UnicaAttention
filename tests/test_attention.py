@@ -24,7 +24,7 @@ EMULATED = {
     "attention_int8qk": INT8_QK,
     "attention_int8pv": dict(INT8_QK, p_fmt="u8", v_fmt="int8", p_local=True),
 }
-EMULATED["attention_int8pv_async"] = EMULATED["attention_int8pv"]
+EMULATED["attention_int8pv_async"] = EMULATED["attention_int8pv_pipe"] = EMULATED["attention_int8pv"]
 MAX_FROM_EMULATOR = 1e-3
 
 # (batch, heads, n_queries, n_keys)
@@ -91,6 +91,19 @@ def test_async_loads_change_nothing_but_time():
         assert torch.equal(unica.attention(q, k, v, "attention_int8pv_async", inputs), sync), (n_queries, n_keys)
 
 
+def test_pipelined_qk_changes_nothing_but_time():
+    torch.manual_seed(7)
+    # 1, 2 and 3 tiles: the prologue, the last iteration's thrown-away Q·Kᵀ, the K(t + 2) loads
+    for batch, heads, n_queries, n_keys in SHAPES + [(1, 2, 100, 128), (1, 2, 100, 129), (1, 2, 100, 192)]:
+        q = torch.randn(batch, heads, n_queries, 128, device="cuda").bfloat16()
+        k, v = (torch.randn(batch, heads, n_keys, 128, device="cuda").bfloat16() for _ in range(2))
+        inputs = unica.kernel_inputs(q, k, v, "attention_int8pv_async")
+        for tile in ({}, {"KEYS_PER_TILE": 32}):
+            in_turn = unica.attention(q, k, v, "attention_int8pv_async", inputs, **tile)
+            pipelined = unica.attention(q, k, v, "attention_int8pv_pipe", inputs, **tile)
+            assert torch.equal(pipelined, in_turn), (tile, n_queries, n_keys)
+
+
 def test_bare_exp2_changes_nothing_but_time():
     torch.manual_seed(2)
     for batch, heads, n_queries, n_keys in SHAPES:
@@ -138,6 +151,7 @@ def test_rejects_what_the_kernel_cannot_take():
 if __name__ == "__main__":
     test_every_kernel_matches_fp32_reference_on_all_shapes()
     test_async_loads_change_nothing_but_time()
+    test_pipelined_qk_changes_nothing_but_time()
     test_bare_exp2_changes_nothing_but_time()
     test_lazy_rescale_changes_nothing_but_time()
     test_trace_build_changes_nothing_but_time()

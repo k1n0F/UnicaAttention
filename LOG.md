@@ -755,6 +755,149 @@ No difference.
   single-tile test. Expected gain: the 48 MOV and nothing else, −1.5 … −3 %. Not started; the code is back
   to M3.9.
 
+## M3.12 — Q·Kᵀ of the next tile under the softmax (prediction, before implementation)
+
+**What it attacks: the stretches without MMA in each warp** (lever 2 of M3.8). Per tile a warp runs
+Q·Kᵀ(t) (32 IMMA, ~1000 cycles in the timeline), then the softmax (~750 cycles, no IMMA), then P·V(t). The
+softmax needs the scores of the same tile, so ptxas has nothing independent to put into the gaps between
+the Q·Kᵀ IMMA, and nothing for the tensor pipe during the softmax. The other warp of the scheduler fills
+part of that (tensor pipe 64 %), not all.
+
+**Change** (new kernel `attention_int8pv_pipe`, the arithmetic of `attention_int8pv_async`): in iteration t
+the warp issues Q·Kᵀ(t + 1), then the softmax of tile t, then P·V(t). Q·Kᵀ(t + 1) and the softmax of t are
+independent, and ptxas interleaves them inside one basic block. Two details decide whether it can:
+
+- **No branch between them.** The mask of a partial tile is applied to scores(t + 1) at the end of
+  iteration t, not between the IMMA and the softmax. Q·Kᵀ(t + 1) is computed even in the last iteration,
+  on stale shared memory, and thrown away.
+- **Buffers:** iteration t reads K(t + 1) and V(t), and loads K(t + 2) into the K buffer of t (read by
+  Q·Kᵀ(t) in the iteration before) and V(t + 1) into the other V buffer. Still one barrier per tile; the
+  prologue loads K(0), V(0), K(1) and computes Q·Kᵀ(0).
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | **identical bit for bit** to `attention_int8pv_async` (same operations per tile, same order) |
+| registers | a second set of 32 scores is alive across the softmax: 224 → **~250–255**. Spills are the main risk; if ptxas spills, the gain may vanish |
+| executed instructions | about the same (one wasted Q·Kᵀ per warp out of 512) |
+| SASS | the softmax instructions of tile t between the Q·Kᵀ IMMA of t + 1, not after them |
+| tensor pipe | 64 % → **~70–75 %** |
+| kernel time | **−5 … −15 %** (center −10 %). Up to ~750 cycles of softmax per tile could hide under the ~520 pipe cycles of Q·Kᵀ(t + 1) and between its IMMA, against ~3265 per tile. But the other warp already fills some of those gaps, and the softmax instructions placed between IMMA still cost ~1 cycle each past the first few (M3.8). |
+
+## M3.12 — result (so far): the overlap works, the registers do not fit
+
+The output is identical bit for bit to `attention_int8pv_async` on every shape, including 1, 2 and 3 tiles
+and K32 (`test_pipelined_qk_changes_nothing_but_time`). In SASS the Q·Kᵀ IMMA of t + 1 now sit between the
+max and exponent instructions of tile t, instead of in one block of 32.
+
+Three versions. compare.py 40 × 32760 kernel alone, one run with all four; ncu 4 heads:
+
+| | registers, spills | executed instructions | active cycles | tensor pipe | kernel |
+|---|---|---|---|---|---|
+| `attention_int8pv_async` K64 (M3.9) | 224, 0 | 2.390 G | 20.01 M | 63.8 % | 87.7 ms |
+| pipe K64, plain loop with `scores = next` | 255, 0 | 2.710 G (+13.4 %) | 19.90 M (−0.6 %) | 64.3 % | 88.8 / 89.0 vs 88.2 / 88.5 ms (separate runs) |
+| pipe K64, loop unrolled by 2 (no copy) | 255, **80 B spilled** | 2.501 G | 20.54 M (+2.6 %) | 62.3 % | 89.7 ms (+2.3 %) |
+| async K32 | 196, 0 | 3.289 G | 21.94 M | 58.3 % | 94.6 ms |
+| **pipe K32**, unrolled | 247, 0 | 3.127 G | **20.25 M (−7.7 % vs async K32)** | 63.1 % | **90.3 ms (−4.5 % vs async K32)** |
+
+- **The mechanism holds.** Where registers suffice (K32), issuing Q·Kᵀ(t + 1) under the softmax saves 7.7 %
+  of the cycles. In the plain K64 loop the stalls per instruction fell as predicted (wait 1.47 → 1.16, short
+  scoreboard 0.74 → 0.36), but the copy `scores = next` (+42 MOV per tile) and buffer addresses computed per
+  thread took it all back.
+- **K64 runs out of registers.** Two sets of 32 scores, `out` (64), `q` (16), fragments and addresses do
+  not fit in 255: the unrolled loop spills, and ptxas re-reads `threadIdx` (S2R) inside the loop instead of
+  keeping it. Prediction "~250–255, spills the main risk": the risk came true.
+- **Net: nothing beats `attention_int8pv_async` K64 yet.** Pipe K32 reaches it (+1 … +3 %): K32's own cost
+  (+8 % against K64) eats what the overlap saves.
+- What it would take for K64: ~20–30 registers fewer. Candidates: the Q fragments (16 registers) read from
+  shared memory with `ldmatrix` each tile instead of being held (+4 LDSM per tile), or issuing only half of
+  Q·Kᵀ(t + 1) under the softmax (16 extra scores instead of 32).
+
+## M3.13 — Q from shared memory, to make room for the pipeline (prediction, before implementation)
+
+**What it attacks: registers**, the limit M3.12 ran into. Each warp holds its 16 rows of int8 Q as 16
+registers for the whole kernel. Instead it copies them once into shared memory (16 rows at the K8 stride,
+2.3 KB per warp, 9.2 KB per block). Each Q·Kᵀ then reads them back with one `ldmatrix.x4` per 32-wide step
+of d. `ldmatrix.x4` (b16, non-transposed) returns exactly the A fragment `load_q8` builds: row lane / 4,
+bytes 4 · (lane % 4), matrices = rows 0–7 / 8–15 × bytes 0–15 / 16–31. Only one step's 4 registers are
+alive at a time.
+
+**Change** (`UNICA_Q_SMEM`, default 1, in `attention_int8pv_pipe` only): Q rows copied with `cp.async`
+in the first group (rows past n_queries zero-filled), 4 `LDSM` per Q·Kᵀ.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | identical bit for bit (the same bytes reach the same mma) |
+| registers, pipe K64 | 255 with 80 B spilled → **≤ 255, no spills** (12–16 fewer needed) |
+| shared memory | 36.9 → 46.1 KB per block; still 2 blocks per SM (2 × 47.1 KB ≤ 100 KB) |
+| executed instructions | +4 LDSM per tile; the S2R / spill code of M3.12 gone |
+| kernel time, pipe K64 vs async K64 | **−4 … −10 %**: the overlap saved 7.7 % of the cycles at K32, where it was not starved of registers. K64 has the same softmax to hide and fewer instructions around it. The +4 LDSM go to the memory pipe, not the FMA pipe |
+
+## M3.13 — result
+
+Bit for bit as before (`test_pipelined_qk_changes_nothing_but_time` and the emulator test pass with
+Q_SMEM=1). All in one session; ncu 4 heads, compare.py 40 × 32760 kernel alone:
+
+| | registers, spills | local loads (ncu) | executed | active cycles | tensor pipe | kernel (compare.py, 3 runs) |
+|---|---|---|---|---|---|---|
+| `attention_int8pv_async` K64 | 224, 0 | 0 | 2.390 G | 20.02 M (two runs) | 63.8 % | 85.2 / 84.6 / 85.2 ms |
+| pipe K64, Q in registers (M3.12) | 255, 80 B | 33.6 M | 2.501 G | 20.53 M (+2.6 %) | 62.3 % | 87.0 ms |
+| **pipe K64, Q from shared memory** | 255, **108 B** | 35.8 M | 2.506 G | **19.34 / 19.35 M (−3.4 %)** | **66.1 %** | **84.1 / 83.8 / 84.3 ms (−0.9 … −1.3 %)** |
+
+- **The first build above the ~64 % wall:** the tensor pipe reaches 66.1 %, and the active cycles fall by
+  3.4 %, repeatable to 0.1 %. The overlap of M3.12 now pays at K64.
+- **But not for the reason predicted.** The spills did not go away: 108 B instead of 80 B, ~8.5 local
+  loads per warp and tile in both builds. ptxas reads all four Q fragments in one block right before the
+  Q·Kᵀ IMMA, so the peak of live registers did not drop. The spills sit at the top of the loop and after
+  the rescale branch (values kept across the loop). What changed is where ptxas puts the work. With Q read
+  inside Q·Kᵀ, it schedules the Q·Kᵀ of t + 1 with the softmax of t better, and the spill reloads cost
+  less than they did. Prediction "no spills": **missed**. Time −4 … −10 %: **missed**, −3.4 % in cycles and
+  −1 % in compare.py.
+- **ncu and compare.py disagree** (−3.4 % vs −1 %). In M3.9 they agreed. The shapes differ (4 vs 40 heads)
+  and so do the clocks (ncu's are not fixed, M3.9). Not explained yet. The lower number is the one to
+  quote.
+- The spills are the obvious next target: ~8.5 local loads per tile, and registers at 255.
+
+**Where the gain comes from** (the author's questions: register pressure, the place of the IMMA, shared
+memory, and whether it is ptxas scheduling rather than the Q loads themselves).
+
+nvdisasm (13.2 and 13.0) refuses life ranges for a kernel at 255 registers ("Invalid register count").
+The live registers below are counted from the SASS of the loop instead: backward liveness with the back
+edge, operand widths of IMMA / LDSM / 64-bit addresses, forward branches ignored. The count is below what
+ptxas allocates: 209 live at most in `attention_int8pv_async` against its 224 registers, since it ignores
+the alignment of register groups. The method is the same for all builds, so the comparison holds.
+
+| | async K64 | pipe, Q in registers | pipe, Q from shared |
+|---|---|---|---|
+| live registers in the loop: max / mean | 209 / 161 | 220 / 190 | **217 / 180** |
+| live across the back edge | 126 | 139 | **117** |
+| live at the Q·Kᵀ IMMA | 162–179 | 180–197 | **169–185** |
+| live at the P·V IMMA (the peak) | 150–209 | 196–217 | 183–217 |
+| V `LDSM` → first use, instructions: mean / max | 21.9 / 47 | 20.4 / 40 | **39.9 / 159** |
+| K/Q `LDSM` → first use: mean / max | 15.8 / 30 | 23.0 / 65 | 24.3 / 87 |
+| Q·Kᵀ(t + 1): instructions spanned by its 32 IMMA; MUFU / FMNMX / FFMA inside | | 151; 24 / 25 / 25 | 161; 20 / 38 / 24 |
+| spill reloads (LDL) per tile, static | 0 | 18 | 27 |
+| stalls per instruction: wait / short scoreboard / MIO throttle / math pipe | 1.47 / 0.74 / 0.26 / 1.07 | 1.33 / 0.50 / 0.42 / 1.12 | **1.20 / 0.46 / 0.32 / 1.03** |
+| shared memory per block; blocks per SM by shared memory / by registers | 36.9 KB; 2 / 2 | 36.9 KB; 2 / 2 | **46.1 KB; 2 / 2** |
+
+1. **Register pressure fell, but not at the peak.** Q is no longer carried around the loop: 22 fewer
+   registers live across the back edge, ~10 fewer in the mean, ~12 fewer around the Q·Kᵀ IMMA. The peak
+   is in P·V (`out`, the P fragments, the V fragments and the scores of t + 1), and it did not move: 217
+   against 220. That is why the spills stay.
+2. **The Q·Kᵀ IMMA sit about the same.** They are interleaved with the softmax in both builds (151 and 161
+   instructions for 32 IMMA, a similar mix inside).
+3. **What moved are the V loads.** With the registers freed, ptxas issues the V `ldmatrix` about twice as
+   far ahead of the P·V IMMA that use them: 40 instructions on average instead of 20, up to 159. Short-
+   scoreboard and wait stalls fall with it. This matches the author's hypothesis: the gain is a different
+   schedule that the lower pressure allows, not the Q loads. Those are 4 more LDSM per tile and cost.
+   Not proven causally; the data point the same way.
+4. **Shared memory:** 46.1 KB per block, 2 × 47.1 KB = 94.2 KB of the 100 KB per SM. **~2.9 KB per block
+   of headroom.** One more buffer of K or V (9.2 KB) would drop the kernel to 1 block per SM. Registers
+   also allow only 2 blocks, so both limits now bind together.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

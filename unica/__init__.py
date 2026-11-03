@@ -23,15 +23,17 @@ LOG2E = 1.4426950408889634
 # Every variant in csrc/flash.cu, oldest first. All take the same grid and block; bench/compare.py
 # times them side by side. The quantized ones trade exactness for speed: their error is measured
 # against bench/emulate.py, which predicts it.
-KERNELS = ("attention", "attention_smem", "attention_int8qk", "attention_int8pv", "attention_int8pv_async")
-QUANTIZED = {"attention_int8qk", "attention_int8pv", "attention_int8pv_async"}
+KERNELS = ("attention", "attention_smem", "attention_int8qk", "attention_int8pv", "attention_int8pv_async",
+           "attention_int8pv_pipe")
+QUANTIZED = {"attention_int8qk", "attention_int8pv", "attention_int8pv_async", "attention_int8pv_pipe"}
 DEFAULT_KERNEL = "attention_smem"
 
 # The tile shape csrc/flash.cu is built with when nothing overrides it (its UNICA_* macros). FAST_EXP2=0
 # brings back exp2f in the u8 kernels, to measure M3.5; LAZY_RESCALE=0 the multiply of out in every tile
-# (M3.9); TRACE=1 records a timeline (bench/timeline.py).
+# (M3.9); Q_SMEM=0 Q in registers in attention_int8pv_pipe (M3.13); TRACE=1 records a timeline
+# (bench/timeline.py).
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
-        "TRACE": 0}
+        "Q_SMEM": 1, "TRACE": 0}
 
 
 def attention(

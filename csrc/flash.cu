@@ -33,6 +33,10 @@ constexpr int MMA_K = 16;
 #ifndef UNICA_LAZY_RESCALE
 #define UNICA_LAZY_RESCALE 1
 #endif
+// M3.13: 0 keeps Q in registers in attention_int8pv_pipe.
+#ifndef UNICA_Q_SMEM
+#define UNICA_Q_SMEM 1
+#endif
 
 constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 128;                      // WAN 2.2
@@ -1184,6 +1188,143 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         pv_int8(out, p, v_tiles[buffer], alpha, beta, lane);
         TRACE_MARK(slot, lane, tile, 3);
     }
+
+    store_out(O + q_offset, out, row_sum, row, col, n_rows, v_scale);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// M3.12: Q·Kᵀ of the next tile issued before the softmax of this one.
+// ---------------------------------------------------------------------------------------------------
+
+// M3.13: the warp's 16 rows of int8 Q into shared memory, K8_STRIDE apart, joining the caller's cp.async
+// group. Rows at or past n_rows become zeros, read from nowhere: their address stays at Q8, row 0 of the head,
+// which always exists.
+__device__ __forceinline__ void load_q8_async(int8_t* q_tile, const int8_t* Q, const int8_t* Q8, int n_rows,
+                                              int lane) {
+#pragma unroll
+    for (int load = 0; load < ROWS_PER_WARP * HEAD_DIM / 16 / WARP_SIZE; ++load) {
+        const int chunk = load * WARP_SIZE + lane;
+        const int q_row = chunk / (HEAD_DIM / 16), byte = chunk % (HEAD_DIM / 16) * 16;
+        const bool valid = q_row < n_rows;
+        cp_async16(q_tile + q_row * K8_STRIDE + byte, valid ? Q + q_row * HEAD_DIM + byte : Q8, valid ? 16 : 0);
+    }
+}
+
+// qk_scores_int8 with Q from the warp's tile in shared memory (load_q8_async). One ldmatrix.x4 per 32-wide step
+// of d returns the A fragment load_q8 builds (row lane / 4, bytes 4 · (lane % 4); matrices: rows 0–7 and
+// 8–15 of bytes 0–15, then of bytes 16–31), so Q takes no registers between tiles.
+__device__ __forceinline__ void qk_scores_int8_q_smem(float scores[KEY_BLOCKS][4], const int8_t* q_tile,
+                                                      const int8_t* k_tile, int lane) {
+    const int matrix = lane / 8;
+    const int8_t* lane_row = q_tile + (lane % 8 + matrix % 2 * 8) * K8_STRIDE + matrix / 2 * 16;
+    uint32_t q[Q8_STEPS][4];
+#pragma unroll
+    for (int step = 0; step < Q8_STEPS; ++step) ldmatrix_x4(q[step], lane_row + step * MMA_K8);
+    qk_scores_int8(scores, q, k_tile, lane);
+}
+
+// t % 2 as a type, for the two halves of the loop in attention_int8pv_pipe.
+template <int VALUE>
+struct Parity {
+    static constexpr int value = VALUE;
+};
+
+// attention_int8pv_async with Q·Kᵀ(t + 1) issued before the softmax of tile t. The two are independent, so
+// ptxas can put the softmax between the IMMA, and the tensor pipe has work while the softmax runs. No branch
+// may stand between them, or they land in different basic blocks: the mask of a partial tile goes on its
+// scores right after they are made, at the end of the iteration before, and Q·Kᵀ(t + 1) runs even in the
+// last iteration, on stale K, and is thrown away. Iteration t reads K(t + 1) and V(t), and loads K(t + 2)
+// into the K buffer of tile t (Q·Kᵀ(t) read it in the iteration before) and V(t + 1) into the other V buffer.
+// Same arguments, grid and block as attention_int8pv.
+extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
+    attention_int8pv_pipe(const int8_t* Q8, const int8_t* K8, const float* q_scale, const float* k_scale,
+                          const int8_t* V8, const float* v_scale, __nv_bfloat16* O, int n_queries, int n_keys,
+                          float scale_log2) {
+    __shared__ __align__(16) int8_t k_tiles[2][KEYS_PER_TILE * K8_STRIDE];
+    __shared__ __align__(16) int8_t v_tiles[2][KEYS_PER_TILE * K8_STRIDE];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row = lane / 4;
+    const int col = 2 * (lane % 4);
+
+    const int row0 = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP;
+    const int n_rows = min(n_queries - row0, ROWS_PER_WARP);
+
+    const size_t q_offset = (size_t(blockIdx.y) * n_queries + row0) * HEAD_DIM;
+    const size_t kv_offset = size_t(blockIdx.y) * n_keys * HEAD_DIM;
+    K8 += kv_offset;
+    V8 += kv_offset;
+    v_scale += size_t(blockIdx.y) * HEAD_DIM;
+    k_scale += size_t(blockIdx.y) * ((n_keys + K_SCALE_BLOCK - 1) / K_SCALE_BLOCK);
+    const float q_scale_log2 =
+        q_scale[size_t(blockIdx.y) * ((n_queries + Q_SCALE_BLOCK - 1) / Q_SCALE_BLOCK) + row0 / Q_SCALE_BLOCK] *
+        scale_log2;
+    const int n_tiles = (n_keys + KEYS_PER_TILE - 1) / KEYS_PER_TILE;
+
+    load_tile8_async(k_tiles[0], K8, min(n_keys, KEYS_PER_TILE));
+    load_tile8_async<true>(v_tiles[0], V8, min(n_keys, KEYS_PER_TILE));
+    if (n_tiles > 1)
+        load_tile8_async(k_tiles[1], K8 + KEYS_PER_TILE * HEAD_DIM, min(n_keys - KEYS_PER_TILE, KEYS_PER_TILE));
+#if UNICA_Q_SMEM
+    __shared__ __align__(16) int8_t q_tiles[WARPS_PER_BLOCK][ROWS_PER_WARP * K8_STRIDE];
+    load_q8_async(q_tiles[warp], Q8 + q_offset, Q8, n_rows, lane);
+    cp_async_commit();
+    auto qk = [&](float s[KEY_BLOCKS][4], const int8_t* k_tile) { qk_scores_int8_q_smem(s, q_tiles[warp], k_tile, lane); };
+#else
+    cp_async_commit();
+    uint32_t q[Q8_STEPS][4];
+    load_q8(q, Q8 + q_offset, row, col, n_rows);
+    auto qk = [&](float s[KEY_BLOCKS][4], const int8_t* k_tile) { qk_scores_int8(s, q, k_tile, lane); };
+#endif
+
+    float row_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
+    float row_sum[2] = {0.0f, 0.0f};
+    float out[D_BLOCKS][4] = {};
+
+    cp_async_wait();
+    __syncthreads();
+    float scores[2][KEY_BLOCKS][4];  // tile t in scores[t % 2]; Q·Kᵀ(t + 1) writes the other
+    qk(scores[0], k_tiles[0]);
+    if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
+
+    // Iteration t, with t % 2 == decltype(parity)::value known at compile time: every buffer and score index
+    // is a constant, and the scores of t + 1 land where iteration t + 1 reads them, with no copy. A plain
+    // loop with scores = next at its end spends 42 MOV per tile on that copy, and computes the buffer
+    // addresses in every thread (M3.12).
+    auto iteration = [&](int t, auto parity) {
+        constexpr int now = decltype(parity)::value, later = 1 - now;
+        const int key0 = t * KEYS_PER_TILE;
+        cp_async_wait();  // this thread's part of K(t + 1) and V(t), issued an iteration ago
+        __syncthreads();  // everyone's part; and every warp is done with K(t) and V(t − 1)
+        if (t + 2 < n_tiles) {
+            const int keys = key0 + 2 * KEYS_PER_TILE;
+            load_tile8_async(k_tiles[now], K8 + keys * HEAD_DIM, min(n_keys - keys, KEYS_PER_TILE));
+        }
+        if (t + 1 < n_tiles) {
+            const int keys = key0 + KEYS_PER_TILE;
+            load_tile8_async<true>(v_tiles[later], V8 + keys * HEAD_DIM, min(n_keys - keys, KEYS_PER_TILE));
+        }
+        cp_async_commit();
+
+        float alpha[2], beta[2];
+        qk(scores[later], k_tiles[later]);  // stale K in the last iteration, never used
+        online_softmax_u8(scores[now], row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
+        uint32_t p[PV8_STEPS][4];
+#pragma unroll
+        for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
+        pv_int8(out, p, v_tiles[now], alpha, beta, lane);
+
+        const int next_valid = n_keys - key0 - KEYS_PER_TILE;  // ≤ 0 in the last iteration: all masked
+        if (next_valid < KEYS_PER_TILE) mask_scores(scores[later], col, next_valid);
+    };
+
+    int t = 0;
+    for (; t + 1 < n_tiles; t += 2) {
+        iteration(t, Parity<0>{});
+        iteration(t + 1, Parity<1>{});
+    }
+    if (t < n_tiles) iteration(t, Parity<0>{});
 
     store_out(O + q_offset, out, row_sum, row, col, n_rows, v_scale);
 }
