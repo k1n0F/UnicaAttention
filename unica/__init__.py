@@ -26,7 +26,9 @@ LOG2E = 1.4426950408889634
 KERNELS = ("attention", "attention_smem", "attention_int8qk", "attention_int8pv", "attention_int8pv_async",
            "attention_int8pv_pipe")
 QUANTIZED = {"attention_int8qk", "attention_int8pv", "attention_int8pv_async", "attention_int8pv_pipe"}
-DEFAULT_KERNEL = "attention_smem"
+# INT8 Q·Kᵀ, u8 × s8 P·V: rel L2 1.73 % against FP32 on random inputs (SageAttention 2: 3.9 %). The exact
+# path is attention_smem, at 0.17 %, the bf16 output floor.
+DEFAULT_KERNEL = "attention_int8pv_pipe"
 
 # The tile shape csrc/flash.cu is built with when nothing overrides it (its UNICA_* macros). FAST_EXP2=0
 # brings back exp2f in the u8 kernels, to measure M3.5; LAZY_RESCALE=0 the multiply of out in every tile

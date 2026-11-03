@@ -990,6 +990,22 @@ compare.py 40 × 32760 (one run, all four), ncu 4 heads:
 in cycles and −2.5 % in compare.py from `attention_int8pv_async` at the start of M3.12. Tensor pipe 67.8 %,
 the highest so far.
 
+## M3.16 — `attention_int8pv_pipe` becomes the default
+
+Author's decision: `unica.attention()` runs the u8 path by default. The exact path stays available as
+`kernel="attention_smem"` (0.17 %, the bf16 output floor). bench/harness.py, same run, 1 × 40 × 32760 × 128,
+bf16 random inputs, median of 10, whole call (quantization included):
+
+| kernel | time | speed-up | rel L2 | cos |
+|---|---|---|---|---|
+| PyTorch SDPA | 517.0 ms | 1.0× | 0.23 % | 0.999997 |
+| SageAttention 2 | 74.3 ms | 7.0× | 3.90 % | 0.999238 |
+| SageAttention 3 | 57.6 ms | 9.0× | 19.11 % | 0.981755 |
+| **UnicaAttention** | **83.7 ms** | **6.2×** | **1.73 %** | **0.999850** |
+
+Against the goal in the README: 2.25× less error than SageAttention 2, but 12.6 % slower than it. Not a
+win yet. 74.3 ms means ~9.4 ms less, about 11 %.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
