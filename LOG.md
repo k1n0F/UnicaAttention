@@ -1304,6 +1304,33 @@ tensor pipe is busier), so the card clocks it 7 % lower: a tie in time. Conseque
 
 Nothing changes in the code: 4 warps K64 stays.
 
+## M5.1 — a ComfyUI node for ComfyUI-WanVideoWrapper
+
+The author's WAN 2.2 workflow (I2V A14B, high- and low-noise models, 832 × 480, 81 frames) runs on
+ComfyUI-WanVideoWrapper, whose `WanVideoModelLoader` sets `attention_mode = "sageattn"`. WanVideoWrapper
+already has an override path: `transformer_options["attention_mode_override"]` is passed by the model down
+to the self-attention of each block, and from there to the `attention` function that `model.py` imports.
+
+`comfyui/__init__.py`, node **Unica Attention (WanVideo)** (between a model loader and the sampler):
+
+- clones the model and sets the override to `"unica"` for all steps and blocks;
+- wraps that `attention` once: `"unica"` goes to `unica.attention`, from WanVideoWrapper's layout
+  [batch, tokens, heads, 128] in any float dtype to bf16 [batch, heads, tokens, 128] and back (one copy each
+  way); every other mode goes to the original;
+- cross-attention to the text is not overridden by WanVideoWrapper, so it keeps the loader's mode;
+- `measure_every` > 0: on every n-th self-attention call, unica and SageAttention 2 against FP32 on the first
+  `measure_heads` heads of the real Q, K, V, appended to `build/wan_attention_errors.csv` (the real-data error
+  measurement of PLAN.md, with nothing heavy written to disk).
+
+Installed as a directory junction in `custom_nodes`. It runs in ComfyUI's own venv (torch 2.14.0+cu132), with
+the cubins built beforehand in this repository: that shell has no nvcc. `tests/test_comfyui.py` checks the
+wrapper without ComfyUI, against a stand-in module: "unica" equals `unica.attention` bit for bit in fp16
+in/out, other modes pass through, and wrapping twice wraps once.
+
+Known cost of this first version: the layout copies, ~3 × 335 MB in and 335 MB out per call, about 1.5 ms of a
+~76 ms call. Reading WanVideoWrapper's layout directly in the quantize kernels and in store_out would remove
+them.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
