@@ -1095,6 +1095,83 @@ M3.16, so the accuracy decision stands. bench/harness.py, 1 × 40 × 32760 × 12
 difference), at 2.25× less error. From M1 (~770 ms): 10.1×. The README goal, faster at no more error, is
 not met yet: level is not faster.
 
+## M3.18 — what `attention_int8pv_tma` waits on (investigation)
+
+Executed per warp and tile (ncu SourceCounters, 4 heads): **467.0**. I2FP 98.1, FFMA 98.0, IMMA 64.1, FMNMX
+38.0, LDSM 36.0, MUFU 36.0, F2IP 16.0, FMUL 13.1, IDP 8.0, the rest uniform-datapath and branch overhead.
+Hardly a `MOV` left (1.9).
+
+Stall samples (695 K) by instruction:
+
+| instruction | share | top reasons |
+|---|---|---|
+| IMMA | 43.1 % | math pipe 57 %, wait 28 % |
+| BRA + BSSY, i.e. the `__syncthreads` | **11.9 %** | barrier 71 % / 99 % |
+| I2FP | 9.4 % | wait 42 %, selected 40 % |
+| FMNMX | 7.1 % | short scoreboard 49 % |
+| FFMA | 5.9 % | selected 62 % |
+| LDSM | 4.0 % | selected 33 %, MIO 27 % |
+
+By reason over everything: wait 26 %, math pipe 25 %, selected 18 %, **barrier 10 %**, short scoreboard 7 %.
+
+- **The barrier is new as a target.** With TMA the per-tile `__syncthreads` only protects buffers about to be
+  overwritten (WAR). Every warp of the block waits for the slowest one there, every tile.
+- **No three-input max on sm_120.** `max.f32 d, a, b, c` is accepted by PTX, but ptxas emits two `FMNMX`
+  (compiled and checked). The 32 FMNMX per tile stay.
+- **Outside the kernel:** quantization is 2.9 ms of the 76.3 ms whole call (Q and K two passes each, a
+  separate `k.mean`, a separate `aminmax` over V: ~2.2 GB at 810 GB/s ≈ 2.7 ms). Fusing the mean and the
+  aminmax into the quantize kernels saves at most ~0.8 ms, ~1 %.
+
+Order agreed with the author: the barrier, then the quantization, then (with an accuracy check) the flush
+every 128 keys.
+
+## M3.19 — mbarriers instead of `__syncthreads` (prediction, before implementation)
+
+**What it attacks:** warps of a block waiting for the slowest one every tile (barrier 10 % of the stall
+samples). With TMA the `__syncthreads` only guards two buffers against being overwritten while another
+warp still reads them.
+
+**Change** (`UNICA_EMPTY_BARRIERS`, default 1, `attention_int8pv_tma`): four "empty" mbarriers, `k_free[2]`
+and `v_free[2]`, each completed by 4 arrivals, one per warp (`__syncwarp`, then lane 0 arrives) after the
+warp's last read of that buffer: after Q·Kᵀ(t + 1) for `k_free[later]`, after P·V(t) for `v_free[now]`.
+Before issuing K(t + 2) and V(t + 1), thread 0 waits only for the arrivals that free those two buffers:
+the reads of K(t) and of V(t − 1), phases t / 2 and (t − 1) / 2. No other warp waits for another.
+Phases cannot run two ahead: the next phase of a free barrier needs the copy that thread 0 issues after its
+wait. The re-arming of `landed` stays safe as well: every free arrival comes after that warp's wait on
+`landed`.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | **identical bit for bit** (the arithmetic does not change) |
+| barrier stalls | 10 % of the samples → **~0**; warp 0 waits on the free barriers instead, a little |
+| instructions per tile | about the same: −BAR.SYNC, +2 arrivals and the waits of thread 0 |
+| registers | ~235, no spills |
+| kernel time | **−2 … −5 %**: part of the barrier time is already covered by the other block's warps |
+
+## M3.19 — result: slower, not kept
+
+Bit for bit the same output (new test, 3 runs per shape, 1 to 4 tiles, K64 and K32), and `compute-sanitizer
+--tool racecheck` reports 0 hazards (it may not see the TMA writes). Per-tile `BAR.SYNC` gone (5 → 2, the
+prologue's), 7 `SYNCS.ARRIVE` added; registers 235 → 244, no spills.
+
+| | `__syncthreads` | free mbarriers |
+|---|---|---|
+| kernel, compare.py (both orders) | 73.9 / 75.5 ms | 78.7 / 79.5 ms (**+6.5 %**) |
+| active cycles (ncu, 2 runs each) | 16.93 / 16.94 M | 18.42 / 18.43 M (**+8.8 %**) |
+| executed instructions | 1.960 G | 2.088 G (+6.5 %) |
+| tensor pipe | 75.6 % | 69.4 % |
+| stalls per instruction: barrier / long scoreboard / wait | 0.58 / 0.09 / 1.45 | **0.00 / 0.61** / 1.60 |
+
+**Prediction missed, in the wrong direction.** The barrier stall went away and came back as a wait for data:
+long scoreboard ×7 (the `try_wait` loop on `landed`), and ~30 more instructions per tile, the extra rounds of
+that loop. The `__syncthreads` was not only a cost. It kept every warp in step with thread 0, which issues the
+copies, so the next tile was always on its way in time. Without it, the fast warps run ahead and wait for
+copies that thread 0 issues late: thread 0 is a computing warp itself, and it now also waits on the free
+barriers for the slowest warp. FlashAttention 3 gives the copies a warp of their own. Here a fifth warp at
+244 registers would leave 1 block per SM (2 × 160 × 244 > 64 K). Reverted.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
