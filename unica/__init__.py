@@ -23,8 +23,8 @@ LOG2E = 1.4426950408889634
 # Every variant in csrc/flash.cu, oldest first. All take the same grid and block; bench/compare.py
 # times them side by side. The quantized ones trade exactness for speed: their error is measured
 # against bench/emulate.py, which predicts it.
-KERNELS = ("attention", "attention_smem", "attention_int8qk")
-QUANTIZED = {"attention_int8qk"}
+KERNELS = ("attention", "attention_smem", "attention_int8qk", "attention_int8pv")
+QUANTIZED = {"attention_int8qk", "attention_int8pv"}
 DEFAULT_KERNEL = "attention_smem"
 
 # The tile shape csrc/flash.cu is built with when nothing overrides it (its UNICA_* macros).
@@ -32,13 +32,19 @@ TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1}
 
 
 def attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str = DEFAULT_KERNEL, **tile: int
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kernel: str = DEFAULT_KERNEL,
+    inputs: tuple | None = None,
+    **tile: int,
 ) -> torch.Tensor:
     """softmax(q · kᵀ / sqrt(d)) · v, non-causal. q is [batch, heads, n_queries, 128]; k and v are
     [batch, heads, n_keys, 128], so cross-attention with a different n_keys works too.
 
     For tests and benchmarks: kernel picks a variant from KERNELS, and tile overrides entries of TILE,
-    e.g. KEYS_PER_TILE=32; each combination is its own cubin."""
+    e.g. KEYS_PER_TILE=32; each combination is its own cubin. inputs is what kernel_inputs() returned for
+    these q, k, v: the kernel then runs alone, without quantizing again."""
     if kernel not in KERNELS:
         raise ValueError(f"unknown kernel {kernel!r}, expected one of {KERNELS}")
     if unknown := tile.keys() - TILE.keys():
@@ -64,17 +70,26 @@ def attention(
     warps = tile.get("WARPS_PER_BLOCK", TILE["WARPS_PER_BLOCK"])
     grid = (math.ceil(n_queries / (warps * ROWS_PER_WARP)), batch * heads)
     scale_log2 = HEAD_DIM**-0.5 * LOG2E
-    launch = module("flash", **defines)[kernel]
-    if kernel == "attention_int8qk":
-        q8, q_scale = quantize_int8(q, None, Q_SCALE_BLOCK)
-        k8, k_scale = quantize_int8(k, k.mean(-2, dtype=torch.float32), K_SCALE_BLOCK)  # softmax cancels the mean
-        launch(grid, warps * WARP_SIZE, q8, k8, q_scale, k_scale, v, out, n_queries, n_keys, scale_log2)
-    else:
-        launch(grid, warps * WARP_SIZE, q, k, v, out, n_queries, n_keys, scale_log2)
+    if inputs is None:
+        inputs = kernel_inputs(q, k, v, kernel)
+    module("flash", **defines)[kernel](grid, warps * WARP_SIZE, *inputs, out, n_queries, n_keys, scale_log2)
     return out
 
 
+def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str) -> tuple:
+    """The arguments `kernel` takes before its output: q, k, v as they are, or quantized. q, k, v must be
+    contiguous. Apart from attention() so that a benchmark can time quantization and kernel separately."""
+    if kernel not in QUANTIZED:
+        return q, k, v
+    q8, q_scale = quantize_int8(q, None, Q_SCALE_BLOCK)
+    k8, k_scale = quantize_int8(k, k.mean(-2, dtype=torch.float32), K_SCALE_BLOCK)  # softmax cancels the mean
+    if kernel == "attention_int8qk":
+        return q8, k8, q_scale, k_scale, v
+    return q8, k8, q_scale, k_scale, *quantize_v(v)
+
+
 QUANTIZE_THREADS = 256  # must match csrc/flash.cu
+CHUNK = 8  # bf16 per thread in quantize_v
 
 
 def quantize_int8(x: torch.Tensor, mean: torch.Tensor | None, block: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -90,3 +105,17 @@ def quantize_int8(x: torch.Tensor, mean: torch.Tensor | None, block: int) -> tup
     mean_arg = mean.contiguous() if mean is not None else ctypes.c_void_p(0)
     module("flash")["quantize_int8"](grid, QUANTIZE_THREADS, x, mean_arg, x8, scale, n, block)
     return x8, scale
+
+
+def quantize_v(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """v ≈ v8 · scale with one scale per channel over all tokens of a head: int8 [batch, heads, N, 128] and
+    float32 [batch, heads, 128]. d is the axis P·V does not sum over, so the kernel applies the scale once,
+    at the end. Bit for bit bench/emulate.py's V quantization."""
+    v = v.contiguous()
+    low, high = torch.aminmax(v, dim=-2)  # one pass, and |v| needs no copy of v
+    scale = (torch.maximum(high, -low).float() / 127).clamp_min(1e-12)
+    v8 = torch.empty(v.shape, dtype=torch.int8, device=v.device)
+    n_chunks = v.numel() // CHUNK
+    grid = math.ceil(n_chunks / QUANTIZE_THREADS)
+    module("flash")["quantize_v"](grid, QUANTIZE_THREADS, v, scale, v8, v.shape[2], n_chunks)
+    return v8, scale

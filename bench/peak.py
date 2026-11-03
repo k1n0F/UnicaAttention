@@ -1,11 +1,15 @@
 """
-Tensor-core peak of attention's mma mix (half bf16, half fp16 m16n8k16, FP32 accumulate), in TFLOPS
-at whatever clock the card runs now. The ceiling bench/compare.py results are held against.
+Peak rates of the instructions attention is built from (csrc/peak.cu), at whatever clock the card runs
+now: the ceilings bench/compare.py results are held against. All forms take turns in each round, so
+they share the same clock.
 
-    uv run python bench/peak.py
+    uv run python bench/peak.py [--rounds 3]
 """
 
 from __future__ import annotations
+
+import argparse
+import statistics
 
 import torch
 from harness import time_ms
@@ -13,15 +17,37 @@ from harness import time_ms
 from unica.cuda import module
 
 SMS = 84
-WARPS_PER_SM = 16  # enough warps that every tensor unit always has an mma ready
-MMA_PER_ITERATION = 8
-FLOP_PER_MMA = 2 * 16 * 8 * 16
-ITERATIONS = 200_000
+WARPS_PER_SM = 16  # enough warps that every unit always has an instruction ready
+CHAINS = 8
+ITERATIONS = 20_000
+
+# kernel -> (work per warp instruction, unit)
+FORMS = {
+    "peak_bf16_f16_f32": (2 * 16 * 8 * 16, "TFLOPS"),  # the exact path's mix, m16n8k16
+    "peak_s8s8": (2 * 16 * 8 * 32, "TOPS"),  # m16n8k32 from here on
+    "peak_u8s8": (2 * 16 * 8 * 32, "TOPS"),
+    "peak_e4m3_f32": (2 * 16 * 8 * 32, "TFLOPS"),
+    "peak_e4m3_f16": (2 * 16 * 8 * 32, "TFLOPS"),
+    "peak_mix_s8s8_u8s8": (2 * 16 * 8 * 32, "TOPS"),
+    "peak_mix_s8s8_e4m3_f16": (2 * 16 * 8 * 32, "TOPS"),
+    "peak_i2f": (32, "T/s"),  # one conversion per lane
+    "peak_ex2": (32, "T/s"),
+}
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rounds", type=int, default=3)
+    args = ap.parse_args()
+
     blocks, threads = SMS * WARPS_PER_SM // 4, 128
     out = torch.empty(blocks * threads, device="cuda")
-    kernel = module("flash")["mma_peak"]
-    ms = time_ms(lambda: kernel(blocks, threads, out, ITERATIONS), runs=5)
-    flop = blocks * threads // 32 * ITERATIONS * MMA_PER_ITERATION * FLOP_PER_MMA
-    print(f"mma_peak: {ms:.1f} ms, {flop / ms / 1e9:.0f} TFLOPS")
+    peak = module("peak")
+    times: dict[str, list[float]] = {name: [] for name in FORMS}
+    for _ in range(args.rounds):
+        for name in FORMS:
+            times[name].append(time_ms(lambda name=name: peak[name](blocks, threads, out, ITERATIONS), runs=5))
+
+    warp_instructions = blocks * threads // 32 * ITERATIONS * CHAINS
+    for name, (work, unit) in FORMS.items():
+        ms = statistics.median(times[name])
+        print(f"{name:24} {warp_instructions * work / ms / 1e9:7.1f} {unit}")

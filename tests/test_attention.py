@@ -19,7 +19,11 @@ from emulate import emulate, errors, reference  # noqa: E402
 
 # The emulator settings each quantized kernel implements; the kernel must land on the emulator's
 # output, not merely near FP32. The two differ only in P (fp16 in the kernel) and in summation order.
-EMULATED = {"attention_int8qk": dict(qk="int8", q_block=128, k_block=64, smooth_k=True)}
+INT8_QK = dict(qk="int8", q_block=128, k_block=64, smooth_k=True)
+EMULATED = {
+    "attention_int8qk": INT8_QK,
+    "attention_int8pv": dict(INT8_QK, p_fmt="u8", v_fmt="int8", p_local=True),
+}
 MAX_FROM_EMULATOR = 1e-3
 
 # (batch, heads, n_queries, n_keys)

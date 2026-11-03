@@ -119,6 +119,106 @@ kernels alone had (0.686): the quantization no longer shows.
 **Verdict:** held. This run was ~14 % slower overall than the previous ones (`attention_smem`
 249.6 ms vs 218.5 ms), all kernels together; only the ratios are comparable across runs.
 
+## M3.3 — P·V format: u8 × s8 or e4m3 × e4m3 (prediction, before implementation)
+
+**Measured facts** (bench/peak.py, csrc/peak.cu, all forms alternating in one run, 8 independent chains
+per warp, 16 warps per SM):
+
+| Form | SASS | Rate |
+|---|---|---|
+| m16n8k16 bf16/f16 → f32 (today's exact path) | HMMA.16816.F32(.BF16) | 114.1 TFLOPS |
+| m16n8k32 s8 × s8 → s32 (Q·Kᵀ) | IMMA.16832.S8.S8 | 453.6 TOPS |
+| m16n8k32 u8 × s8 → s32 | IMMA.16832.U8.S8 | 465.2 TOPS |
+| m16n8k32 e4m3 × e4m3 → f16 | QMMA.16832.F16.E4M3.E4M3 | 456.1 TFLOPS |
+| m16n8k32 e4m3 × e4m3 → f32 | QMMA.16832.F32.E4M3.E4M3 | **226.5 TFLOPS (half rate)** |
+| s8 × s8 alternating with u8 × s8 (candidate A) | | 450.9 |
+| s8 × s8 alternating with e4m3 → f16 (candidate B) | | 448.5 |
+| int32 → f32 (`I2FP.F32.S32`) | ALU pipe, not the SFU (ncu: xu = 0) | ≥ 8.8 T/s (issue-bound with its IADD and FADD) |
+| `ex2.approx` | MUFU.EX2 | 3.9 T/s |
+
+So the two mixes differ by 0.5 %: equal tensor rate, measured, as long as FP8 accumulates in f16.
+Also on sm_120a, compiled: `ldmatrix.m16n16.x1.trans.b8` (LDSM.8.MT1616, 8-bit V transposed on the way
+in), `cvt.pack.sat.u8.s32.b32` (I2IP.U8.S32.SAT, packs u8), `cvt.rn.satfinite.e4m3x2.f32`
+(F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C, packs e4m3 into a register half without a PRMT).
+
+**Error, emulator** (8 × 32760, with INT8 Q·Kᵀ): u8 P (tile-local max) × s8 V per channel **1.75 %**,
+e4m3 P × e4m3 V per channel **3.95 %** (f16 accumulate 3.96 %). The sources add in quadrature:
+√(1.33² + 0.59² + 1.01²) = 1.77 and √(1.33² + 2.61² + 2.66²) = 3.96 (Q·Kᵀ, P, V alone).
+
+**Prediction** (per warp and tile, against `attention_int8qk`; P·V 2 × 16 = 32 mma in both):
+
+| | u8 × s8 | e4m3 × e4m3 → f16 |
+|---|---|---|
+| P·V mma | 32 IMMA.16832.U8.S8 | 32 QMMA.16832.F16.E4M3.E4M3 |
+| quantizing P | ~48: 32 F2I + 16 I2IP (the ×255 folds into the exponent) | ~16 F2FP (the ×2 folds into the exponent) |
+| flush per tile | +128: 64 I2FP + 64 FFMA (out = out·α + β·acc) | +128: 64 f16 → f32 + 64 FFMA |
+| removed | 512 bf16 → f16 conversions of V, half the V ldmatrix | the same |
+| registers | 210–235, no spills (accumulate one pair of d-blocks over both k-steps, then flush: 8 live accumulator registers, not 64) | ~4 fewer |
+| kernel time | 0.42–0.55 × `attention_int8qk` | the same, 0–3 % faster (32 fewer instructions per tile) |
+| error | 1.75 % ± 0.1 | 3.95 % ± 0.1 |
+
+The tensor floor falls to ~32 % of today's time (P·V 4× cheaper), issue to ~23 %, the SFU stays at ~8 %.
+
+**Decision:** u8 × s8 only. FP8 P·V at 3.95 % is not "well below SageAttention 2's 3.9 %" by
+construction, and its rate is already measured above; it is not built.
+
+## M3.3 — result: `attention_int8pv`, P·V in u8 × s8
+
+Built as predicted, with two layout facts measured first on the card: `ldmatrix.m16n16.x2.trans.b8`
+gives a lane keys 4·(lane % 4) .. + 3 of dim lane / 4 (and + 8), the m16n8k32 B fragment as is; and P
+leaves Q·Kᵀ with keys 2t, 2t+1, 8+2t, 9+2t in lane t's bytes, which mma reads as k = 4t .. 4t+3. The sum
+over k ignores order, so V's rows go into shared memory in P's order (`p_order_slot`): free, an address
+change in the tile load. V is quantized once per head (`quantize_v`, max per channel by `torch.aminmax`).
+
+Same run (bench/compare.py, 40 × 32760, 3 rounds, median of 5; the card ran slow, `attention_smem` 251.5
+instead of ~225 ms):
+
+| | `attention_int8qk` | `attention_int8pv` | predicted |
+|---|---|---|---|
+| whole call | 173.4 ms | **104.4 ms** | |
+| quantization (Q, K / + V) | 1.65 ms | 2.81 ms | V ~1 ms: held (1.16) |
+| kernel alone | 172.0 ms | **101.2 ms = 0.59×** | 0.42–0.55×: **wrong** |
+| rel L2 vs FP32 | 1.32 % | **1.73 %** | 1.75 ± 0.1 %: held |
+| kernel vs emulator | 0.08 % | **0.000–0.015 %** | ~0.1 %: better, P is now rounded alike in both |
+
+Against SageAttention, one more run (whole calls, 3 rounds): SDPA 519.9, SageAttention 2 **75.1 ms,
+3.90 %**, SageAttention 3 59.0 ms, 19.1 %, `attention_int8pv` **100.5 ms, 1.73 %**.
+
+Machine code (ptxas -v, SASS of the main loop, per warp and tile):
+
+| | `attention_int8qk` | `attention_int8pv` | predicted |
+|---|---|---|---|
+| registers, spills | 230, 0 | **253**, 0 | 210–235: wrong, occupancy unchanged (2 blocks / SM) |
+| shared memory | 26.6 KB | 18.4 KB | |
+| instructions | 1141 | **729** (0.64×) | |
+| mma | 64 HMMA + 32 IMMA | 32 IMMA.S8.S8 + 32 IMMA.U8.S8 | held |
+| quantizing P | 144 F2FP.F16 (fp16 P) | **16 F2IP.U8.F32.NTZ** | ~48: better, ptxas fuses rounding and packing, 2 values each |
+| V conversion | 128 PRMT + 256 IMAD.U32 | 0 | held |
+| flush | 64 FMUL | 64 FMUL + 64 I2FP + 64 FFMA | held |
+| LDSM | 32 MT88.4 + 16 M88.4 | 16 MT1616.2 (8-bit) + 16 M88.4 | |
+| exp2f | 34 MUFU.EX2 + 34 FSETP + ~68 FMUL | the same | not touched |
+
+F2IP rounds halves to even, like torch.round (tests/test_mma.py checks exact halves).
+
+Nsight Compute (4 heads):
+
+| | `attention_int8qk` | `attention_int8pv` |
+|---|---|---|
+| duration | 21.11 ms | 12.08 ms |
+| tensor pipe active | 80.0 % (HMMA 65.5 + IMMA 15.1) | **52.0 %** (IMMA) |
+| issue slots busy | 31.5 % | 33.8 % |
+| no eligible warp | 66.2 % | 62.9 % |
+| shared-memory bank conflicts (loads) | 93.8 K | **0** |
+| top stalls (M cycles) | math pipe 1.01, wait 0.74, long scoreboard 0.65 | wait 0.41, math pipe 0.38, long scoreboard 0.33, barrier 0.15 |
+
+**Why the time prediction missed:** it assumed the tensor and issue floors would overlap as well as
+before. They no longer bind: the tensor pipe is half idle and issue a third busy. With 2 warps per
+scheduler (253 registers allow 2 blocks of 4 warps per SM), 63 % of cycles no warp is ready: the kernel
+is now **latency-bound**. The waits are fixed-latency chains (exp2f's range check, the flush right after
+its mma), the global → register → shared tile loads (long scoreboard) and the barrier around them.
+What attacks this next: asynchronous tile loads (`cp.async` / TMA, the agreed step C), fewer
+instructions per exponent (`ex2.approx.ftz` instead of `exp2f`: ~100 per tile), or more warps per SM.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

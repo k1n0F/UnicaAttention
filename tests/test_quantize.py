@@ -14,7 +14,7 @@ import torch
 import unica
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
-from emulate import quant  # noqa: E402
+from emulate import QMAX, quant, to_fmt  # noqa: E402
 
 SHAPES = [(1, 2, 1000, 128), (2, 3, 77, 128), (1, 1, 128, 128)]  # partial last blocks, fewer tokens than a block
 
@@ -33,6 +33,20 @@ def test_matches_emulator_bit_for_bit():
             assert torch.equal(per_token, expected_scale), (shape, block)
 
 
+def test_v_matches_emulator_bit_for_bit():
+    torch.manual_seed(1)
+    for shape in SHAPES:
+        v = (torch.randn(shape, device="cuda") * torch.rand(shape[-1], device="cuda") * 4).bfloat16()
+        v8, scale = unica.quantize_v(v)
+        # bench/emulate.py's emulate(), v_fmt="int8"
+        expected_scale = (v.float().abs().amax(-2, keepdim=True) / QMAX["int8"]).clamp_min(1e-12)
+        expected = to_fmt(v.float() / expected_scale, "int8")
+
+        assert torch.equal(scale, expected_scale.squeeze(-2)), shape
+        assert torch.equal(v8.float(), expected), (shape, (v8.float() - expected).abs().max())
+
+
 if __name__ == "__main__":
     test_matches_emulator_bit_for_bit()
+    test_v_matches_emulator_bit_for_bit()
     print("quantize ok")

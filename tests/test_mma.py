@@ -46,6 +46,20 @@ def test_one_int8_mma_matches_torch_exactly():
     assert torch.equal(d, expected), (d - expected).abs().max()
 
 
+def test_pv_int8_tile_matches_torch_exactly():
+    torch.manual_seed(5)
+    p = torch.rand(16, KEYS_PER_TILE, device="cuda") * 255  # fractions too: the kernel rounds them like torch
+    p[0] = torch.arange(KEYS_PER_TILE, device="cuda") * 3 + 0.5  # exact halves: to even, 0.5 -> 0, 3.5 -> 4
+    v = torch.randint(-127, 128, (KEYS_PER_TILE, HEAD_DIM), device="cuda", dtype=torch.int8)
+    out = torch.empty(16, HEAD_DIM, device="cuda")
+
+    module("flash")["pv_int8_tile"](1, 4 * WARP_SIZE, p, v, out)
+    torch.cuda.synchronize()
+
+    expected = (p.round().double() @ v.double()).float()  # |sum| <= 64 · 255 · 127 < 2^24: exact in float
+    assert torch.equal(out, expected), (out - expected).abs().max()
+
+
 def test_qk_tile_matches_torch_exactly():
     torch.manual_seed(1)
     q, k = small_ints(16, HEAD_DIM), small_ints(KEYS_PER_TILE, HEAD_DIM)  # |q·k| <= 16 · 128, exact
@@ -92,6 +106,7 @@ def test_attention_warp_matches_fp32():
 if __name__ == "__main__":
     test_one_mma_matches_torch_exactly()
     test_one_int8_mma_matches_torch_exactly()
+    test_pv_int8_tile_matches_torch_exactly()
     test_qk_tile_matches_torch_exactly()
     test_softmax_stats_match_logsumexp()
     test_attention_warp_matches_fp32()
