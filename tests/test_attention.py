@@ -15,7 +15,12 @@ import torch
 import unica
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
-from emulate import errors, reference  # noqa: E402
+from emulate import emulate, errors, reference  # noqa: E402
+
+# The emulator settings each quantized kernel implements; the kernel must land on the emulator's
+# output, not merely near FP32. The two differ only in P (fp16 in the kernel) and in summation order.
+EMULATED = {"attention_int8qk": dict(qk="int8", q_block=128, k_block=64, smooth_k=True)}
+MAX_FROM_EMULATOR = 1e-3
 
 # (batch, heads, n_queries, n_keys)
 SHAPES = [
@@ -49,9 +54,17 @@ def test_every_kernel_matches_fp32_reference_on_all_shapes():
             out = unica.attention(q, k, v, kernel=kernel, **tile)
             error = errors(out.float(), ref)["rel_l2"]
             name = kernel + "".join(f" {key}={value}" for key, value in tile.items())
-            print(f"{name:52} {(batch, heads, n_queries, n_keys)!s:22} rel L2 {error:.3%}, floor {floor:.3%}")
             assert torch.isfinite(out).all(), name
-            assert error < floor + MAX_ABOVE_FLOOR, (name, error, floor)
+            if kernel in unica.QUANTIZED:
+                emulated = emulate(q, k, v, **EMULATED[kernel])
+                from_emulator = errors(out.float(), emulated)["rel_l2"]
+                predicted = errors(emulated, ref)["rel_l2"]
+                print(f"{name:52} {(batch, heads, n_queries, n_keys)!s:22} rel L2 {error:.3%}, "
+                      f"emulator predicts {predicted:.3%}, kernel vs emulator {from_emulator:.3%}")
+                assert from_emulator < MAX_FROM_EMULATOR, (name, from_emulator)
+            else:
+                print(f"{name:52} {(batch, heads, n_queries, n_keys)!s:22} rel L2 {error:.3%}, floor {floor:.3%}")
+                assert error < floor + MAX_ABOVE_FLOOR, (name, error, floor)
 
 
 def test_rejects_what_the_kernel_cannot_take():

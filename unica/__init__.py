@@ -9,17 +9,22 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 
 from unica.cuda import module
 
 HEAD_DIM = 128
 WARP_SIZE = 32
-ROWS_PER_WARP = 16  # must match csrc/flash.cu
+ROWS_PER_WARP = 16  # these three must match csrc/flash.cu
+Q_SCALE_BLOCK = 128
+K_SCALE_BLOCK = 64
 LOG2E = 1.4426950408889634
 
-# Every variant in csrc/flash.cu with the attention() signature, oldest first. All take the same grid
-# and block; bench/compare.py times them side by side.
-KERNELS = ("attention", "attention_smem")
+# Every variant in csrc/flash.cu, oldest first. All take the same grid and block; bench/compare.py
+# times them side by side. The quantized ones trade exactness for speed: their error is measured
+# against bench/emulate.py, which predicts it.
+KERNELS = ("attention", "attention_smem", "attention_int8qk")
+QUANTIZED = {"attention_int8qk"}
 DEFAULT_KERNEL = "attention_smem"
 
 # The tile shape csrc/flash.cu is built with when nothing overrides it (its UNICA_* macros).
@@ -59,5 +64,24 @@ def attention(
     warps = tile.get("WARPS_PER_BLOCK", TILE["WARPS_PER_BLOCK"])
     grid = (math.ceil(n_queries / (warps * ROWS_PER_WARP)), batch * heads)
     scale_log2 = HEAD_DIM**-0.5 * LOG2E
-    module("flash", **defines)[kernel](grid, warps * WARP_SIZE, q, k, v, out, n_queries, n_keys, scale_log2)
+    launch = module("flash", **defines)[kernel]
+    if kernel == "attention_int8qk":
+        # Quantized in torch, a separate pass before the kernel. Fusing it into the kernel is a later step.
+        q8, q_scale = quantize_int8(q.float(), Q_SCALE_BLOCK)
+        k = k.float()
+        k8, k_scale = quantize_int8(k - k.mean(-2, keepdim=True), K_SCALE_BLOCK)  # softmax cancels the mean
+        launch(grid, warps * WARP_SIZE, q8, k8, q_scale, k_scale, v, out, n_queries, n_keys, scale_log2)
+    else:
+        launch(grid, warps * WARP_SIZE, q, k, v, out, n_queries, n_keys, scale_log2)
     return out
+
+
+def quantize_int8(x: torch.Tensor, block: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """x ≈ x8 · scale, one scale per `block` tokens over all of d: [..., N, D] float -> int8 [..., N, D]
+    and float32 [..., ceil(N / block)]. The scale never varies along d, the axis Q·Kᵀ sums over, so the
+    int32 mma result is scaled once at the end. Same rounding as bench/emulate.py."""
+    n = x.shape[-2]
+    token_max = F.pad(x.abs().amax(-1), (0, -n % block))
+    scale = (token_max.unflatten(-1, (-1, block)).amax(-1) / 127).clamp_min(1e-12)
+    per_token = scale.repeat_interleave(block, -1)[..., :n, None]
+    return (x / per_token).round().clamp(-127, 127).to(torch.int8), scale.contiguous()

@@ -67,6 +67,40 @@ B3 = `__launch_bounds__(128, 3)`, ptxas fits registers for 3 blocks per SM.
 what costs is one block per SM (the W8 shapes lose 7–18 %). The register count is not the lever
 here, shared memory decides how many blocks fit as often as registers do.
 
+## M3.1 — INT8 Q·Kᵀ
+
+`attention_int8qk`: Q and K int8 with one scale per 128 Q tokens and per 64 K tokens (one per tile),
+K smoothed (mean over tokens subtracted). `mma.sync.m16n8k32.s32.s8.s8.s32`, exact int32 accumulate.
+The tile shares one Q scale and one K scale, so dequantization is a single number in the place of
+`scale_log2`: no instruction of its own, only 32 `I2F` per tile. P·V unchanged (FP16, from shared
+memory). Quantization runs in torch before the kernel, for now.
+
+**Hypotheses:** kernel 225 → ~155 ms (140–175): Q·Kᵀ is half the tensor work and gets 4× cheaper,
+tensor floor 200 → 125 ms, at ~82 % efficiency ~155 ms. Torch quantization +5–10 ms. Error as the
+emulator predicts, ~1.3 %.
+
+**Measured** (same run): kernel alone 218.5 → **149.9 ms (1.46×)**; with torch quantization 168.9 ms;
+quantization alone **21.7 ms**. Error 1.32 % at full shape; on every test shape the emulator's
+prediction to the third digit (1.231 % / 1.231 %, 1.337 % / 1.337 %), kernel vs emulator output 0.08 %.
+
+**Verdict:** kernel hypothesis held. Quantization hypothesis wrong, 2–4× over: torch makes about ten
+float32 passes over 670 MB. The traffic it needs is ~1.3 GB (read Q, K twice for the mean, write int8),
+~1.7 ms at 810 GB/s: a CUDA quantization kernel should save ~20 ms end to end.
+
+Machine code: 242 → 230 registers, no spills; per tile 128 HMMA → 64 HMMA + 32 IMMA, LDSM 64 → 48,
++32 I2F; shared memory 34.8 → 26.6 KB (3 blocks would now fit by shared memory, registers still allow 2).
+
+| Nsight Compute (4 heads) | `attention_smem` | `attention_int8qk` |
+|---|---|---|
+| tensor pipe, HMMA (now P·V only) | 87.7 % | 65.7 % |
+| tensor pipe, IMMA (Q·Kᵀ) | — | 15.2 % |
+| issue slots busy | 24.4 % | 33.9 % |
+| stalls: math pipe throttle | 2.21 M | 0.99 M |
+| stalls: long scoreboard (global → shared tile loads) | 0.61 M | 0.66 M |
+
+P·V is now two thirds of the tensor time, and the tile loads (`LDG` → `STS`, through registers) start
+to show: the place for FP8 P·V and for `cp.async` / TMA.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

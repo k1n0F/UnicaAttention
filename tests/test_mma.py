@@ -33,6 +33,19 @@ def test_one_mma_matches_torch_exactly():
     assert torch.equal(d, expected), (d, expected)
 
 
+def test_one_int8_mma_matches_torch_exactly():
+    torch.manual_seed(4)
+    a = torch.randint(-127, 128, (16, 32), device="cuda", dtype=torch.int8)  # the full int8 range: int32 is exact
+    b = torch.randint(-127, 128, (8, 32), device="cuda", dtype=torch.int8)
+    d = torch.empty(16, 8, device="cuda", dtype=torch.int32)
+
+    module("flash")["mma_s8_16x8x32"](1, WARP_SIZE, a, b, d)
+    torch.cuda.synchronize()
+
+    expected = (a.double() @ b.double().T).int()  # |sum| <= 127² · 32 < 2^53: float64 is exact
+    assert torch.equal(d, expected), (d - expected).abs().max()
+
+
 def test_qk_tile_matches_torch_exactly():
     torch.manual_seed(1)
     q, k = small_ints(16, HEAD_DIM), small_ints(KEYS_PER_TILE, HEAD_DIM)  # |q·k| <= 16 · 128, exact
@@ -78,6 +91,7 @@ def test_attention_warp_matches_fp32():
 
 if __name__ == "__main__":
     test_one_mma_matches_torch_exactly()
+    test_one_int8_mma_matches_torch_exactly()
     test_qk_tile_matches_torch_exactly()
     test_softmax_stats_match_logsumexp()
     test_attention_warp_matches_fp32()
