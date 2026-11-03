@@ -29,6 +29,10 @@ constexpr int MMA_K = 16;
 #ifndef UNICA_FAST_EXP2
 #define UNICA_FAST_EXP2 1
 #endif
+// M3.9: 0 brings back the multiply of out by alpha in every tile of the u8 kernels.
+#ifndef UNICA_LAZY_RESCALE
+#define UNICA_LAZY_RESCALE 1
+#endif
 
 constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 128;                      // WAN 2.2
@@ -906,6 +910,11 @@ __device__ __forceinline__ void p_fragment_u8(uint32_t p[4], const float scores[
 // so 8 int32 accumulators are alive at a time, not 64.
 __device__ __forceinline__ void pv_int8(float out[D_BLOCKS][4], const uint32_t p[PV8_STEPS][4], const int8_t* v_tile,
                                         const float alpha[2], const float beta[2], int lane) {
+#if UNICA_LAZY_RESCALE
+    // M3.9: alpha is exactly 1 unless the max of a row grew in this tile, and then out · alpha is out. When it
+    // is 1 in every row of the warp, the 64 multiplies are skipped. Rounding is the same on both paths.
+    if (!__all_sync(0xffffffff, alpha[0] == 1.0f && alpha[1] == 1.0f)) rescale_out(out, alpha);
+#endif
     const int8_t* lane_row = v_tile + lane * K8_STRIDE;  // keys 0..15 of a step for matrix 0, 16..31 for matrix 1
 #pragma unroll
     for (int pair = 0; pair < D_BLOCKS / 2; ++pair) {
@@ -923,7 +932,7 @@ __device__ __forceinline__ void pv_int8(float out[D_BLOCKS][4], const uint32_t p
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 float& o = out[2 * pair + half][i];
-                o = fmaf(beta[i / 2], __int2float_rn(acc[half][i]), o * alpha[i / 2]);
+                o = fmaf(beta[i / 2], __int2float_rn(acc[half][i]), UNICA_LAZY_RESCALE ? o : o * alpha[i / 2]);
             }
     }
 }

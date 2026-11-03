@@ -587,6 +587,59 @@ cannot keep the pipe full at 4 + ~1 cycle per filler. The levers, in this light:
    stretches without IMMA, but adds no instructions only if the registers allow it.
 3. **C** (K64 at 3 blocks) changes neither of the two. Expected ~0 % now, on firmer ground than in M3.7.
 
+## M3.9 — lazy rescale of `out` (prediction, before implementation)
+
+**What it attacks: FMA-pipe instructions per IMMA** (lever 1 of M3.8). The flush does
+`out = fmaf(beta, I2F(acc), out · alpha)`, 64 FMUL per tile, whether alpha is 1 or not. alpha is exactly 1
+when the running max of the row did not grow in this tile. On the benchmark's data (40 × 32760, random), a
+warp sees a new max in some of its 16 rows in **12.1 % of the tiles** (62 of 512, counted in torch on 2 heads).
+In the other 88 % the 64 FMUL multiply by 1.
+
+**Change** (`UNICA_LAZY_RESCALE`, default 1; 0 is the M3.8 kernel): one warp vote per tile. If every lane
+has alpha = 1 in both of its rows, `out` is left as it is. Otherwise `rescale_out` multiplies it first, the
+same 64 FMUL, in a branch that the warp takes as a whole. The flush becomes `fmaf(beta, I2F(acc), out)`. Both
+paths round exactly as before (`out · 1` is `out`), so the output does not change by a bit. The threshold
+variant of FlashAttention 4 (keep a stale max until it is off by more than τ) would skip more, but changes
+the rounding and the emulator. Not part of this step.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | **identical bit for bit** to LAZY_RESCALE=0, on all test shapes |
+| loop SASS | −64 FMUL on the path the warp usually takes, + ~4 (vote, compare, branch); the 64 FMUL move into a branch |
+| instructions executed (ncu) | **−7 %** (0.88 · 64 − 4 ≈ 52 of 676 per tile) |
+| registers | ~255, no spills |
+| kernel time | **−1 … −2 %**: 52 FMA-pipe instructions per tile at ~0.5–1 cycle each, by M3.8's microbenchmark, of ~3265 cycles per tile. Small, but a direct test of the M3.8 model. compare.py drifts by ±2 %, so the cycle count of ncu decides |
+
+## M3.9 — result
+
+| | LAZY_RESCALE=0 | LAZY_RESCALE=1 | predicted |
+|---|---|---|---|
+| output | | identical bit for bit, 6 shapes × {random keys, keys growing along the sequence} × both u8 kernels. The rescale branch runs in 47 % / 96 % of their tiles | held |
+| loop SASS | 676 | 673 static. The 64 FMUL sit in a branch (`VOTE.ALL`, `@P0 BRA` just before the P·V IMMA), so the usual path is **609** (−67) | held, −3 more than estimated |
+| registers, spills | 255, 0 | **224**, 0; still 2 blocks per SM (3 need ≤ 168) | ~255: missed, in the good direction |
+| instructions executed (ncu, 4 heads) | 2.638 G | 2.390 G (**−9.4 %**), FMA pipe 865 → 630 M (−27 %) | −7 %: held, a little more |
+| tensor pipe | 62.5 % | 63.9 % | |
+| active cycles per SM (ncu, 2 pairs of runs) | 20.45 / 20.54 M | 20.01 / 20.01 M: **−2.2 % / −2.6 %** | −1 … −2 %: **held, at the top and a little past it** |
+| kernel, 40 × 32760 (compare.py, both orders) | 88.3 / 89.7 ms | 86.5 / 87.5 ms: **−2.0 % / −2.5 %** | |
+| rel L2 | 1.73 % | 1.73 % | |
+
+**Findings:**
+
+- The model of M3.8 holds, and the removed FMUL were dearer than the microbenchmark said. ~59 instructions
+  fewer per tile on average saved ~2.3 % of ~3265 cycles, **~1.2 cycles each**, against 0.5–0.9 in
+  `peak_u8s8_mixed`. That matches the fit of M3.8 on the kernel itself (612 non-MMA instructions ≈ 614
+  cycles), not the perfect mix of the microbenchmark. In the real kernel a non-MMA instruction costs about a
+  cycle.
+- **Under ncu the clock is not fixed from one process to the next**: 1.97–2.29 GHz in these four runs.
+  Durations from separate ncu runs are not comparable. **Active cycles (`sm__cycles_active.avg`) are.**
+  The ncu durations compared across processes in M3.4–M3.8 carry this uncertainty. Their ratios inside one
+  report (pipe percentages, instruction counts) do not.
+- The threshold variant (FlashAttention 4: rescale only when the max grows by more than τ) would remove
+  the remaining 12 % of rescales and the vote. At ~1 cycle per instruction that is at most ~0.3 % more: not
+  worth giving up bit-exactness with the emulator for.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
