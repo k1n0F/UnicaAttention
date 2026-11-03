@@ -1238,6 +1238,72 @@ of K is 8.4 MB, L2 64 MB). That means ~40 launches instead of 5, or one cooperat
   gave (M3.12–13: 3–8 % of the cycles). **Expected net ≈ 0 %, for +0.05 … +0.16 % error.** Not
   implemented.
 
+## M3.22 — tile settings, again, on the TMA kernel (prediction, before measuring)
+
+Every tile choice so far (K64, 4 warps, 2 blocks) was made on older kernels. `attention_int8pv_tma` has fewer
+instructions per tile, no copy addresses, and different registers, so the balance may have moved. Compiled:
+
+| build | registers, spills | shared memory | blocks (warps) per SM |
+|---|---|---|---|
+| K64, 4 warps (now) | 235, 0 | 46.1 KB | 2 (8) |
+| K32, 4 warps | 188, 0 | 27.7 KB | 2 (8) |
+| K32, 4 warps, MIN_BLOCKS 3 | 168, 36 / 72 B | 27.7 KB | **3 (12)** |
+| K32, MIN_BLOCKS 4 | 128, 356 / 256 B | | heavy spills: skipped |
+| 8 warps, K64 | 235, 0 | 55.3 KB | 1 (8) |
+| 8 warps, K32 | 188, 0 | 36.9 KB | 1 (8) |
+| 6 warps | | | does not compile (a tile does not split over 6 warps) |
+
+**Hypotheses** (kernel alone, compare.py, all in one run):
+
+| build | predicted vs K64 4 warps |
+|---|---|
+| K32, 4 warps | **+5 … +10 %**: same warps, twice the per-tile overhead (M3.7 saw +17 % before TMA took the copies out of it) |
+| K32, 3 blocks | **−3 … +5 %**: 12 warps instead of 8 against the K32 overhead and a few spills; the most uncertain |
+| 8 warps, K64 | **0 … +5 %**: same 8 warps, but one block, so the barrier holds 8 warps and no other block fills its gaps |
+| 8 warps, K32 | **+5 … +15 %**: both costs |
+
+Output: 8 warps K64 bit for bit equal to 4 warps (the same arithmetic per row); the K32 builds against the
+emulator with `bc=32`.
+
+## M3.22 — result: nothing to change, and the card is power-limited
+
+All variants are correct (8 warps bit for bit; K32 within 0.1 % of the emulator at `bc=32`). compare.py,
+kernel alone (one run with all five; its spread was 8–13 %, the clock was high that run):
+
+| build | kernel | vs K64 4 warps | predicted |
+|---|---|---|---|
+| K64, 4 warps | 70.3 ms | | |
+| K32, 4 warps | 83.4 ms | **+18.6 %** | +5 … +10 %: missed, worse |
+| K32, 3 blocks | 78.8 ms | **+12.1 %** | −3 … +5 %: missed, worse |
+| 8 warps, K64 | 67.1 ms | (noise; see below) | 0 … +5 % |
+| 8 warps, K32 | 86.3 ms | +22.8 % | +5 … +15 %: worse |
+
+K32 stays out: 12 warps per SM do not pay for twice the per-tile overhead, even with the copies gone.
+
+**4 against 8 warps at K64, head to head:**
+
+| | 4 warps | 8 warps |
+|---|---|---|
+| compare.py, both orders | 73.8 / 74.7 ms | 72.9 / 74.0 ms (−1 %) |
+| ncu active cycles, 4 heads (2 runs) | 16.96 M | 18.05 / 18.07 M (**+6.5 %**) |
+| ncu active cycles, 40 heads | 168.0 M | 180.3 M (**+7.3 %**) |
+| tensor pipe (ncu) | 75.5 % | 70.9 % |
+| bank conflicts `op_ld` | 0.27–0.29 M | ~20 (one block per SM: no other block to collide with, M3.6) |
+| **SM clock / power, 6 s of calls (nvidia-smi)** | **2610 MHz / 360 W** | **~2800 MHz / 360 W** |
+| time per call there | 73.4 / 74.8 ms | 73.7 / 73.6 ms |
+
+**Finding: under full load the RTX 5080 runs at its power limit (360 W), not at a clock of its own.**
+Both builds draw exactly 360 W. The 4-warp build needs 7 % fewer cycles but spends more energy per cycle (its
+tensor pipe is busier), so the card clocks it 7 % lower: a tie in time. Consequences:
+
+- ncu's cycle counts (taken at a clock ncu sets) predict wall time only while the power limit does not bind.
+  At the benchmark shape it binds. Fewer cycles for the same work at the same energy buy nothing.
+- What makes the kernel faster now is **less energy per attention**: fewer instructions, less data moved
+  through registers and shared memory. M3.17 (−10 %) did that; packing the same work denser does not.
+- Wall time under load (compare.py, harness.py) is the measure that counts. ncu stays the tool for *why*.
+
+Nothing changes in the code: 4 warps K64 stays.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
