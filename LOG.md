@@ -696,6 +696,65 @@ The pairs of V are the next step: they need a different V8 layout.
   executed instructions). Before predicting it, the executed count of what they cost will be checked
   first, not only the static SASS.
 
+## M3.11 — V fragments in pairs (prediction, before implementation)
+
+**Executed first** (ncu SourceCounters, per warp and tile): 569.8 instructions, of them **55 MOV**. The 48
+before the P·V IMMA exist because `ldmatrix.m16n16.x2.trans.b8` returns {r0, r1, r2, r3} = (keys 0..15, dims
+c and c + 8; keys 16..31, dims c and c + 8). The IMMA wants one B operand per block of 8 dims, keys 0..15
+and 16..31 in two adjacent registers: {r0, r2} and {r1, r3}.
+
+**What it attacks:** FMA/ALU-pipe instructions per IMMA, as M3.9 did.
+
+**Change** (`UNICA_V_PAIRS`, default 1): the V tile in shared memory is laid out for the pairs. A row of a
+32-key step holds, for each block of 8 dims, those 8 dims of key slot j and then of slot j + 16. The
+"columns" c and c + 8 of the 16 × 16 matrix that ldmatrix transposes are then the same dims of slots j and
+j + 16. r0, r1 is the B operand of one block of dims, r2, r3 that of the next. 16 rows of 256 bytes per
+step, stride 272: rows shift by 4 banks, so 8 rows of one ldmatrix phase take 32 different banks. The V8
+format in global memory does not change. Each 16-byte copy of a V row is split into two 8-byte copies
+(`cp.async.ca`, 8 bytes; `.cg` takes only 16). +4 copies per thread and tile.
+`quantize_v` and its tests stay as they are. A V8 layout that matches in global memory would save those 4
+again, below the noise of M3.10.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | **identical bit for bit** (same products, same order of the sums) |
+| executed per warp-tile | 569.8 → **~526** (−48 MOV, +4 LDGSTS): −7.7 % |
+| registers | ≤ 224, no spills |
+| shared memory | unchanged (the new tile is 8704 bytes, inside the 9216 already reserved) |
+| bank conflicts | `ldmatrix` none, as now; the 8-byte copies: some, from the two halves of a 16-byte chunk |
+| kernel time | **−1.5 … −3 %**: 44 instructions at ~1.2 cycles is ~1.6 % of ~3265 cycles; more if the MOV were also on the path to the IMMA that read them |
+
+## M3.11 — result: pairing at copy time loses, not kept
+
+Two loaders tried, both bit-exact (the new test passed on all shapes, both u8 kernels, K64 and K32; the
+exact single-tile P·V test passed too). ncu, 4 heads, 2 runs each, identical within 0.1 %:
+
+| | executed instructions | active cycles | `LDGSTS` bank conflicts | tensor pipe | registers |
+|---|---|---|---|---|---|
+| V in rows of one key (M3.9) | 2.390 G | 20.01 M | ~1 K | 63.9 % | 224 |
+| **1.** each 16-byte chunk of a key row split into two 8-byte copies | **2.193 G (−8.2 %)** | 20.52 M (**+2.5 %**) | **152 M** | 62.3 % | 242 |
+| **2.** 8-byte pieces given out so that a warp writes one tile row of 256 bytes | 2.399 G (+0.4 %) | 20.42 M (+2.1 %) | 80 M | 62.6 % | 254 |
+
+compare.py (40 × 32760, kernel alone, both orders) for loader 1: 84.9 / 85.2 ms against 84.9 / 85.1 ms.
+No difference.
+
+- **The MOV go away as predicted:** 48 fewer per tile, 569.8 → 523 executed (predicted ~526). The pairing
+  itself is right.
+- **The copies take it back.** Loader 1: the 8-byte writes of 8 threads land 32 bytes apart, two to a bank
+  pair, and the 4 keys of a warp overlap on top. 152 M conflicts, ~36 extra wavefronts per tile, all on the
+  shared-memory pipe the ldmatrix also use. Loader 2 halves the conflicts, but computes a key and two
+  addresses for each of its 8 pieces in every tile: +48 instructions, as many as it saved. The addresses
+  stay the same from tile to tile, but there are no registers left to keep them (254).
+- **Prediction: missed.** −1.5 … −3 % predicted, +2 … +2.5 % measured: the cost of the 8-byte copies was
+  not in the model.
+- What would work: a V8 layout in **global memory** that already holds a tile row as it is wanted, so that
+  16-byte copies stay as they are (4 per thread, no key arithmetic, no conflicts). That changes the V8
+  format: `quantize_v`, V8 padded to whole tiles, its emulator test, the synchronous kernel and the
+  single-tile test. Expected gain: the 48 MOV and nothing else, −1.5 … −3 %. Not started; the code is back
+  to M3.9.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
