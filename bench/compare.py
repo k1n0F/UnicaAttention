@@ -5,6 +5,10 @@ Run-to-run drift (~10 %, all kernels together) is as large as many single optimi
 variant is only ever compared with another one timed in the same process, in alternating rounds.
 
     uv run python bench/compare.py [attention attention_smem ...] [--heads 40] [--tokens 32760]
+
+A variant is a kernel name, optionally with a tile shape (see unica.TILE):
+
+    attention_smem:WARPS_PER_BLOCK=8,KEYS_PER_TILE=32
 """
 
 from __future__ import annotations
@@ -17,6 +21,14 @@ from emulate import errors, reference
 from harness import time_ms
 
 import unica
+
+
+def parse_variant(spec: str) -> tuple[str, dict[str, int]]:
+    """"attention_smem:KEYS_PER_TILE=32" -> ("attention_smem", {"KEYS_PER_TILE": 32})."""
+    kernel, _, settings = spec.partition(":")
+    tile = {key: int(value) for key, value in (item.split("=") for item in settings.split(",") if item)}
+    return kernel, tile
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -36,13 +48,17 @@ if __name__ == "__main__":
     times: dict[str, list[float]] = {name: [] for name in args.kernels}
     for _ in range(args.rounds):
         for name in args.kernels:
-            times[name].append(time_ms(lambda name=name: unica.attention(q, k, v, kernel=name), args.runs))
+            kernel, tile = parse_variant(name)
+            run = lambda kernel=kernel, tile=tile: unica.attention(q, k, v, kernel=kernel, **tile)  # noqa: E731
+            times[name].append(time_ms(run, args.runs))
 
     flop = 4 * args.heads * args.tokens**2 * 128
     base = statistics.median(times[args.kernels[0]])
-    print(f"{'kernel':18} {'time':>9} {'spread':>8} {'vs first':>9} {'TFLOPS':>7} {'rel L2':>8}")
+    width = max(18, *map(len, args.kernels))
+    print(f"{'kernel':{width}} {'time':>9} {'spread':>8} {'vs first':>9} {'TFLOPS':>7} {'rel L2':>8}")
     for name in args.kernels:
         ms = statistics.median(times[name])
         spread = (max(times[name]) - min(times[name])) / ms
-        e = errors(unica.attention(q, k, v, kernel=name).float(), ref)
-        print(f"{name:18} {ms:7.1f}ms {spread:8.1%} {base / ms:8.2f}x {flop / ms / 1e9:7.0f} {e['rel_l2']:8.2%}")
+        kernel, tile = parse_variant(name)
+        e = errors(unica.attention(q, k, v, kernel=kernel, **tile).float(), ref)
+        print(f"{name:{width}} {ms:7.1f}ms {spread:8.1%} {base / ms:8.2f}x {flop / ms / 1e9:7.0f} {e['rel_l2']:8.2%}")

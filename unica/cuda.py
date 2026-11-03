@@ -24,15 +24,19 @@ def _check(res):
         raise RuntimeError(f"CUDA driver error {res}: {msg.value.decode() if msg.value else '?'}")
 
 
-def cubin(name):
+def cubin(name, defines=None):
     """csrc/<name>.cu -> build/<name>.cubin, rebuilt when the .cu is newer.
 
+    defines become -D flags, and each combination gets its own cubin: build/<name>-KEY1=1-KEY2=2.cubin.
     Only the .cu file's own time is checked: a change in an included header does not trigger a rebuild.
     """
-    src, out = ROOT / "csrc" / f"{name}.cu", ROOT / "build" / f"{name}.cubin"
+    defines = defines or {}
+    suffix = "".join(f"-{key}={value}" for key, value in sorted(defines.items()))
+    src, out = ROOT / "csrc" / f"{name}.cu", ROOT / "build" / f"{name}{suffix}.cubin"
     if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
         out.parent.mkdir(exist_ok=True)
-        cmd = ["nvcc", f"-arch={ARCH}", "-cubin", "-O3", "-std=c++17", "-lineinfo", "-o", str(out), str(src)]
+        flags = [f"-D{key}={value}" for key, value in sorted(defines.items())]
+        cmd = ["nvcc", f"-arch={ARCH}", "-cubin", "-O3", "-std=c++17", "-lineinfo", *flags, "-o", str(out), str(src)]
         subprocess.run(cmd, check=True)
     return out.read_bytes()
 
@@ -48,18 +52,19 @@ def _context():
 
 
 @functools.cache
-def module(name):
-    """csrc/<name>.cu, loaded once per process and kept until exit, as Triton and torch keep theirs.
-    Without unloading, repeated calls do not pile up. A changed .cu takes effect in a new process."""
-    return Module(name)
+def module(name, **defines):
+    """csrc/<name>.cu built with -D defines, loaded once per process and kept until exit, as Triton and
+    torch keep theirs. Without unloading, repeated calls do not pile up. A changed .cu takes effect in a
+    new process."""
+    return Module(name, defines)
 
 
 class Module:
     """One .cubin loaded into torch's context. module["name"] gives a kernel. Use module(), not this directly."""
 
-    def __init__(self, name):
+    def __init__(self, name, defines=None):
         _check(_cuda.cuCtxSetCurrent(_context()))
-        self._image = cubin(name)  # keeps the bytes alive while the module exists
+        self._image = cubin(name, defines)  # keeps the bytes alive while the module exists
         self._mod = ctypes.c_void_p()
         _check(_cuda.cuModuleLoadData(ctypes.byref(self._mod), self._image))
 

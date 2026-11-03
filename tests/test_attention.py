@@ -27,6 +27,13 @@ SHAPES = [
     (1, 4, 4096, 4096),  # long enough for the running max to rescale many times
 ]
 MAX_ABOVE_FLOOR = 5e-4
+# tile shapes bench/compare.py measures; each must be correct before its time means anything
+TILE_VARIANTS = [
+    {"WARPS_PER_BLOCK": 8},
+    {"KEYS_PER_TILE": 32},
+    {"WARPS_PER_BLOCK": 8, "KEYS_PER_TILE": 32},
+    {"MIN_BLOCKS_PER_SM": 3},
+]
 
 
 def test_every_kernel_matches_fp32_reference_on_all_shapes():
@@ -37,12 +44,14 @@ def test_every_kernel_matches_fp32_reference_on_all_shapes():
         ref = reference(q, k, v)
         floor = errors(ref.bfloat16().float(), ref)["rel_l2"]
 
-        for kernel in unica.KERNELS:
-            out = unica.attention(q, k, v, kernel=kernel)
+        variants = [(kernel, {}) for kernel in unica.KERNELS] + [("attention_smem", t) for t in TILE_VARIANTS]
+        for kernel, tile in variants:
+            out = unica.attention(q, k, v, kernel=kernel, **tile)
             error = errors(out.float(), ref)["rel_l2"]
-            print(f"{kernel:16} {(batch, heads, n_queries, n_keys)!s:24} rel L2 {error:.3%}, bf16 floor {floor:.3%}")
-            assert torch.isfinite(out).all(), kernel
-            assert error < floor + MAX_ABOVE_FLOOR, (kernel, error, floor)
+            name = kernel + "".join(f" {key}={value}" for key, value in tile.items())
+            print(f"{name:52} {(batch, heads, n_queries, n_keys)!s:22} rel L2 {error:.3%}, floor {floor:.3%}")
+            assert torch.isfinite(out).all(), name
+            assert error < floor + MAX_ABOVE_FLOOR, (name, error, floor)
 
 
 def test_rejects_what_the_kernel_cannot_take():

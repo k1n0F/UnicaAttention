@@ -14,10 +14,22 @@
 constexpr int MMA_N = 8;
 constexpr int MMA_K = 16;
 
+// Tile shape. unica.attention(..., KEYS_PER_TILE=32) and the like rebuild this file with -D to measure
+// other shapes; the step kernels and their tests assume the defaults.
+#ifndef UNICA_WARPS_PER_BLOCK
+#define UNICA_WARPS_PER_BLOCK 4
+#endif
+#ifndef UNICA_KEYS_PER_TILE
+#define UNICA_KEYS_PER_TILE 64
+#endif
+#ifndef UNICA_MIN_BLOCKS_PER_SM
+#define UNICA_MIN_BLOCKS_PER_SM 1
+#endif
+
 constexpr int WARP_SIZE = 32;
-constexpr int HEAD_DIM = 128;      // WAN 2.2
-constexpr int ROWS_PER_WARP = 16;  // query rows: the M of one mma
-constexpr int KEYS_PER_TILE = 64;  // keys one warp scores per pass
+constexpr int HEAD_DIM = 128;                      // WAN 2.2
+constexpr int ROWS_PER_WARP = 16;                  // query rows: the M of one mma
+constexpr int KEYS_PER_TILE = UNICA_KEYS_PER_TILE;  // keys one warp scores per pass
 
 // acc += A · Bᵀ on one warp. A is 16 × MMA_K, B is MMA_N × MMA_K, both row-major bf16.
 // B row-major is exactly the "col" operand PTX wants, so K needs no transpose for Q·Kᵀ.
@@ -343,7 +355,7 @@ extern "C" __global__ void attention_warp(const __nv_bfloat16* Q, const __nv_bfl
     }
 }
 
-constexpr int WARPS_PER_BLOCK = 4;
+constexpr int WARPS_PER_BLOCK = UNICA_WARPS_PER_BLOCK;
 constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;  // 64 query rows per block
 
 // Step 5: the whole attention, any lengths. Q and O are [heads][n_queries][HEAD_DIM], K and V are
@@ -385,6 +397,27 @@ extern "C" __global__ void attention(const __nv_bfloat16* Q, const __nv_bfloat16
     store_out(O + q_offset, out, row_sum, row, col, n_rows);
 }
 
+// Reference: the tensor-core peak of the mma mix attention runs, half bf16 (Q·Kᵀ) and half fp16 (P·V)
+// m16n8k16 with FP32 accumulate. 8 independent accumulators per warp, so no mma waits for the one
+// before it. Inputs are 1.0 everywhere; out keeps the result alive so nothing is optimised away.
+extern "C" __global__ void mma_peak(float* out, int iterations) {
+    const uint32_t ones_bf16 = 0x3f803f80, ones_f16 = 0x3c003c00;
+    const uint32_t a_bf16[4] = {ones_bf16, ones_bf16, ones_bf16, ones_bf16}, b_bf16[2] = {ones_bf16, ones_bf16};
+    const uint32_t a_f16[4] = {ones_f16, ones_f16, ones_f16, ones_f16}, b_f16[2] = {ones_f16, ones_f16};
+    float acc[8][4] = {};
+    for (int i = 0; i < iterations; ++i) {
+#pragma unroll
+        for (int chain = 0; chain < 8; chain += 2) {
+            mma_bf16_16816(acc[chain], a_bf16, b_bf16);
+            mma_f16_16816(acc[chain + 1], a_f16, b_f16);
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int chain = 0; chain < 8; ++chain) sum += acc[chain][0] + acc[chain][1] + acc[chain][2] + acc[chain][3];
+    out[blockIdx.x * blockDim.x + threadIdx.x] = sum;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // M2: speed. Each step is a separate kernel next to the one before it, so bench/compare.py can time
 // both in one run.
@@ -394,6 +427,7 @@ constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
 constexpr int CHUNK = 8;                          // bf16 in one 16-byte load
 constexpr int CHUNKS_PER_ROW = HEAD_DIM / CHUNK;  // 16
 constexpr int TILE_LOADS = KEYS_PER_TILE * CHUNKS_PER_ROW / THREADS_PER_BLOCK;  // 8 per thread
+static_assert(KEYS_PER_TILE * CHUNKS_PER_ROW % THREADS_PER_BLOCK == 0, "a tile must split evenly over the block");
 
 // Rows in shared memory are 8 bf16 longer than in K and V. Shared memory has 32 banks of 4 bytes, and a
 // 128-wide row is 256 bytes, exactly two rounds of banks: the 8 rows one ldmatrix reads would all start
@@ -489,8 +523,9 @@ __device__ __forceinline__ void pv_smem(float out[D_BLOCKS][4], const float scor
 }
 
 // M2 step 1: K and V tiles go through shared memory once per block, warps take fragments with ldmatrix.
-// Same grid, block and arguments as attention.
-extern "C" __global__ void attention_smem(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+// Same grid, block and arguments as attention. MIN_BLOCKS_PER_SM > 1 makes ptxas fit the registers so
+// that many blocks share an SM, spilling if it must.
+extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM) attention_smem(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                                           __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2) {
     __shared__ __align__(16) __nv_bfloat16 k_tile[KEYS_PER_TILE * SMEM_STRIDE];
     __shared__ __align__(16) __nv_bfloat16 v_tile[KEYS_PER_TILE * SMEM_STRIDE];

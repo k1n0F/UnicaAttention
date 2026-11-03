@@ -14,8 +14,7 @@ from unica.cuda import module
 
 HEAD_DIM = 128
 WARP_SIZE = 32
-WARPS_PER_BLOCK = 4  # these three must match csrc/flash.cu
-ROWS_PER_BLOCK = WARPS_PER_BLOCK * 16
+ROWS_PER_WARP = 16  # must match csrc/flash.cu
 LOG2E = 1.4426950408889634
 
 # Every variant in csrc/flash.cu with the attention() signature, oldest first. All take the same grid
@@ -23,13 +22,22 @@ LOG2E = 1.4426950408889634
 KERNELS = ("attention", "attention_smem")
 DEFAULT_KERNEL = "attention_smem"
 
+# The tile shape csrc/flash.cu is built with when nothing overrides it (its UNICA_* macros).
+TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1}
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str = DEFAULT_KERNEL) -> torch.Tensor:
+
+def attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str = DEFAULT_KERNEL, **tile: int
+) -> torch.Tensor:
     """softmax(q · kᵀ / sqrt(d)) · v, non-causal. q is [batch, heads, n_queries, 128]; k and v are
     [batch, heads, n_keys, 128], so cross-attention with a different n_keys works too.
-    kernel picks a variant from KERNELS, for tests and benchmarks."""
+
+    For tests and benchmarks: kernel picks a variant from KERNELS, and tile overrides entries of TILE,
+    e.g. KEYS_PER_TILE=32; each combination is its own cubin."""
     if kernel not in KERNELS:
         raise ValueError(f"unknown kernel {kernel!r}, expected one of {KERNELS}")
+    if unknown := tile.keys() - TILE.keys():
+        raise ValueError(f"unknown tile settings {sorted(unknown)}, expected some of {sorted(TILE)}")
     if not (q.dtype == k.dtype == v.dtype == torch.bfloat16):
         raise TypeError(f"q, k, v must be bfloat16, got {q.dtype}, {k.dtype}, {v.dtype}")
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
@@ -47,7 +55,9 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str = D
     # the kernel indexes plain [heads][tokens][128] arrays; for an already contiguous tensor this is free
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     out = torch.empty_like(q)
-    grid = (math.ceil(n_queries / ROWS_PER_BLOCK), batch * heads)
+    defines = {f"UNICA_{key}": value for key, value in tile.items() if TILE[key] != value}
+    warps = tile.get("WARPS_PER_BLOCK", TILE["WARPS_PER_BLOCK"])
+    grid = (math.ceil(n_queries / (warps * ROWS_PER_WARP)), batch * heads)
     scale_log2 = HEAD_DIM**-0.5 * LOG2E
-    module("flash")[kernel](grid, WARPS_PER_BLOCK * WARP_SIZE, q, k, v, out, n_queries, n_keys, scale_log2)
+    module("flash", **defines)[kernel](grid, warps * WARP_SIZE, q, k, v, out, n_queries, n_keys, scale_log2)
     return out
