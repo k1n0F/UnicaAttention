@@ -14,6 +14,7 @@ from unica.cuda import module
 WARP_SIZE = 32
 HEAD_DIM = 128
 KEYS_PER_TILE = 64
+LOG2E = 1.4426950408889634
 
 
 def small_ints(*shape: int) -> torch.Tensor:
@@ -44,7 +45,40 @@ def test_qk_tile_matches_torch_exactly():
     assert torch.equal(s, expected), (s - expected).abs().max()
 
 
+def test_softmax_stats_match_logsumexp():
+    n_keys = 1024  # 16 tiles: the running max is rescaled many times
+    scale = HEAD_DIM**-0.5
+    torch.manual_seed(2)
+    for q_gain in (1.0, 30.0):  # x30: up to 2^174 > FP32 max 2^128, unless the max is subtracted first
+        q = (torch.randn(16, HEAD_DIM, device="cuda") * q_gain).bfloat16()
+        k = torch.randn(n_keys, HEAD_DIM, device="cuda").bfloat16()
+        lse = torch.empty(16, device="cuda")
+
+        module("flash")["softmax_stats"](1, WARP_SIZE, q, k, lse, n_keys, scale * LOG2E)
+        torch.cuda.synchronize()
+
+        expected = torch.logsumexp(q.float() @ k.float().T * scale, dim=-1) * LOG2E  # log2-sum-exp2
+        torch.testing.assert_close(lse, expected, rtol=1e-5, atol=1e-4)
+
+
+def test_attention_warp_matches_fp32():
+    n_keys = 1024
+    torch.manual_seed(3)
+    q, k, v = (torch.randn(n, HEAD_DIM, device="cuda").bfloat16() for n in (16, n_keys, n_keys))
+    out = torch.empty(16, HEAD_DIM, device="cuda")
+
+    module("flash")["attention_warp"](1, WARP_SIZE, q, k, v, out, n_keys, HEAD_DIM**-0.5 * LOG2E)
+    torch.cuda.synchronize()
+
+    expected = torch.softmax(q.float() @ k.float().T * HEAD_DIM**-0.5, dim=-1) @ v.float()
+    rel_l2 = ((out - expected).norm() / expected.norm()).item()
+    print(f"attention_warp rel L2 vs FP32: {rel_l2:.3%}")
+    assert rel_l2 < 0.01, rel_l2  # P is rounded to bf16 before P·V
+
+
 if __name__ == "__main__":
     test_one_mma_matches_torch_exactly()
     test_qk_tile_matches_torch_exactly()
+    test_softmax_stats_match_logsumexp()
+    test_attention_warp_matches_fp32()
     print("mma ok")
