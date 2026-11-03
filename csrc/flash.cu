@@ -998,3 +998,98 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
 
     store_out(O + q_offset, out, row_sum, row, col, n_rows, v_scale);
 }
+
+// ---------------------------------------------------------------------------------------------------
+// M3.4: tiles load while the previous one is computed.
+// ---------------------------------------------------------------------------------------------------
+
+// 16 bytes global -> shared without passing through registers: the thread does not wait for them, it waits
+// later in cp_async_wait. src_bytes 0 reads nothing and writes 16 zeros. .cg: through L2 only, the tile is
+// read once per block and would only push other data out of L1.
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, int src_bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                 :: "r"(smem_address(dst)), "l"(src), "r"(src_bytes) : "memory");
+}
+
+// Every cp_async16 of this thread issued before it is one group; cp_async_wait waits for all groups.
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
+
+// load_tile8 with cp.async: the same chunks and slots, the copies only start here. Keys at or past n_keys
+// become zeros, read from nowhere: the address stays at key 0 of the tile, which always exists.
+template <bool P_ORDER = false>
+__device__ __forceinline__ void load_tile8_async(int8_t* tile, const int8_t* src, int n_keys) {
+#pragma unroll
+    for (int load = 0; load < K8_TILE_LOADS; ++load) {
+        const int chunk_index = load * THREADS_PER_BLOCK + threadIdx.x;
+        const int key = chunk_index / (HEAD_DIM / 16);
+        const int byte = chunk_index % (HEAD_DIM / 16) * 16;
+        const bool valid = key < n_keys;
+        cp_async16(tile + (P_ORDER ? p_order_slot(key) : key) * K8_STRIDE + byte,
+                   src + (valid ? key : 0) * HEAD_DIM + byte, valid ? 16 : 0);
+    }
+}
+
+// M3.4: attention_int8pv with two buffers per tile. Tile t + 1 is on its way while tile t is computed, and
+// one __syncthreads per tile does the work of two: at the top of tile t it means both "tile t has landed"
+// and "every warp is done with tile t − 1", whose buffer the load of tile t + 1 then reuses.
+// Same arguments, grid and block as attention_int8pv.
+extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
+    attention_int8pv_async(const int8_t* Q8, const int8_t* K8, const float* q_scale, const float* k_scale,
+                           const int8_t* V8, const float* v_scale, __nv_bfloat16* O, int n_queries, int n_keys,
+                           float scale_log2) {
+    __shared__ __align__(16) int8_t k_tiles[2][KEYS_PER_TILE * K8_STRIDE];
+    __shared__ __align__(16) int8_t v_tiles[2][KEYS_PER_TILE * K8_STRIDE];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row = lane / 4;
+    const int col = 2 * (lane % 4);
+
+    const int row0 = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP;
+    const int n_rows = min(n_queries - row0, ROWS_PER_WARP);
+
+    const size_t q_offset = (size_t(blockIdx.y) * n_queries + row0) * HEAD_DIM;
+    const size_t kv_offset = size_t(blockIdx.y) * n_keys * HEAD_DIM;
+    K8 += kv_offset;
+    V8 += kv_offset;
+    v_scale += size_t(blockIdx.y) * HEAD_DIM;
+    k_scale += size_t(blockIdx.y) * ((n_keys + K_SCALE_BLOCK - 1) / K_SCALE_BLOCK);
+    const float q_scale_log2 =
+        q_scale[size_t(blockIdx.y) * ((n_queries + Q_SCALE_BLOCK - 1) / Q_SCALE_BLOCK) + row0 / Q_SCALE_BLOCK] *
+        scale_log2;
+
+    load_tile8_async(k_tiles[0], K8, min(n_keys, KEYS_PER_TILE));
+    load_tile8_async<true>(v_tiles[0], V8, min(n_keys, KEYS_PER_TILE));
+    cp_async_commit();
+
+    uint32_t q[Q8_STEPS][4];
+    load_q8(q, Q8 + q_offset, row, col, n_rows);
+
+    float row_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
+    float row_sum[2] = {0.0f, 0.0f};
+    float out[D_BLOCKS][4] = {};
+
+    for (int key0 = 0, buffer = 0; key0 < n_keys; key0 += KEYS_PER_TILE, buffer ^= 1) {
+        cp_async_wait();  // this thread's part of tile key0
+        __syncthreads();  // everyone's part; and the other buffer is free
+        const int next = key0 + KEYS_PER_TILE;
+        if (next < n_keys) {
+            load_tile8_async(k_tiles[buffer ^ 1], K8 + next * HEAD_DIM, min(n_keys - next, KEYS_PER_TILE));
+            load_tile8_async<true>(v_tiles[buffer ^ 1], V8 + next * HEAD_DIM, min(n_keys - next, KEYS_PER_TILE));
+            cp_async_commit();
+        }
+
+        const int n_valid = min(n_keys - key0, KEYS_PER_TILE);
+        float scores[KEY_BLOCKS][4], alpha[2], beta[2];
+        qk_scores_int8(scores, q, k_tiles[buffer], lane);
+        if (n_valid < KEYS_PER_TILE) mask_scores(scores, col, n_valid);
+        online_softmax_u8(scores, row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
+        uint32_t p[PV8_STEPS][4];
+#pragma unroll
+        for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores, step);
+        pv_int8(out, p, v_tiles[buffer], alpha, beta, lane);
+    }
+
+    store_out(O + q_offset, out, row_sum, row, col, n_rows, v_scale);
+}

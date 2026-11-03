@@ -23,8 +23,8 @@ LOG2E = 1.4426950408889634
 # Every variant in csrc/flash.cu, oldest first. All take the same grid and block; bench/compare.py
 # times them side by side. The quantized ones trade exactness for speed: their error is measured
 # against bench/emulate.py, which predicts it.
-KERNELS = ("attention", "attention_smem", "attention_int8qk", "attention_int8pv")
-QUANTIZED = {"attention_int8qk", "attention_int8pv"}
+KERNELS = ("attention", "attention_smem", "attention_int8qk", "attention_int8pv", "attention_int8pv_async")
+QUANTIZED = {"attention_int8qk", "attention_int8pv", "attention_int8pv_async"}
 DEFAULT_KERNEL = "attention_smem"
 
 # The tile shape csrc/flash.cu is built with when nothing overrides it (its UNICA_* macros).

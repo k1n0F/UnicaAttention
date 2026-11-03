@@ -24,6 +24,7 @@ EMULATED = {
     "attention_int8qk": INT8_QK,
     "attention_int8pv": dict(INT8_QK, p_fmt="u8", v_fmt="int8", p_local=True),
 }
+EMULATED["attention_int8pv_async"] = EMULATED["attention_int8pv"]
 MAX_FROM_EMULATOR = 1e-3
 
 # (batch, heads, n_queries, n_keys)
@@ -71,6 +72,16 @@ def test_every_kernel_matches_fp32_reference_on_all_shapes():
                 assert error < floor + MAX_ABOVE_FLOOR, (name, error, floor)
 
 
+def test_async_loads_change_nothing_but_time():
+    torch.manual_seed(1)
+    for batch, heads, n_queries, n_keys in SHAPES:
+        q = torch.randn(batch, heads, n_queries, 128, device="cuda").bfloat16()
+        k, v = (torch.randn(batch, heads, n_keys, 128, device="cuda").bfloat16() for _ in range(2))
+        inputs = unica.kernel_inputs(q, k, v, "attention_int8pv")
+        sync = unica.attention(q, k, v, "attention_int8pv", inputs)
+        assert torch.equal(unica.attention(q, k, v, "attention_int8pv_async", inputs), sync), (n_queries, n_keys)
+
+
 def test_rejects_what_the_kernel_cannot_take():
     q = torch.randn(1, 1, 16, 64, device="cuda").bfloat16()  # head_dim 64
     for bad in (q, q.float()):
@@ -83,5 +94,6 @@ def test_rejects_what_the_kernel_cannot_take():
 
 if __name__ == "__main__":
     test_every_kernel_matches_fp32_reference_on_all_shapes()
+    test_async_loads_change_nothing_but_time()
     test_rejects_what_the_kernel_cannot_take()
     print("attention ok")

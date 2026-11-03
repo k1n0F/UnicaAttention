@@ -219,6 +219,66 @@ its mma), the global → register → shared tile loads (long scoreboard) and th
 What attacks this next: asynchronous tile loads (`cp.async` / TMA, the agreed step C), fewer
 instructions per exponent (`ex2.approx.ftz` instead of `exp2f`: ~100 per tile), or more warps per SM.
 
+## M3.4 — asynchronous tile loads (prediction, before implementation)
+
+**What it attacks: latency, not bandwidth.** DRAM is 2.5 % busy and L2 18 %. Each tile today goes
+global → registers → shared memory with two `__syncthreads` around it: every warp of the block waits for the
+slowest load of the tile, an L2 round trip of several hundred cycles, and only the other block on the SM
+works in the meantime. ncu: long scoreboard 0.33 M and barrier 0.15 M of ~1.97 M stall cycles, about a
+quarter.
+
+**Change** (`attention_int8pv_async`, otherwise `attention_int8pv` unchanged): `cp.async` copies 16 bytes
+global → shared without passing through registers, and the thread does not wait for it. Two buffers: tile
+t + 1 is loading while tile t is computed. One `__syncthreads` per tile instead of two: at the top of tile t
+it says both "tile t has landed" and "every warp is done with tile t − 1", whose buffer the next load
+reuses. Keys past the end: `cp.async` with source size 0 writes zeros. Why `cp.async` before TMA: the gain
+here is the overlap, which both give. TMA also saves issue slots (one thread per tile), but needs a tensor
+map from the driver and swizzled tiles instead of padded rows, which changes the ldmatrix addressing. It
+is a separate step, measured on its own.
+
+**Hypotheses:**
+
+| | `attention_int8pv` | `attention_int8pv_async`, predicted |
+|---|---|---|
+| kernel time | 101 ms (0.59 × int8qk) | **−8 … −20 %: 80–93 ms**, most of the load and barrier stalls hidden |
+| output | | **bit for bit the same**: the arithmetic does not change |
+| registers | 253 | 235–253, no spills (the 16 registers that carried each uint4 are gone); still 2 blocks per SM |
+| shared memory | 18.4 KB | 36.9 KB (two buffers); 2 blocks still fit in 100 KB |
+| SASS per tile | 8 LDG.E.128 + 8 STS.128, 2 BAR.SYNC | 8 LDGSTS.E.BYPASS.128, LDGDEPBAR, DEPBAR, 1 BAR.SYNC |
+| ncu | long scoreboard 0.33 M, barrier 0.15 M, tensor pipe 52 % | long scoreboard → ~0, barrier lower, tensor pipe ~58–65 % |
+
+## M3.4 — result
+
+Same run (bench/compare.py, 40 × 32760, 5 rounds, median of 5):
+
+| | `attention_int8pv` | `attention_int8pv_async` | predicted |
+|---|---|---|---|
+| kernel alone | 97.8 ms | **87.9 ms (−10.1 %)** | −8 … −20 %, 80–93 ms: **held, at the low end** |
+| whole call | 101.0 ms | **90.2 ms** | |
+| output | | identical bit for bit (test on all 6 shapes) | held |
+| registers, spills | 253, 0 | 253, 0 | held; 2 blocks per SM, limited by registers |
+| shared memory | 18.4 KB | 36.9 KB | held; the shared-memory limit falls from 5 blocks to 2, registers already allow only 2 |
+| loop SASS per tile | 729: 8 LDG.E.128 + 8 STS.128, 2 BAR.SYNC | 734: 8 LDGSTS.E.BYPASS.128, LDGDEPBAR, DEPBAR.LE, 1 BAR.SYNC | held |
+
+Nsight Compute (4 heads, its fixed clocks):
+
+| | `attention_int8pv` | `attention_int8pv_async` |
+|---|---|---|
+| duration | 10.50 ms | 7.81 ms (−26 %) |
+| tensor pipe active | 51.9 % | **62.0 %** |
+| no eligible warp | 63.0 % | 55.5 % |
+| stalls, long scoreboard / barrier (M) | 0.34 / 0.15 | **0.10 / 0.08** |
+| stalls, short scoreboard (M) | 0.05 | 0.10 |
+| shared-memory bank conflicts (`op_ld`) | 0 | 236 K |
+
+**Not predicted:** the gain depends on the shape and on the clock: 40 heads −10 %, 4 heads −15 %
+(CUDA events, 9.4 → 8.0 ms), ncu at its fixed clocks −26 %. Not explained yet. Also new: 236 K bank
+conflicts counted as shared loads, and short-scoreboard stalls doubled. The ldmatrix addresses did not
+change, so `LDGSTS` writing into permuted rows of the V tile is the first suspect; not checked yet.
+
+Still latency-bound: in 55 % of cycles no warp is ready, and the top stalls are now fixed-latency waits
+(0.39 M), math pipe (0.32 M) and the selected warp itself (0.38 M), with 2 warps per scheduler.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
