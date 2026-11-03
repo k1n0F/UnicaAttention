@@ -1354,6 +1354,31 @@ a mask and a positional `heads` reach the previous override; patching twice inst
 smoke test in ComfyUI's venv, random 4 heads × 2048 tokens: unica 1.63 %, SageAttention 2 3.72 %,
 SageAttention 3 18.7 %.
 
+## M5.3 — first errors on real Q, K, V
+
+Run by the Rigsy app's agent: the Rigsy WAN 2.2 I2V workflow (nvfp4 weights, lightx2v 4-step LoRA, normally
+on SageAttention 3), Unica Attention (native) after the KJ patch on both models, seed 42, `measure_every`
+20, `measure_heads` 2. 34 020 tokens per call. 160 self-attention calls = 4 steps × 40 blocks, so every 20th
+call fell on the same two blocks: **block 19** (calls 20, 60, 100, 140) and **block 39**, the last (40, 80,
+120, 160). rel L2 against FP32 on heads 0–1:
+
+| block | unica | SageAttention 2 | SageAttention 3 | SageAttention 2 / unica |
+|---|---|---|---|---|
+| 19, 4 steps | **1.13 / 1.18 / 1.21 / 1.26 %** | 1.51 / 1.72 / 1.65 / 1.67 % | 10.1 / 11.1 / 10.9 / 11.2 % | **1.33 … 1.45×** |
+| 39, 4 steps | 0.237 / 0.234 / 0.213 / 0.210 % | 0.226 / 0.241 / 0.211 / 0.203 % | 1.87 / 1.99 / 1.72 / 1.67 % | 0.95 … 1.03× |
+
+cos: unica ≥ 0.99992, SageAttention 2 ≥ 0.99985, SageAttention 3 ≥ 0.9939.
+
+- **Real attention is kinder than random inputs:** 0.2–1.3 % here against 1.73 % (unica) and 3.90 %
+  (SageAttention 2) on random data. Random inputs remain the worst case, as PLAN.md intends.
+- **The advantage over SageAttention 2 depends on the layer.** In block 19 unica is 1.33–1.45× more accurate.
+  In the last block both sit at ~0.2 % and tie, close to what bf16 output rounding alone leaves (0.17 % on
+  random data). SageAttention 3 is 8–9× worse than both throughout.
+- **Coverage is thin:** 2 of 40 blocks, 2 of 40 heads. A step multiple of 40 lands on the same blocks every
+  step. Next: `measure_every` coprime to 40 (e.g. 7 or 13), so the samples walk through all blocks, and more
+  heads per call.
+- The `*_ms` columns time 2 heads with a cold first call, and say nothing about speed.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
