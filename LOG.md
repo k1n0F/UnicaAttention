@@ -471,6 +471,122 @@ not a scale of the metric.
   K64 is already at the same ~63 % tensor wall with 2 warps, and C would pay the ~4 % of the register
   cap. Expectation before any work: 0 … −5 %.
 
+## M3.8 — the ~63 % tensor wall (investigation, prediction before measuring)
+
+The question: why does the tensor pipe idle a third of the time whether a scheduler has 2, 3 or 4 warps?
+Two explanations predict different things:
+
+- **H1, the warps bunch up.** Each warp alternates an MMA phase (Q·Kᵀ: 32 IMMA, P·V: 32 IMMA) with a phase
+  without MMA (max, exponents, packing, flush). If the warps of a scheduler drift into the same phase, they
+  queue for the tensor pipe together and then leave it idle together; more warps only make the queue
+  longer. Predicts: the math-pipe-throttle stalls fall on the IMMA instructions (≥ 70 % of them), and the
+  time a warp spends waiting at an IMMA grows with the number of warps.
+- **H2, one warp's chain.** Each warp has a fixed path per tile whose length is set by latencies (IMMA →
+  max → shuffle → exponent → pack → IMMA), and the tensor pipe cannot run ahead of it. Predicts:
+  the stalls are spread over the softmax instructions (wait, short scoreboard), not concentrated on IMMA.
+  More warps should then have helped, which M3.7 contradicts. So H1 is the favourite.
+
+**Measurement:** ncu source-level stall sampling (`SourceCounters`, `WarpStateStats`), samples per SASS
+instruction, summed by phase: Q·Kᵀ, softmax, P·V with its flush, loads and loop control. K64 with 2 warps per
+scheduler and B (K32, 4 blocks) with 4.
+
+**Stall sampling, K64** (840 K samples): 96 % of the math-pipe stalls are on IMMA, as H1 predicts, but that
+alone does not separate H1 from a plain tensor-bound burst. The SASS says more:
+
+- The 32 Q·Kᵀ IMMA are issued back to back, one instruction apart, alternating accumulators, each with
+  ~2600 "wait" samples: the fixed spacing between two IMMA of one warp, the pipe's own rate. No dependent
+  chains. Within an MMA phase a warp already feeds the pipe as fast as it takes.
+- ptxas reordered P·V: the 16 IMMA of step 0, then the 16 of step 1, then the flush, not pair by pair as the
+  source reads.
+- So the idle third of the tensor pipe lies entirely in the phases without MMA (softmax: ~200 instructions
+  between the last Q·Kᵀ and the first P·V IMMA, flush, loads). The question becomes: why do the other
+  warps of the scheduler not fill them?
+
+**Timeline probe** (`UNICA_TRACE`): every warp on SM 0 records `clock64` per tile at four points, each tied by
+a data dependency to the value that ends the phase: tile start, last Q·Kᵀ score converted, last P packed,
+last `out` flushed. MMA phases are [start, scores] and [P packed, out flushed]. Per scheduler (`%warpid % 4`),
+compare the time in which no warp is in an MMA phase with what independent warps would give, the product
+of (1 − each warp's MMA fraction).
+
+| | H1 (bunching) | independent phases |
+|---|---|---|
+| idle (no warp in MMA) vs the product | **clearly above**, ≥ 1.3× | ≈ 1× |
+| two warps in MMA at once vs independent | above | ≈ 1× |
+
+**Timeline result** (`bench/timeline.py`, 1 × 32760, SM 0):
+
+| | K64 | K32 | A: K32, 3 blocks | B: K32, 4 blocks |
+|---|---|---|---|---|
+| resident warps per scheduler | 2.00 | 2.00 | 2.99 | 3.55 |
+| MMA-phase fraction per warp | 0.63 | 0.54 | 0.61 | 0.83 |
+| no warp in MMA: measured / if independent | **0.078 / 0.125** | **0.041 / 0.120** | 0.096 / 0.067 | 0.009 / 0.004 |
+| 2+ warps in MMA: measured / if independent | 0.33 / 0.38 | 0.11 / 0.19 | 0.64 / 0.67 | 0.95 / 0.97 |
+| median cycles per tile: Q·Kᵀ / softmax / P·V + flush / barrier + loads | 1002 / 751 / 1020 / 329 | 468 / 497 / 568 / 227 | | 682 / 649 / 1033 / 412 |
+| whole tile, cycles | 3265 | 1724 | | 2905 |
+
+**H1 is refuted.** With 2 warps the warps interleave better than chance: there is less time with no warp in
+an MMA phase than independent warps would leave (0.078 vs 0.125). With 3 and 4 they are close to
+independent. There is no bunching to break up.
+
+What the timeline shows instead is one invariant: **~39 keys per 1000 cycles per scheduler** in every build:
+2 × 64 / 3265, 2 × 32 / 1724 and 3.55 × 32 / 2905. The tensor pipe at its peak rate (16.2 cycles per IMMA per
+scheduler, from `peak_u8s8`) would allow 62: 39 is the 63 %. A shared limit that does not move with warps
+or tile size. A warp in its Q·Kᵀ phase takes 31 cycles per IMMA, twice the peak spacing.
+
+**Next suspect: the MMA as the kernel issues it.** `peak_u8s8` gives every IMMA the same A register four
+times and the same B register twice, with nothing in between. The kernel gives each IMMA four A
+registers and a fresh B pair from ldmatrix, with ~10 other instructions per IMMA in the stream (676 / 64).
+Microbenchmark `peak_u8s8_mixed_N` (csrc/peak.cu): distinct operand registers per chain, and N independent
+FFMA per IMMA, at 2 and 4 warps per scheduler.
+
+| | predicted, if the wall is the mix | if it is not |
+|---|---|---|
+| distinct registers, 0 fillers | ~peak | ~peak |
+| 8–12 fillers per IMMA, 2 warps per scheduler | **~60–65 % of peak** | ≥ 90 % |
+
+**Microbenchmark result** (`bench/peak.py`, one run per row group; runs drift ±10 % with the clock):
+
+| per IMMA | 2 warps per scheduler | 4 warps per scheduler |
+|---|---|---|
+| nothing (`peak_u8s8`, one operand register) | 490 TOPS | 496 |
+| distinct operand registers, nothing else | 493 | 498 |
+| 4 FFMA | 460 (−7 %) | 465 |
+| 8 FFMA | 402 (−19 %) | 409 |
+| 12 FFMA | 342 (−31 %) | 350 |
+| 16 FFMA | 294 (−40 %) | 300 |
+| 8 FMUL | 402 | 405 |
+| 8 FMNMX | 397 | 398 |
+| 4 IADD3 (ptxas fused the 8 adds in pairs) | 357 | 378 |
+| 8 I2FP | **488 (free)** | 495 |
+| 8 MUFU.EX2 | 124 | 125 |
+
+- Distinct registers cost nothing; the operand pattern of `peak_u8s8` is not what made it fast.
+- **Other instructions take time away from the IMMA**, whatever the number of warps: 2 and 4 per
+  scheduler give the same numbers. Up to about 4 per IMMA they almost fit in its shadow. Past that each
+  FFMA, FMUL or FMNMX adds ~0.7–0.9 cycle to the 16 of the IMMA (8 → 16 fillers: 19.6 → 26.8 cycles per
+  IMMA). IADD3 costs more per instruction. Prediction "~60–65 % at 8–12": held at 12 (69 %), 8 is higher
+  (81 %).
+- **Free:** I2FP (the int → float conversions of the flush and the scores). MUFU runs in its own pipe and
+  limits only by its own rate (8 per IMMA = 64 cycles of SFU, so 25 %).
+- A first version of the fillers (C++ `fmaf(x, 0.5f, 1.0f)`, chains from 0) gave 306 TOPS at 8 per IMMA
+  instead of 402. Not explained and not reproduced. The cost per instruction above is uncertain by that
+  much.
+- This also explains M3.5. Its 108 removed instructions were 36 FSETP and 72 FMUL whose predicate was false
+  on every lane. If the predicated ones cost the IMMA nothing, the 36 FSETP at ~0.5–1 cycle each come to
+  0.6–1.1 %. 1.0 % was measured.
+
+**Conclusion of M3.8.** The ~63 % wall is not bunched warps (refuted) and not too few warps (M3.7). It is
+the work between the MMA, which shares the scheduler with them. Even perfectly mixed, the ~9.6 non-MMA
+instructions per IMMA of the kernel would cost a good part of the pipe. The rest is the phase structure:
+each warp has stretches of up to ~200 instructions with no IMMA ready (softmax), and the other warps then
+cannot keep the pipe full at 4 + ~1 cycle per filler. The levers, in this light:
+
+1. **Fewer FMA- and ALU-pipe instructions per IMMA**, above all in the flush (64 FMUL `out · alpha` + 64
+   FFMA per tile) and the softmax. Free pipes (I2FP, MUFU) do not count.
+2. **Overlap inside a warp** (Q·Kᵀ of tile t + 1 issued before the softmax of tile t). It shortens the
+   stretches without IMMA, but adds no instructions only if the registers allow it.
+3. **C** (K64 at 3 blocks) changes neither of the two. Expected ~0 % now, on firmer ground than in M3.7.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

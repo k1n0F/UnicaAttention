@@ -33,13 +33,19 @@ FORMS = {
     "peak_i2f": (32, "T/s"),  # one conversion per lane
     "peak_ex2": (32, "T/s"),
 }
+# M3.8: u8 × s8 with distinct operand registers and N FFMA per mma
+FORMS |= {f"peak_u8s8_mixed_{n}": (2 * 16 * 8 * 32, "TOPS") for n in (0, 4, 8, 12, 16)}
+FORMS |= {f"peak_u8s8_mixed_8_{kind}": (2 * 16 * 8 * 32, "TOPS") for kind in ("FFMA_IMM", "FMUL", "FMNMX", "IADD", "I2F", "EX2")}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("forms", nargs="*", default=list(FORMS))
     ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--warps-per-sm", type=int, default=WARPS_PER_SM, help="8 = 2 per scheduler, as attention runs")
     args = ap.parse_args()
+    FORMS = {name: FORMS[name] for name in args.forms}
 
-    blocks, threads = SMS * WARPS_PER_SM // 4, 128
+    blocks, threads = SMS * args.warps_per_sm // 4, 128
     out = torch.empty(blocks * threads, device="cuda")
     peak = module("peak")
     times: dict[str, list[float]] = {name: [] for name in FORMS}

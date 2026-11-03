@@ -1062,6 +1062,53 @@ __device__ __forceinline__ void load_tile8_async(int8_t* tile, const int8_t* src
     }
 }
 
+// M3.8: a timeline of the tile loop for the warps of SM 0, built only with -DUNICA_TRACE=1 (bench/timeline.py).
+// Each such warp takes a slot and records clock64 at TRACE_POINTS places of every tile; trace_read copies it
+// all out. Without UNICA_TRACE the marks are empty and the kernel is the same instruction for instruction.
+#ifndef UNICA_TRACE
+#define UNICA_TRACE 0
+#endif
+#if UNICA_TRACE
+constexpr int TRACE_SLOTS = 64, TRACE_TILES = 1024, TRACE_POINTS = 4;  // bench/timeline.py has them too
+__device__ long long trace_clocks[TRACE_SLOTS][TRACE_TILES][TRACE_POINTS];
+__device__ int trace_warp[TRACE_SLOTS];  // %warpid: the scheduler is %warpid % 4
+__device__ int trace_used;
+
+// The slot of this warp, or -1 when it is not on SM 0 or the slots are full. Same value in every lane.
+__device__ __forceinline__ int trace_slot(int lane) {
+    unsigned sm, warp_id;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+    asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp_id));
+    int slot = -1;
+    if (sm == 0 && lane == 0) {
+        slot = atomicAdd(&trace_used, 1);
+        if (slot < TRACE_SLOTS) trace_warp[slot] = warp_id;
+        else slot = -1;
+    }
+    return __shfl_sync(0xffffffff, slot, 0);
+}
+
+__device__ __forceinline__ void trace_mark(int slot, int lane, int tile, int point) {
+    long long now;
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(now) :: "memory");
+    if (slot >= 0 && lane == 0 && tile < TRACE_TILES) trace_clocks[slot][tile][point] = now;
+}
+
+// clocks: int64 [TRACE_SLOTS][TRACE_TILES][TRACE_POINTS], warps: int32 [TRACE_SLOTS], used: int32 [1]. Then
+// clears the slots for the next run. One thread.
+extern "C" __global__ void trace_read(long long* clocks, int* warps, int* used) {
+    for (int i = 0; i < TRACE_SLOTS * TRACE_TILES * TRACE_POINTS; ++i) clocks[i] = (&trace_clocks[0][0][0])[i];
+    for (int i = 0; i < TRACE_SLOTS; ++i) warps[i] = trace_warp[i];
+    *used = min(trace_used, TRACE_SLOTS);
+    trace_used = 0;
+}
+#define TRACE_SLOT(lane) trace_slot(lane)
+#define TRACE_MARK(slot, lane, tile, point) trace_mark(slot, lane, tile, point)
+#else
+#define TRACE_SLOT(lane) (-1)
+#define TRACE_MARK(slot, lane, tile, point) ((void)0)
+#endif
+
 // M3.4: attention_int8pv with two buffers per tile. Tile t + 1 is on its way while tile t is computed, and
 // one __syncthreads per tile does the work of two: at the top of tile t it means both "tile t has landed"
 // and "every warp is done with tile t − 1", whose buffer the load of tile t + 1 then reuses.
@@ -1101,6 +1148,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     float row_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
     float row_sum[2] = {0.0f, 0.0f};
     float out[D_BLOCKS][4] = {};
+    [[maybe_unused]] const int slot = TRACE_SLOT(lane);
 
     for (int key0 = 0, buffer = 0; key0 < n_keys; key0 += KEYS_PER_TILE, buffer ^= 1) {
         cp_async_wait();  // this thread's part of tile key0
@@ -1112,15 +1160,20 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
             cp_async_commit();
         }
 
+        [[maybe_unused]] const int tile = key0 / KEYS_PER_TILE;
+        TRACE_MARK(slot, lane, tile, 0);
         const int n_valid = min(n_keys - key0, KEYS_PER_TILE);
         float scores[KEY_BLOCKS][4], alpha[2], beta[2];
         qk_scores_int8(scores, q, k_tiles[buffer], lane);
+        TRACE_MARK(slot, lane, tile, 1);
         if (n_valid < KEYS_PER_TILE) mask_scores(scores, col, n_valid);
         online_softmax_u8(scores, row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
         uint32_t p[PV8_STEPS][4];
 #pragma unroll
         for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores, step);
+        TRACE_MARK(slot, lane, tile, 2);
         pv_int8(out, p, v_tiles[buffer], alpha, beta, lane);
+        TRACE_MARK(slot, lane, tile, 3);
     }
 
     store_out(O + q_offset, out, row_sum, row, col, n_rows, v_scale);

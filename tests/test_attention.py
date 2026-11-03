@@ -101,6 +101,14 @@ def test_bare_exp2_changes_nothing_but_time():
         assert torch.equal(unica.attention(q, k, v, "attention_int8pv_async", inputs), exp2f), (n_queries, n_keys)
 
 
+def test_trace_build_changes_nothing_but_time():
+    torch.manual_seed(3)
+    q, k, v = (torch.randn(1, 2, 1000, 128, device="cuda").bfloat16() for _ in range(3))
+    inputs = unica.kernel_inputs(q, k, v, "attention_int8pv_async")
+    plain = unica.attention(q, k, v, "attention_int8pv_async", inputs)
+    assert torch.equal(unica.attention(q, k, v, "attention_int8pv_async", inputs, TRACE=1), plain)
+
+
 def test_rejects_what_the_kernel_cannot_take():
     q = torch.randn(1, 1, 16, 64, device="cuda").bfloat16()  # head_dim 64
     for bad in (q, q.float()):
@@ -115,5 +123,6 @@ if __name__ == "__main__":
     test_every_kernel_matches_fp32_reference_on_all_shapes()
     test_async_loads_change_nothing_but_time()
     test_bare_exp2_changes_nothing_but_time()
+    test_trace_build_changes_nothing_but_time()
     test_rejects_what_the_kernel_cannot_take()
     print("attention ok")

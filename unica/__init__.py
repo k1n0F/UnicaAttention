@@ -28,8 +28,8 @@ QUANTIZED = {"attention_int8qk", "attention_int8pv", "attention_int8pv_async"}
 DEFAULT_KERNEL = "attention_smem"
 
 # The tile shape csrc/flash.cu is built with when nothing overrides it (its UNICA_* macros). FAST_EXP2=0
-# brings back exp2f in the u8 kernels, to measure M3.5.
-TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1}
+# brings back exp2f in the u8 kernels, to measure M3.5; TRACE=1 records a timeline (bench/timeline.py).
+TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "TRACE": 0}
 
 
 def attention(
