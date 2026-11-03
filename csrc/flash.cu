@@ -673,6 +673,74 @@ __device__ __forceinline__ void qk_scores_int8(float scores[KEY_BLOCKS][4], cons
         for (int i = 0; i < 4; ++i) scores[block][i] = __int2float_rn(acc[block][i]);
 }
 
+constexpr int QUANTIZE_THREADS = 256;
+
+// Max over the whole block of threads; every thread gets it.
+__device__ __forceinline__ float block_max(float x) {
+    __shared__ float warp_max[QUANTIZE_THREADS / WARP_SIZE];
+#pragma unroll
+    for (int lanes = WARP_SIZE / 2; lanes > 0; lanes /= 2) x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, lanes));
+    if (threadIdx.x % WARP_SIZE == 0) warp_max[threadIdx.x / WARP_SIZE] = x;
+    __syncthreads();
+    x = warp_max[0];
+#pragma unroll
+    for (int warp = 1; warp < QUANTIZE_THREADS / WARP_SIZE; ++warp) x = fmaxf(x, warp_max[warp]);
+    return x;
+}
+
+// 8 neighbouring values of one row as float, minus the mean of their dims if there is one.
+__device__ __forceinline__ void load_chunk(float values[CHUNK], const __nv_bfloat16* src, const float* mean) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(src);
+    const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
+#pragma unroll
+    for (int i = 0; i < CHUNK / 2; ++i) {
+        const float2 pair = __bfloat1622float2(pairs[i]);
+        values[2 * i] = pair.x - (mean ? mean[2 * i] : 0.0f);
+        values[2 * i + 1] = pair.y - (mean ? mean[2 * i + 1] : 0.0f);
+    }
+}
+
+// Quantization for attention_int8qk. One block of threads per scale block: block_tokens tokens of one head,
+// x ≈ x8 · scale with x = X − mean (mean [heads][HEAD_DIM], or null). Bit for bit what bench/emulate.py's
+// quant() computes: the same max, the same IEEE division (nvcc's default), round half to even like
+// torch.round. The block is read twice; the second read comes from L2, not from VRAM.
+// Grid: (ceil(n_tokens / block_tokens), heads). Block: QUANTIZE_THREADS.
+extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
+    quantize_int8(const __nv_bfloat16* X, const float* mean, int8_t* X8, float* scale, int n_tokens, int block_tokens) {
+    const int token0 = blockIdx.x * block_tokens;
+    const int n_chunks = min(block_tokens, n_tokens - token0) * CHUNKS_PER_ROW;
+    const size_t offset = (size_t(blockIdx.y) * n_tokens + token0) * HEAD_DIM;
+    X += offset;
+    X8 += offset;
+    if (mean) mean += blockIdx.y * HEAD_DIM;
+
+    float local_max = 0.0f;
+    for (int chunk = threadIdx.x; chunk < n_chunks; chunk += QUANTIZE_THREADS) {
+        const int dim = chunk % CHUNKS_PER_ROW * CHUNK;
+        float values[CHUNK];
+        load_chunk(values, X + chunk * CHUNK, mean ? mean + dim : nullptr);
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) local_max = fmaxf(local_max, fabsf(values[i]));
+    }
+    // · (1/127), not / 127: torch divides a tensor by a scalar as a multiplication by its reciprocal, and
+    // the two differ in the last bit for some maxima. The emulator is the reference, so match it.
+    const float block_scale = fmaxf(block_max(local_max) * (1.0f / 127.0f), 1e-12f);
+    if (threadIdx.x == 0) scale[size_t(blockIdx.y) * gridDim.x + blockIdx.x] = block_scale;
+
+    for (int chunk = threadIdx.x; chunk < n_chunks; chunk += QUANTIZE_THREADS) {
+        const int dim = chunk % CHUNKS_PER_ROW * CHUNK;
+        float values[CHUNK];
+        load_chunk(values, X + chunk * CHUNK, mean ? mean + dim : nullptr);
+        uint32_t packed[2] = {0, 0};
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) {
+            const int value = __float2int_rn(fminf(fmaxf(rintf(values[i] / block_scale), -127.0f), 127.0f));
+            packed[i / 4] |= uint32_t(value & 0xff) << (8 * (i % 4));
+        }
+        *reinterpret_cast<uint2*>(X8 + chunk * CHUNK) = make_uint2(packed[0], packed[1]);
+    }
+}
+
 // M3 step 1: Q·Kᵀ in int8, P·V as in attention_smem. Q8 and K8 are int8 [heads][tokens][HEAD_DIM]
 // with K smoothed (its mean over tokens subtracted: softmax cancels it); q_scale and k_scale hold one
 // scale per Q_SCALE_BLOCK and K_SCALE_BLOCK tokens, [heads][blocks]. q·k ≈ q̂·k̂ · q_scale · k_scale.

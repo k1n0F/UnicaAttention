@@ -101,6 +101,24 @@ Machine code: 242 → 230 registers, no spills; per tile 128 HMMA → 64 HMMA + 
 P·V is now two thirds of the tensor time, and the tile loads (`LDG` → `STS`, through registers) start
 to show: the place for FP8 P·V and for `cp.async` / TMA.
 
+## M3.2 — quantization in CUDA
+
+`quantize_int8` in csrc/flash.cu: one block of 256 threads per scale block, max over the block, then
+a second read (from L2) that writes int8. The K mean stays in torch (`k.mean(-2, dtype=float32)`, one
+pass, 0.39 ms). Bit for bit bench/emulate.py's `quant()` (tests/test_quantize.py), which needed one
+finding: torch divides a tensor by a scalar as a multiplication by the reciprocal, so the scale is
+`max · (1/127)`, not `max / 127`; the two differed in the last bit for 1 block in 32.
+
+**Hypothesis:** 21.7 → ~2 ms (2–3): ~1.34 GB of VRAM traffic at 810 GB/s is 1.65 ms.
+
+**Measured** (same run): torch 22.6 ms → **CUDA 1.59 ms (14×)**, 0.39 ms of it the torch K mean.
+Nsight Compute: DRAM throughput **90 %** in both launches (Q 573 µs, K 554 µs): bound by VRAM, as it
+should be. End to end, `attention_int8qk` / `attention_smem` = 0.686 in the same run, the ratio the
+kernels alone had (0.686): the quantization no longer shows.
+
+**Verdict:** held. This run was ~14 % slower overall than the previous ones (`attention_smem`
+249.6 ms vs 218.5 ms), all kernels together; only the ratios are comparable across runs.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

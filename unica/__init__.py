@@ -6,10 +6,10 @@ UnicaAttention: attention kernel made for the RTX 5080 (sm_120).
 
 from __future__ import annotations
 
+import ctypes
 import math
 
 import torch
-import torch.nn.functional as F
 
 from unica.cuda import module
 
@@ -66,22 +66,27 @@ def attention(
     scale_log2 = HEAD_DIM**-0.5 * LOG2E
     launch = module("flash", **defines)[kernel]
     if kernel == "attention_int8qk":
-        # Quantized in torch, a separate pass before the kernel. Fusing it into the kernel is a later step.
-        q8, q_scale = quantize_int8(q.float(), Q_SCALE_BLOCK)
-        k = k.float()
-        k8, k_scale = quantize_int8(k - k.mean(-2, keepdim=True), K_SCALE_BLOCK)  # softmax cancels the mean
+        q8, q_scale = quantize_int8(q, None, Q_SCALE_BLOCK)
+        k8, k_scale = quantize_int8(k, k.mean(-2, dtype=torch.float32), K_SCALE_BLOCK)  # softmax cancels the mean
         launch(grid, warps * WARP_SIZE, q8, k8, q_scale, k_scale, v, out, n_queries, n_keys, scale_log2)
     else:
         launch(grid, warps * WARP_SIZE, q, k, v, out, n_queries, n_keys, scale_log2)
     return out
 
 
-def quantize_int8(x: torch.Tensor, block: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """x ≈ x8 · scale, one scale per `block` tokens over all of d: [..., N, D] float -> int8 [..., N, D]
-    and float32 [..., ceil(N / block)]. The scale never varies along d, the axis Q·Kᵀ sums over, so the
-    int32 mma result is scaled once at the end. Same rounding as bench/emulate.py."""
-    n = x.shape[-2]
-    token_max = F.pad(x.abs().amax(-1), (0, -n % block))
-    scale = (token_max.unflatten(-1, (-1, block)).amax(-1) / 127).clamp_min(1e-12)
-    per_token = scale.repeat_interleave(block, -1)[..., :n, None]
-    return (x / per_token).round().clamp(-127, 127).to(torch.int8), scale.contiguous()
+QUANTIZE_THREADS = 256  # must match csrc/flash.cu
+
+
+def quantize_int8(x: torch.Tensor, mean: torch.Tensor | None, block: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """x − mean ≈ x8 · scale, one scale per `block` tokens over all of d. x is contiguous bf16
+    [batch, heads, N, 128], mean float32 [batch, heads, 128] or None. Returns int8 [batch, heads, N, 128]
+    and float32 scales [batch, heads, ceil(N / block)]. The scale never varies along d, the axis Q·Kᵀ sums
+    over, so the int32 mma result is scaled once at the end. Bit for bit bench/emulate.py's quant()."""
+    batch, heads, n, _ = x.shape
+    x = x.contiguous()
+    x8 = torch.empty(x.shape, dtype=torch.int8, device=x.device)
+    scale = torch.empty(batch, heads, math.ceil(n / block), device=x.device)
+    grid = (scale.shape[-1], batch * heads)
+    mean_arg = mean.contiguous() if mean is not None else ctypes.c_void_p(0)
+    module("flash")["quantize_int8"](grid, QUANTIZE_THREADS, x, mean_arg, x8, scale, n, block)
+    return x8, scale
