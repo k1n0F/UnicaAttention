@@ -1331,6 +1331,29 @@ Known cost of this first version: the layout copies, ~3 × 335 MB in and 335 MB 
 ~76 ms call. Reading WanVideoWrapper's layout directly in the quantize kernels and in store_out would remove
 them.
 
+## M5.2 — a node for ComfyUI's own WAN model
+
+The author's Rigsy workflow runs WAN on ComfyUI's own nodes (`MODEL`), with `PathchSageAttentionKJ`. The
+WanVideoWrapper workflow of M5.1 ran the system out of RAM: both 14B models offloaded to RAM with block
+swap, and the text encoder on the CPU.
+
+**Unica Attention (native)**, in the same `comfyui/__init__.py`, uses ComfyUI's
+`transformer_options["optimized_attention_override"]`, which every attention call of ComfyUI's models goes
+through (`wrap_attn` in `comfy/ldm/modules/attention.py`; for WAN's self-attention it also takes the tensors
+out of their `AttentionTensorContainer` first). `PathchSageAttentionKJ` writes its own function into the same
+key, so this node goes **after** it and keeps it as the previous override:
+
+- self-attention (head_dim 128, as many keys as queries, no mask, default scale, `heads` passed by name) goes
+  to unica, in both of ComfyUI's layouts ([b, s, heads · 128] and, with skip_reshape, [b, heads, s, 128]);
+- every other call, including cross-attention to the text, goes unchanged to the previous override
+  (SageAttention there) or to ComfyUI's own function;
+- `measure_every` works as in M5.1, and the CSV now also has SageAttention 3 where it is installed.
+
+`tests/test_comfyui.py`: self-attention equal to `unica.attention` bit for bit in both layouts; cross-attention,
+a mask and a positional `heads` reach the previous override; patching twice installs it once. Measurement
+smoke test in ComfyUI's venv, random 4 heads × 2048 tokens: unica 1.63 %, SageAttention 2 3.72 %,
+SageAttention 3 18.7 %.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
