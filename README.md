@@ -15,6 +15,7 @@
   <img src="https://img.shields.io/badge/platform-Windows%2011-lightgrey" alt="Windows 11">
   <img src="https://img.shields.io/badge/CUDA-PTX%20%2B%20native%20ctypes-76B900?logo=nvidia&logoColor=white" alt="PTX and native ctypes">
   <img src="https://img.shields.io/badge/ComfyUI-nodes-blue" alt="ComfyUI nodes">
+  <a href="https://github.com/k1n0F/vramsuite"><img src="https://img.shields.io/badge/measured%20with-VRAM%20Suite-66e5c2" alt="Measured with VRAM Suite"></a>
 </p>
 
 ---
@@ -81,6 +82,7 @@ On a 4-step video, attention is only part of the run. UnicaAttention and SageAtt
 - **TMA** copies each tile. One thread issues it, an mbarrier says when it has landed. The TMA box is 16 bytes wider than a row: the bytes outside the tensor arrive as zeros, so tiles land padded and `ldmatrix` reads them without bank conflicts. V8 is stored in the order the P fragments need, with the keys k and k + 16 interleaved, so `ldmatrix` returns the MMA operands ready to use.
 - **The Q·Kᵀ of tile t + 1 is issued before the softmax of tile t**, so the tensor cores have work while the exponents run.
 - **Measured, not assumed.** Every step starts with a written prediction, and the result is recorded even when the prediction failed. Many did. One finding: under full load the RTX 5080 sits at its 360 W power limit, so saving cycles only helps if it also saves energy. The whole log: [LOG.md](LOG.md).
+- **The machine is measured with [VRAM Suite](https://github.com/k1n0F/vramsuite)**, the sibling project. `vramsuite transfer` gives the bandwidth the quantization passes are held against: VRAM ~808 GB/s, PCIe Gen5 x8 ~28.6 GB/s pinned. `vramsuite doctor` gives the driver's view of free VRAM, which decides whether a benchmark run counts at all. With ComfyUI still holding 6.9 GB, SageAttention 3 looked 46 % slower than with that memory freed.
 
 ## Architecture
 
