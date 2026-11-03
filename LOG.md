@@ -247,6 +247,9 @@ is a separate step, measured on its own.
 | SASS per tile | 8 LDG.E.128 + 8 STS.128, 2 BAR.SYNC | 8 LDGSTS.E.BYPASS.128, LDGDEPBAR, DEPBAR, 1 BAR.SYNC |
 | ncu | long scoreboard 0.33 M, barrier 0.15 M, tensor pipe 52 % | long scoreboard → ~0, barrier lower, tensor pipe ~58–65 % |
 
+(The bank conflicts below were read only from `op_ld`, which hid the 11 M store conflicts of `int8pv`.
+M3.6 has all the counters and the cause.)
+
 ## M3.4 — result
 
 Same run (bench/compare.py, 40 × 32760, 5 rounds, median of 5):
@@ -333,6 +336,59 @@ instruction count goes down). No pipe is near its limit, the SFU included. The t
 chain of dependent latencies through it, with 2 warps per scheduler to cover it. That is direct evidence
 for occupancy as the next lever, not instruction count. The change stays (default FAST_EXP2=1): it costs
 nothing and frees issue slots that a third warp per scheduler can use. To be measured again after that.
+
+## M3.6 — the bank conflicts of M3.4 (investigation)
+
+**All conflict counters**, not only `op_ld` as in M3.4 (ncu, 4 × 32760):
+
+| | `attention_int8pv` | `attention_int8pv_async` |
+|---|---|---|
+| conflicts, shared stores (`op_st`) | **11.17 M** | 0 |
+| conflicts, shared loads (`op_ld`) | 0 | 218 K |
+| conflicts, `op_ldgsts` | | 5.6 K |
+| shared load wavefronts | 536 870 912 (= 2^29, 4 per `LDSM`, ideal) | 537 110 125 (+239 K, +0.045 %) |
+| conflicts of type arbitration | 8.00 M | 0.29 M |
+
+So M3.4 did not bring conflicts, it removed 98 % of them: the synchronous kernel's `STS.128` had 11 M,
+which M3.4 missed by reading only `op_ld`. The rows the `LDGSTS` write in p_order_slot order are almost
+clean (5.6 K): the suspect of M3.4 is cleared. The ldmatrix addresses are the same in both kernels, and the
+synchronous one reads with no conflicts at all, so the 218 K are not a layout problem.
+
+**Hypothesis:** they are arbitration. An `ldmatrix` and an `LDGSTS` write that lands at the same moment
+compete for the same banks, and the read loses a cycle. The write can come from the same block (the next
+tile lands while this one is read) or from the other block on the SM. Probe, with one block per SM (84
+blocks: 84 × 64 queries, 32760 keys, 1 head) so that only the block's own writes remain:
+
+| probe | predicted `op_ld` conflicts |
+|---|---|
+| `attention_int8pv_async`, 1 block per SM | a few tens of K: only collisions with its own next tile |
+| the same, but waiting for the next tile right after issuing it (no overlap) | **≈ 0**, wavefronts = 4 per `LDSM` exactly |
+| `attention_int8pv`, 1 block per SM | `op_st` conflicts **≈ 0**: its 11 M were stores colliding with the other block's ldmatrix |
+
+Cost even if nothing is done: 239 K extra wavefronts over 84 SMs is ~2.8 K cycles per SM in a kernel of
+~20 M cycles per SM, **≈ 0.01 % of the time**. Whatever the probe shows, a fix cannot pay back a change of
+layout. The point of the probe is to know the cause.
+
+**Result** (`bench/ncu_launch.py`, `sm__ctas_launched` confirms the blocks per SM):
+
+| launch | `int8pv`: `op_st` / `op_ld` conflicts | `int8pv_async`: `op_ld` conflicts | load wavefronts per `LDSM` |
+|---|---|---|---|
+| 84 blocks, 1 per SM | 0 / 0 | **0** (`op_ldgsts` 41) | 4 exactly, both |
+| 168 blocks, 2 per SM, started together | 0 / 0 | 11 K | 4 / 4.001 |
+| 4 heads, 2560 blocks, ~25 per SM one after another | 11.17 M / 0 | 218 K | 4 / 4.002 |
+
+- Alone on its SM, neither kernel has a single conflict. The block's own next tile, landing while it reads,
+  costs nothing: the prediction of a few tens of K **missed**, and the probe that waits right after issuing
+  is not needed.
+- With two blocks that start together there are still almost none. They stay in step: both load, then both
+  compute, so the stores of one never meet the reads of the other.
+- The conflicts come when the two blocks on an SM are out of step, as they are once blocks finish and new
+  ones start at different times. The stores (`STS`) or the landing copies of one block then meet the
+  `ldmatrix` of the other. The prediction "arbitration, not layout" **held**, with this refinement.
+- No fix: alone or in step the layout is conflict-free, and the cost is ≈ 0.01 %. Two things to keep in
+  mind. With 3 blocks per SM (M3.7) there are more neighbours out of step, so this is to be measured again
+  there. The phase between blocks may also be part of why the gain of M3.4 depended on the shape (not
+  checked).
 
 ## M2 — instruction budget, the input for M3
 
