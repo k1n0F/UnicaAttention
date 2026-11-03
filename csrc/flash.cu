@@ -1,11 +1,12 @@
 /*
- * M1: plain flash attention on mma.sync, BF16 inputs, FP32 accumulate.
+ * M1: plain flash attention on mma.sync. Q·Kᵀ in BF16, P·V in FP16, both accumulate in FP32.
  *
- * Built up one piece at a time: one mma, a Q·Kᵀ tile, online softmax, the P·V loop.
- * Each piece keeps its own test kernel, so a broken layout shows up where it was made.
+ * Built up one piece at a time: one mma, a Q·Kᵀ tile, online softmax, the P·V loop, the whole
+ * attention. Each piece keeps its own test kernel, so a broken layout shows up where it was made.
  */
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 #include <cstdint>
 
@@ -13,7 +14,9 @@
 constexpr int MMA_N = 8;
 constexpr int MMA_K = 16;
 
+constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 128;      // WAN 2.2
+constexpr int ROWS_PER_WARP = 16;  // query rows: the M of one mma
 constexpr int KEYS_PER_TILE = 64;  // keys one warp scores per pass
 
 // acc += A · Bᵀ on one warp. A is 16 × MMA_K, B is MMA_N × MMA_K, both row-major bf16.
@@ -27,6 +30,15 @@ constexpr int KEYS_PER_TILE = 64;  // keys one warp scores per pass
 // One uint32_t carries two neighbouring bf16 of one row.
 __device__ __forceinline__ void mma_bf16_16816(float acc[4], const uint32_t a[4], const uint32_t b[2]) {
     asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// The same mma with fp16 inputs, same layout and same rate. Used for P·V: P lies in [0, 1] and needs
+// precision, not range, and fp16 has 10 mantissa bits to bf16's 7.
+__device__ __forceinline__ void mma_f16_16816(float acc[4], const uint32_t a[4], const uint32_t b[2]) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
@@ -75,16 +87,28 @@ constexpr int Q_STEPS = HEAD_DIM / MMA_K;          // 8 fragments of Q along d
 constexpr int KEY_BLOCKS = KEYS_PER_TILE / MMA_N;  // 8 blocks of 16 × 8 in one score tile
 
 // 16 rows of Q as A fragments, kept in registers for the whole pass over K: 32 registers per lane.
-__device__ __forceinline__ void load_q(uint32_t q[Q_STEPS][4], const __nv_bfloat16* Q, int row, int col) {
+// Rows at or past n_rows (the end of the sequence) read as zero.
+__device__ __forceinline__ void load_q(uint32_t q[Q_STEPS][4], const __nv_bfloat16* Q, int row, int col,
+                                       int n_rows = ROWS_PER_WARP) {
+    const bool top = row < n_rows, bottom = row + 8 < n_rows;
 #pragma unroll
-    for (int step = 0; step < Q_STEPS; ++step) load_a(q[step], Q + step * MMA_K, HEAD_DIM, row, col);
+    for (int step = 0; step < Q_STEPS; ++step) {
+        const __nv_bfloat16* tile = Q + step * MMA_K;
+        q[step][0] = top ? load_pair(tile + row * HEAD_DIM + col) : 0;
+        q[step][1] = bottom ? load_pair(tile + (row + 8) * HEAD_DIM + col) : 0;
+        q[step][2] = top ? load_pair(tile + row * HEAD_DIM + col + 8) : 0;
+        q[step][3] = bottom ? load_pair(tile + (row + 8) * HEAD_DIM + col + 8) : 0;
+    }
 }
 
 // scores = Q · Kᵀ for one tile of KEYS_PER_TILE keys: 8 blocks of 16 × 8, 32 floats per lane.
 // The loops must unroll, otherwise scores[block] with a run-time block cannot live in registers
 // and goes to local memory.
+// MASKED is the last, partial tile: keys at or past n_keys read as zero and score -inf, so p = 0.
+// A separate instantiation keeps these checks out of every full tile.
+template <bool MASKED = false>
 __device__ __forceinline__ void qk_scores(float scores[KEY_BLOCKS][4], const uint32_t q[Q_STEPS][4],
-                                          const __nv_bfloat16* K, int row, int col) {
+                                          const __nv_bfloat16* K, int row, int col, int n_keys = KEYS_PER_TILE) {
 #pragma unroll
     for (int block = 0; block < KEY_BLOCKS; ++block)
 #pragma unroll
@@ -93,10 +117,18 @@ __device__ __forceinline__ void qk_scores(float scores[KEY_BLOCKS][4], const uin
     for (int step = 0; step < Q_STEPS; ++step)
 #pragma unroll
         for (int block = 0; block < KEY_BLOCKS; ++block) {
-            uint32_t b[2];
-            load_b(b, K + block * MMA_N * HEAD_DIM + step * MMA_K, HEAD_DIM, row, col);
+            uint32_t b[2] = {0, 0};
+            if (!MASKED || block * MMA_N + row < n_keys)  // in B, the lane's row picks the key
+                load_b(b, K + block * MMA_N * HEAD_DIM + step * MMA_K, HEAD_DIM, row, col);
             mma_bf16_16816(scores[block], q[step], b);
         }
+    if (MASKED) {
+#pragma unroll
+        for (int block = 0; block < KEY_BLOCKS; ++block)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)  // in D, the lane's col picks the key
+                if (block * MMA_N + col + i % 2 >= n_keys) scores[block][i] = -CUDART_INF_F;
+    }
 }
 
 // Step 2: S = Q · Kᵀ for 16 query rows and KEYS_PER_TILE keys, summed over HEAD_DIM.
@@ -161,7 +193,7 @@ __device__ __forceinline__ void online_softmax(float scores[KEY_BLOCKS][4], floa
 // Step 3: online softmax statistics, no V yet. For each of 16 query rows: max + log2(sum) of
 // 2^(s · scale_log2) over all keys, with s = q·k. Keys come KEYS_PER_TILE at a time and no
 // whole row of S is ever stored.
-// n_keys must be a multiple of KEYS_PER_TILE: no masking yet. Launch with a single warp.
+// n_keys must be a multiple of KEYS_PER_TILE. Launch with a single warp.
 extern "C" __global__ void softmax_stats(const __nv_bfloat16* Q, const __nv_bfloat16* K, float* lse,
                                          int n_keys, float scale_log2) {
     const int lane = threadIdx.x;
@@ -190,27 +222,73 @@ extern "C" __global__ void softmax_stats(const __nv_bfloat16* Q, const __nv_bflo
 constexpr int D_BLOCKS = HEAD_DIM / MMA_N;        // 16 blocks of 16 × 8 across one row of O
 constexpr int KEY_STEPS = KEYS_PER_TILE / MMA_K;  // 4 steps of 16 keys in P·V
 
-__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
-    const __nv_bfloat162 pair = __floats2bfloat162_rn(lo, hi);  // lo goes to the low 16 bits, the lower address
+__device__ __forceinline__ uint32_t pack_f16(float lo, float hi) {
+    const __half2 pair = __floats2half2_rn(lo, hi);  // lo goes to the low 16 bits, the lower address
     return *reinterpret_cast<const uint32_t*>(&pair);
 }
 
-__device__ __forceinline__ uint32_t pack_bf16(__nv_bfloat16 lo, __nv_bfloat16 hi) {
-    const __nv_bfloat162 pair = __halves2bfloat162(lo, hi);
-    return *reinterpret_cast<const uint32_t*>(&pair);
+// One element of V as float; keys at or past n_keys read as zero. Zero, not just "p = 0": past the
+// end of V may lie anything, and 0 · NaN = NaN.
+template <bool MASKED>
+__device__ __forceinline__ float v_at(const __nv_bfloat16* V, int key, int dim, int n_keys) {
+    return !MASKED || key < n_keys ? __bfloat162float(V[key * HEAD_DIM + dim]) : 0.0f;
 }
 
-// B fragment of V for 16 keys × 8 columns of d: B[n][k] = V[k][n]. The two keys of one register sit
-// HEAD_DIM apart in V, so it takes two 16-bit loads instead of one 32-bit load. ldmatrix.trans
-// transposes on the way in and replaces this in M2.
-__device__ __forceinline__ void load_v(uint32_t b[2], const __nv_bfloat16* V, int row, int col) {
-    b[0] = pack_bf16(V[col * HEAD_DIM + row], V[(col + 1) * HEAD_DIM + row]);
-    b[1] = pack_bf16(V[(col + 8) * HEAD_DIM + row], V[(col + 9) * HEAD_DIM + row]);
+// B fragment of V for 16 keys × 8 columns of d: B[n][k] = V[k][n], converted bf16 -> fp16 for the
+// fp16 P·V. The conversion keeps every bf16 mantissa bit; only |v| > 65504 would overflow.
+// The two keys of one register sit HEAD_DIM apart in V, so it takes two 16-bit loads instead of one
+// 32-bit load. ldmatrix.trans transposes on the way in and replaces this in M2.
+template <bool MASKED>
+__device__ __forceinline__ void load_v(uint32_t b[2], const __nv_bfloat16* V, int row, int col, int n_keys) {
+    b[0] = pack_f16(v_at<MASKED>(V, col, row, n_keys), v_at<MASKED>(V, col + 1, row, n_keys));
+    b[1] = pack_f16(v_at<MASKED>(V, col + 8, row, n_keys), v_at<MASKED>(V, col + 9, row, n_keys));
+}
+
+// One tile of KEYS_PER_TILE keys for one warp: scores, online softmax, then P·V added into out.
+// MASKED: the last tile holds only n_keys keys.
+template <bool MASKED>
+__device__ __forceinline__ void attention_tile(const uint32_t q[Q_STEPS][4], const __nv_bfloat16* K,
+                                               const __nv_bfloat16* V, int n_keys, float row_max[2],
+                                               float row_sum[2], float out[D_BLOCKS][4], int row, int col,
+                                               float scale_log2) {
+    float scores[KEY_BLOCKS][4], alpha[2];
+    qk_scores<MASKED>(scores, q, K, row, col, n_keys);
+    online_softmax(scores, row_max, row_sum, alpha, scale_log2);
+
+    // what O has gathered so far was weighted against the old max
+#pragma unroll
+    for (int block = 0; block < D_BLOCKS; ++block) {
+        out[block][0] *= alpha[0];
+        out[block][1] *= alpha[0];
+        out[block][2] *= alpha[1];
+        out[block][3] *= alpha[1];
+    }
+
+    // Two neighbouring 16 × 8 blocks of P, as Q·Kᵀ left them, are exactly one 16 × 16 A fragment:
+    // P goes from output to input without leaving the lane. fp16, not bf16: 0.02 % error instead of 0.16 %.
+#pragma unroll
+    for (int step = 0; step < KEY_STEPS; ++step) {
+        const float* left = scores[2 * step];
+        const float* right = scores[2 * step + 1];
+        const uint32_t p[4] = {
+            pack_f16(left[0], left[1]),
+            pack_f16(left[2], left[3]),
+            pack_f16(right[0], right[1]),
+            pack_f16(right[2], right[3]),
+        };
+        const int key0 = step * MMA_K;
+#pragma unroll
+        for (int block = 0; block < D_BLOCKS; ++block) {
+            uint32_t b[2];
+            load_v<MASKED>(b, V + key0 * HEAD_DIM + block * MMA_N, row, col, n_keys - key0);
+            mma_f16_16816(out[block], p, b);
+        }
+    }
 }
 
 // Step 4: attention for 16 query rows, O = softmax(Q · Kᵀ / sqrt(HEAD_DIM)) · V, all keys.
 // Q is 16 × HEAD_DIM; K and V are n_keys × HEAD_DIM; O is 16 × HEAD_DIM fp32.
-// n_keys must be a multiple of KEYS_PER_TILE: no masking yet. Launch with a single warp.
+// n_keys must be a multiple of KEYS_PER_TILE. Launch with a single warp.
 extern "C" __global__ void attention_warp(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                                           float* O, int n_keys, float scale_log2) {
     const int lane = threadIdx.x;
@@ -224,41 +302,9 @@ extern "C" __global__ void attention_warp(const __nv_bfloat16* Q, const __nv_bfl
     float row_sum[2] = {0.0f, 0.0f};
     float out[D_BLOCKS][4] = {};  // 16 rows × 128 of O: 64 floats per lane
 
-    for (int key0 = 0; key0 < n_keys; key0 += KEYS_PER_TILE) {
-        float scores[KEY_BLOCKS][4], alpha[2];
-        qk_scores(scores, q, K + key0 * HEAD_DIM, row, col);
-        online_softmax(scores, row_max, row_sum, alpha, scale_log2);
-
-        // what O has gathered so far was weighted against the old max
-#pragma unroll
-        for (int block = 0; block < D_BLOCKS; ++block) {
-            out[block][0] *= alpha[0];
-            out[block][1] *= alpha[0];
-            out[block][2] *= alpha[1];
-            out[block][3] *= alpha[1];
-        }
-
-        // Two neighbouring 16 × 8 blocks of P, as Q·Kᵀ left them, are exactly one 16 × 16 A fragment:
-        // P goes from output to input without leaving the lane.
-#pragma unroll
-        for (int step = 0; step < KEY_STEPS; ++step) {
-            const float* left = scores[2 * step];
-            const float* right = scores[2 * step + 1];
-            const uint32_t p[4] = {
-                pack_bf16(left[0], left[1]),
-                pack_bf16(left[2], left[3]),
-                pack_bf16(right[0], right[1]),
-                pack_bf16(right[2], right[3]),
-            };
-            const __nv_bfloat16* v_rows = V + (key0 + step * MMA_K) * HEAD_DIM;
-#pragma unroll
-            for (int block = 0; block < D_BLOCKS; ++block) {
-                uint32_t b[2];
-                load_v(b, v_rows + block * MMA_N, row, col);
-                mma_bf16_16816(out[block], p, b);
-            }
-        }
-    }
+    for (int key0 = 0; key0 < n_keys; key0 += KEYS_PER_TILE)
+        attention_tile<false>(q, K + key0 * HEAD_DIM, V + key0 * HEAD_DIM, KEYS_PER_TILE, row_max, row_sum, out,
+                              row, col, scale_log2);
 
     const float inv_sum[2] = {1.0f / quad_sum(row_sum[0]), 1.0f / quad_sum(row_sum[1])};
 #pragma unroll
@@ -268,5 +314,58 @@ extern "C" __global__ void attention_warp(const __nv_bfloat16* Q, const __nv_bfl
         out[block][2] *= inv_sum[1];
         out[block][3] *= inv_sum[1];
         store_acc(O + block * MMA_N, HEAD_DIM, out[block], row, col);
+    }
+}
+
+constexpr int WARPS_PER_BLOCK = 4;
+constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;  // 64 query rows per block
+
+// Step 5: the whole attention, any lengths. Q and O are [heads][n_queries][HEAD_DIM], K and V are
+// [heads][n_keys][HEAD_DIM], all bf16 and contiguous; "heads" is batch · heads.
+// Grid: (ceil(n_queries / ROWS_PER_BLOCK), heads). Block: WARPS_PER_BLOCK warps, ROWS_PER_WARP rows each.
+// Every warp reads all of K and V of its head on its own: no shared memory yet (M2).
+extern "C" __global__ void attention(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+                                     __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2) {
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row = lane / 4;
+    const int col = 2 * (lane % 4);
+
+    const int row0 = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP;
+    const int n_rows = min(n_queries - row0, ROWS_PER_WARP);
+    if (n_rows <= 0) return;  // the whole warp at once: no lane is left waiting in a shuffle
+
+    // size_t: 40 heads × 32760 × 128 still fits in int, but batch 16 of them does not
+    const size_t q_offset = (size_t(blockIdx.y) * n_queries + row0) * HEAD_DIM;
+    const size_t kv_offset = size_t(blockIdx.y) * n_keys * HEAD_DIM;
+    K += kv_offset;
+    V += kv_offset;
+
+    uint32_t q[Q_STEPS][4];
+    load_q(q, Q + q_offset, row, col, n_rows);
+
+    float row_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
+    float row_sum[2] = {0.0f, 0.0f};
+    float out[D_BLOCKS][4] = {};
+
+    const int full_keys = n_keys - n_keys % KEYS_PER_TILE;
+    for (int key0 = 0; key0 < full_keys; key0 += KEYS_PER_TILE)
+        attention_tile<false>(q, K + key0 * HEAD_DIM, V + key0 * HEAD_DIM, KEYS_PER_TILE, row_max, row_sum, out,
+                              row, col, scale_log2);
+    if (full_keys < n_keys)
+        attention_tile<true>(q, K + full_keys * HEAD_DIM, V + full_keys * HEAD_DIM, n_keys - full_keys, row_max,
+                             row_sum, out, row, col, scale_log2);
+
+    const float inv_sum[2] = {1.0f / quad_sum(row_sum[0]), 1.0f / quad_sum(row_sum[1])};
+    __nv_bfloat16* O_rows = O + q_offset;
+#pragma unroll
+    for (int block = 0; block < D_BLOCKS; ++block) {
+        const int dim = block * MMA_N + col;
+        if (row < n_rows)
+            *reinterpret_cast<__nv_bfloat162*>(O_rows + row * HEAD_DIM + dim) =
+                __floats2bfloat162_rn(out[block][0] * inv_sum[0], out[block][1] * inv_sum[0]);
+        if (row + 8 < n_rows)
+            *reinterpret_cast<__nv_bfloat162*>(O_rows + (row + 8) * HEAD_DIM + dim) =
+                __floats2bfloat162_rn(out[block][2] * inv_sum[1], out[block][3] * inv_sum[1]);
     }
 }

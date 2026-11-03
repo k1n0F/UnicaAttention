@@ -31,6 +31,10 @@ def kernels():
         ks["SageAttention 3"] = sageattn3_blackwell
     except ImportError as e:
         print(f"skip SageAttention 3: {e}")
+
+    import unica
+
+    ks["UnicaAttention"] = unica.attention
     return ks
 
 
@@ -68,7 +72,13 @@ if __name__ == "__main__":
 
     base = None
     for name, fn in kernels().items():
-        e = errors(fn(q, k, v).float(), ref)
-        ms = time_ms(lambda fn=fn: fn(q, k, v), args.runs)
+        # Fresh copies for every kernel: SageAttention 3 smooths K in place, and every kernel after it
+        # would otherwise run on a K rounded to bf16 once more (+0.1 % error for UnicaAttention).
+        qi, ki, vi = q.clone(), k.clone(), v.clone()
+        e = errors(fn(qi, ki, vi).float(), ref)
+        changed = [n for n, mine, orig in zip("qkv", (qi, ki, vi), (q, k, v)) if not torch.equal(mine, orig)]
+        if changed:
+            print(f"note: {name} modifies {', '.join(changed)} in place")
+        ms = time_ms(lambda fn=fn: fn(qi, ki, vi), args.runs)
         base = base or ms
         print(f"{name:18} {ms:7.1f}ms {base / ms:8.1f}x {flop / ms / 1e9:7.0f} {e['rel_l2']:8.2%} {e['cos']:9.6f}")

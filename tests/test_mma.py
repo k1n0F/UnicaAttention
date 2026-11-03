@@ -73,7 +73,7 @@ def test_attention_warp_matches_fp32():
     expected = torch.softmax(q.float() @ k.float().T * HEAD_DIM**-0.5, dim=-1) @ v.float()
     rel_l2 = ((out - expected).norm() / expected.norm()).item()
     print(f"attention_warp rel L2 vs FP32: {rel_l2:.3%}")
-    assert rel_l2 < 0.01, rel_l2  # P is rounded to bf16 before P·V
+    assert rel_l2 < 5e-4, rel_l2  # fp16 P gives 0.02 %; bf16 P would give 0.16 % and fail here
 
 
 if __name__ == "__main__":
