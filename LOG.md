@@ -1214,6 +1214,30 @@ memory limit. What is left to save is one of the two reads of K and of V (~0.8 m
 the quantizing pass would have to run head group by head group, so that the second read hits L2 (a head
 of K is 8.4 MB, L2 64 MB). That means ~40 launches instead of 5, or one cooperative kernel with grid syncs.
 
+## M3.21 — the flush every 128 keys (checked before implementation, not started)
+
+**Idea:** two tiles share one P max, so their P·V adds up in the same int32 accumulators (|sum| ≤ 128 · 255 ·
+127 < 2^24, still exact), and `out` is flushed once per 128 keys: −32 I2F and −32 FFMA per tile.
+
+**Accuracy** (emulator, `bc` = the keys sharing a P max, everything else as the kernel):
+
+| data | bc = 64 (now) | bc = 128 | bc = 32 |
+|---|---|---|---|
+| random, 4 × 4096 / 2 × 8192 / 1 × 16384 | 1.714 / 1.754 / 1.766 % | 1.767 / 1.806 / 1.815 % (+0.05) | 1.677 / 1.717 / 1.732 % |
+| sharper, q × 2 | 2.700 % | 2.860 % (+0.16) | 2.632 % |
+| sharper, q × 4 | 3.232 % | 3.262 % (+0.03) | 3.221 % |
+
+**Why it does not fit the kernel as it is:**
+
+- The P of tile t would need the max of tile t + 1. `attention_int8pv_pipe` / `_tma` issue Q·Kᵀ(t + 1)
+  precisely so that it runs under the softmax of t. With a shared max, the softmax of every even tile has
+  to wait for Q·Kᵀ(t + 1), and the overlap is lost on half the tiles. Keeping the scores of three tiles
+  instead does not fit in the registers (3 × 32 + `out` 64 + the rest > 255).
+- Rough balance: the flush saves ~32 FMA-pipe instructions per tile (the I2FP are close to free, M3.8), at
+  ~1.2 cycles each ≈ 2 % of a tile. Losing the overlap on half the tiles costs about half of what the overlap
+  gave (M3.12–13: 3–8 % of the cycles). **Expected net ≈ 0 %, for +0.05 … +0.16 % error.** Not
+  implemented.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
