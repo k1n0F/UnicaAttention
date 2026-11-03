@@ -1172,6 +1172,48 @@ copies that thread 0 issues late: thread 0 is a computing warp itself, and it no
 barriers for the slowest warp. FlashAttention 3 gives the copies a warp of their own. Here a fifth warp at
 244 registers would leave 1 block per SM (2 × 160 × 244 > 64 K). Reverted.
 
+## M3.20 — quantization: measured first
+
+Each step alone (40 × 32760, median of 20):
+
+| step | time | throughput |
+|---|---|---|
+| `quantize_int8(q)` | 0.640 ms | ~786 GB/s (read 335 MB + write 168 MB) |
+| `k.mean` | 0.387 ms | 866 GB/s: at the limit |
+| `quantize_int8(k, mean)` | 0.607 ms | as Q |
+| `torch.aminmax(v)` | 0.398 ms | 843 GB/s: at the limit |
+| **`quantize_v`, layout 2** | **0.998 ms** | **~504 GB/s** |
+| all of `kernel_inputs` | 2.876 ms | |
+
+The estimate of M3.18 was wrong about where the time goes. The separate passes for the K mean and the V
+max run at the bandwidth limit, and they cannot go: a scale has to exist before anything is quantized with
+it. What is slow is **`quantize_v` in the paired layout of M3.17**, a cost that M3.17 measured only the
+kernel and missed. Each thread writes its 8 bytes with a stride of 16 bytes, so every 32-byte sector a warp
+touches is left half written.
+
+**Prediction:** `quantize_v_paired`, one thread per 16-byte cell of the output (dims 8b .. 8b + 7 of slot j
+and of slot j + 16), so a warp writes 512 contiguous bytes and reads 256 contiguous bytes from each of two
+keys. Padding keys become zeros (they were uninitialized). Output identical to layout 2
+(`test_v_layouts_hold_the_same_bytes_in_p_order`). **0.998 → ~0.62 ms**, like the other quantize kernels;
+whole call −0.4 ms, ~−0.5 %.
+
+**Result: the premise was wrong, not kept.** The paired kernel passed the layout test, and changed nothing:
+
+| `unica.quantize_v` | time |
+|---|---|
+| layout 0 (rows of one key, contiguous) | 0.992 ms |
+| layout 1 | 0.988 ms |
+| layout 2, quantize_v | 0.998 ms |
+| layout 2, quantize_v_paired | 0.994 ms |
+
+The Python `quantize_v` calls `torch.aminmax` itself. Its 0.998 ms already hold the 0.398 ms of the
+aminmax, which the table above lists a second time. The quantize kernel of V takes ~0.55 ms, like the
+others, and the write pattern of layout 2 costs nothing measurable. The parts of `kernel_inputs`:
+0.64 (Q) + 0.39 (K mean) + 0.61 (K) + 0.40 (V max) + ~0.6 (V) ≈ 2.6 ms of 2.88, every pass near the
+memory limit. What is left to save is one of the two reads of K and of V (~0.8 ms). The statistics pass and
+the quantizing pass would have to run head group by head group, so that the second read hits L2 (a head
+of K is 8.4 MB, L2 64 MB). That means ~40 launches instead of 5, or one cooperative kernel with grid syncs.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
