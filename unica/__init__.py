@@ -30,10 +30,10 @@ DEFAULT_KERNEL = "attention_smem"
 
 # The tile shape csrc/flash.cu is built with when nothing overrides it (its UNICA_* macros). FAST_EXP2=0
 # brings back exp2f in the u8 kernels, to measure M3.5; LAZY_RESCALE=0 the multiply of out in every tile
-# (M3.9); Q_SMEM=0 Q in registers in attention_int8pv_pipe (M3.13); TRACE=1 records a timeline
-# (bench/timeline.py).
+# (M3.9); Q_SMEM=0 Q in registers in attention_int8pv_pipe (M3.13); SUM_ROUNDED=0 the denominator over P
+# before rounding (M3.15); TRACE=1 records a timeline (bench/timeline.py).
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
-        "Q_SMEM": 1, "TRACE": 0}
+        "Q_SMEM": 1, "SUM_ROUNDED": 1, "TRACE": 0}
 
 
 def attention(

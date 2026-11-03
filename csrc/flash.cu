@@ -37,6 +37,10 @@ constexpr int MMA_K = 16;
 #ifndef UNICA_Q_SMEM
 #define UNICA_Q_SMEM 1
 #endif
+// M3.15: 0 sums the float P before rounding for the softmax denominator, in the u8 kernels.
+#ifndef UNICA_SUM_ROUNDED
+#define UNICA_SUM_ROUNDED 1
+#endif
 
 constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 128;                      // WAN 2.2
@@ -857,7 +861,8 @@ extern "C" __global__ void exp2_ftz_mismatches(unsigned* count) {
 // comes out as 255 · 2^(s · scale_log2 − tile max), in [0, 255]: the largest p of every row and tile is 255,
 // so a tile under an older, larger max still gets all 256 steps. beta = 2^(tile max − running max) brings it
 // back when P·V is added into out. row_sum gathers the unrounded values: it is 255 times the usual sum, P·V
-// carries the same 255, and the two cancel in out / sum.
+// carries the same 255, and the two cancel in out / sum. With UNICA_SUM_ROUNDED row_sum is left alone here:
+// add_row_sum_u8 adds the rounded P̂ after packing.
 __device__ __forceinline__ void online_softmax_u8(float scores[KEY_BLOCKS][4], float row_max[2], float row_sum[2],
                                                   float alpha[2], float beta[2], float scale_log2) {
 #pragma unroll
@@ -872,17 +877,35 @@ __device__ __forceinline__ void online_softmax_u8(float scores[KEY_BLOCKS][4], f
         beta[half] = exp2_ftz(tile_max - new_max);
 
         const float offset = LOG2_255 - tile_max;
-        float tile_sum = 0.0f;
+        [[maybe_unused]] float tile_sum = 0.0f;
 #pragma unroll
         for (int block = 0; block < KEY_BLOCKS; ++block)
 #pragma unroll
             for (int i = 2 * half; i < 2 * half + 2; ++i) {
                 scores[block][i] = exp2_ftz(fmaf(scores[block][i], scale_log2, offset));
-                tile_sum += scores[block][i];
+                if (!UNICA_SUM_ROUNDED) tile_sum += scores[block][i];
             }
-        row_sum[half] = row_sum[half] * alpha[half] + tile_sum * beta[half];
+        if (!UNICA_SUM_ROUNDED) row_sum[half] = row_sum[half] * alpha[half] + tile_sum * beta[half];
         row_max[half] = new_max;
     }
+}
+
+// M3.15: row_sum = row_sum · alpha + (Σ P̂) · beta over the rounded u8 P̂ the mma uses, after packing. IDP4A adds
+// four bytes at once, exact in int32: registers 0 and 2 of a step hold this lane's part of row r, 1 and 3 of
+// row r + 8. The float P are then dead once packed, where the FADD of their sum kept 32 of them alive into
+// P·V (M3.14). Σ P̂ instead of Σ P: the same on random data, up to +0.05 % error on sharp attention (LOG.md).
+__device__ __forceinline__ void add_row_sum_u8(float row_sum[2], const uint32_t p[PV8_STEPS][4], const float alpha[2],
+                                               const float beta[2]) {
+    if (!UNICA_SUM_ROUNDED) return;
+    constexpr uint32_t ONES = 0x01010101;
+    unsigned sum[2] = {0, 0};
+#pragma unroll
+    for (int step = 0; step < PV8_STEPS; ++step)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) sum[i % 2] = __dp4a(p[step][i], ONES, sum[i % 2]);
+#pragma unroll
+    for (int half = 0; half < 2; ++half)
+        row_sum[half] = row_sum[half] * alpha[half] + __uint2float_rn(sum[half]) * beta[half];
 }
 
 // Four values in [0, 255] rounded half to even (torch.round) into one register, v0 in the lowest byte.
@@ -1038,6 +1061,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         uint32_t p[PV8_STEPS][4];
 #pragma unroll
         for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores, step);
+        add_row_sum_u8(row_sum, p, alpha, beta);
         pv_int8(out, p, v_tile, alpha, beta, lane);
     }
 
@@ -1184,6 +1208,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         uint32_t p[PV8_STEPS][4];
 #pragma unroll
         for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores, step);
+        add_row_sum_u8(row_sum, p, alpha, beta);
         TRACE_MARK(slot, lane, tile, 2);
         pv_int8(out, p, v_tiles[buffer], alpha, beta, lane);
         TRACE_MARK(slot, lane, tile, 3);
@@ -1313,6 +1338,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         uint32_t p[PV8_STEPS][4];
 #pragma unroll
         for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
+        add_row_sum_u8(row_sum, p, alpha, beta);
         pv_int8(out, p, v_tiles[now], alpha, beta, lane);
 
         const int next_valid = n_keys - key0 - KEYS_PER_TILE;  // ≤ 0 in the last iteration: all masked

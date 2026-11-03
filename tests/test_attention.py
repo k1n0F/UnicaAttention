@@ -22,7 +22,7 @@ from emulate import emulate, errors, reference  # noqa: E402
 INT8_QK = dict(qk="int8", q_block=128, k_block=64, smooth_k=True)
 EMULATED = {
     "attention_int8qk": INT8_QK,
-    "attention_int8pv": dict(INT8_QK, p_fmt="u8", v_fmt="int8", p_local=True),
+    "attention_int8pv": dict(INT8_QK, p_fmt="u8", v_fmt="int8", p_local=True, sum_rounded=True),
 }
 EMULATED["attention_int8pv_async"] = EMULATED["attention_int8pv_pipe"] = EMULATED["attention_int8pv"]
 MAX_FROM_EMULATOR = 1e-3
@@ -130,6 +130,20 @@ def test_lazy_rescale_changes_nothing_but_time():
                 assert torch.equal(lazy, every_tile), (kernel, n_queries, n_keys)
 
 
+def test_both_denominators_match_their_emulator():
+    # random and sharp attention (q · 4): Σ P̂ and Σ P part on sharp data, so each build must land on its own
+    for sharp in (1.0, 4.0):
+        torch.manual_seed(8)
+        q = (torch.randn(1, 2, 1000, 128, device="cuda") * sharp).bfloat16()
+        k, v = (torch.randn(1, 2, 1000, 128, device="cuda").bfloat16() for _ in range(2))
+        for rounded in (0, 1):
+            emulated = emulate(q, k, v, **dict(EMULATED["attention_int8pv"], sum_rounded=bool(rounded)))
+            for kernel in ("attention_int8pv_async", "attention_int8pv_pipe"):
+                out = unica.attention(q, k, v, kernel, SUM_ROUNDED=rounded)
+                from_emulator = errors(out.float(), emulated)["rel_l2"]
+                assert from_emulator < MAX_FROM_EMULATOR, (kernel, sharp, rounded, from_emulator)
+
+
 def test_trace_build_changes_nothing_but_time():
     torch.manual_seed(3)
     q, k, v = (torch.randn(1, 2, 1000, 128, device="cuda").bfloat16() for _ in range(3))
@@ -154,6 +168,7 @@ if __name__ == "__main__":
     test_pipelined_qk_changes_nothing_but_time()
     test_bare_exp2_changes_nothing_but_time()
     test_lazy_rescale_changes_nothing_but_time()
+    test_both_denominators_match_their_emulator()
     test_trace_build_changes_nothing_but_time()
     test_rejects_what_the_kernel_cannot_take()
     print("attention ok")

@@ -898,6 +898,98 @@ the alignment of register groups. The method is the same for all builds, so the 
    of headroom.** One more buffer of K or V (9.2 KB) would drop the kernel to 1 block per SM. Registers
    also allow only 2 blocks, so both limits now bind together.
 
+## M3.14 — what fills the P·V register peak (investigation)
+
+The live registers at the peak of `attention_int8pv_pipe` (217, at a P·V IMMA), by the instruction that last
+wrote each one (liveness from SASS as in M3.13):
+
+| written by | registers | what |
+|---|---|---|
+| FMUL / FFMA | 65 | `out` |
+| **MUFU** | **35** | **the 32 P of tile t as floats**, plus alpha and beta |
+| I2FP | 32 | the scores of tile t + 1 |
+| LDSM (V) | 24 | V fragments loaded ahead |
+| IMMA (P·V) | 16 | accumulators |
+| before the loop | 15 | pointers, scales |
+| F2IP | 8 | P packed to u8 |
+
+The 32 float P are already packed into 8 registers of u8 for the MMA. They stay alive for one reason: all
+32 are next read by the `FADD` of the row sum, 7 to 698 instructions after the peak. The sum is needed
+only by the next tile, so ptxas pushes it to the end to fill gaps. **32 registers at the peak for an
+addition.**
+
+Two ways out, measured before any kernel change:
+
+- **A tree sum** (pairs of P right after their exponent, then 8 → 4 → 2 → 1). Same precision class, but
+  a different order of float additions, so not bit for bit. Compiled and checked, not timed: spills grow
+  from 108 / 204 to 148 / 268 bytes, the peak moves into Q·Kᵀ and stays at 255 allocated. **Worse,
+  reverted.**
+- **The row sum over the rounded P̂**, which the MMA uses anyway, with `IDP4A` (4 bytes · 1 per
+  instruction, exact in int32): 8 instructions per tile instead of 32 `FADD`, and the float P die at the
+  packing. It changes what the denominator is: Σ P̂ / 255 instead of Σ P. Emulator (`sum_rounded`, new
+  option), rel L2 against FP32:
+
+| data | Σ P (now) | Σ P̂ (rounded) |
+|---|---|---|
+| random, 4 × 4096 | 1.6968 % | 1.6968 % |
+| random, 2 × 8192 | 1.7535 % | 1.7535 % |
+| random, 1 × 16384 | 1.7414 % | 1.7415 % |
+| sharper: q × 2, 4 × 4096 | 2.6486 % | **2.6999 %** |
+| sharper: q × 4, 4 × 4096 | 3.2171 % | 3.2324 % |
+
+  Neutral on the benchmark's random data, **+0.01 … +0.05 % absolute on sharper attention**. The many P
+  that round to 0 still count in Σ P, and that turns out to be the better denominator. A choice of
+  accuracy, the author's.
+
+**Decision (author): the rounded sum, via `IDP4A`.**
+
+## M3.15 — row sum over the rounded P̂ (prediction, before implementation)
+
+**What it attacks:** the register peak of P·V in `attention_int8pv_pipe` (32 float P kept alive for the
+row sum), and FMA-pipe instructions per IMMA (32 `FADD` per tile).
+
+**Change** (`UNICA_SUM_ROUNDED`, default 1, all three u8 kernels): `online_softmax_u8` no longer sums the
+float P. After packing, each lane sums its bytes with `__dp4a(p, 0x01010101, acc)`. Registers 0 and 2 of a
+step hold row r, 1 and 3 row r + 8, so 4 `IDP4A` per row and tile, exact in int32. Then one I2F, and
+`row_sum = row_sum · alpha + Σ P̂ · beta` as before. The scale is unchanged (P̂ is already 255 · P). The
+emulator gets `sum_rounded=True` for these kernels.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| error | rel L2 on the benchmark **1.73 %, unchanged** (emulator: ≤ 0.0001 % on random data); kernel vs emulator < 0.1 % |
+| pipe K64: registers, spills | the 32 float P die at the packing: **no spills**, possibly < 255 registers |
+| live at the P·V peak (SASS liveness) | 217 → **~185–190** |
+| instructions per tile | −32 FADD + 8 IDP4A + 2 I2F: **−22**, ~−4 % |
+| kernel time | pipe: **−2 … −5 %** (no spill reloads, fewer FMA-pipe instructions, and ptxas gets room again); async: −1 … −2 % (instructions only, it has no spills) |
+
+## M3.15 — result
+
+Tests pass: every u8 kernel against the emulator with `sum_rounded=True` (≤ 0.015 %), and both builds
+against their own emulator on random and sharp (q · 4) attention (`test_both_denominators_match_their_emulator`).
+compare.py 40 × 32760 (one run, all four), ncu 4 heads:
+
+| | registers, spills | executed | local loads | active cycles | tensor pipe | kernel | rel L2 |
+|---|---|---|---|---|---|---|---|
+| async, Σ P | 224, 0 | 2.390 G | 0 | 20.01 M | 63.9 % | 85.2 ms | 1.73 % |
+| async, **Σ P̂** | 224, 0 | 2.306 G (−3.5 %) | 0 | 19.57 M (**−2.2 %**) | 65.3 % | 83.6 ms (**−1.9 %**) | 1.73 % |
+| pipe, Σ P | 255, 108 / 204 B | 2.506 G | 35.8 M | 19.35 M | 66.1 % | 84.3 ms | 1.73 % |
+| pipe, **Σ P̂** | 255, **12 / 12 B** | 2.396 G (−4.4 %) | **24.6 K** | 18.87 M (**−2.5 %**) | **67.8 %** | **83.1 ms (−1.4 %)** | 1.73 % |
+
+| | predicted | measured |
+|---|---|---|
+| error | 1.73 %, unchanged | **held** |
+| pipe spills | none | 12 B left, local loads 35.8 M → 24.6 K: **held** |
+| live at the P·V peak | ~185–190 | the peak moved to Q·Kᵀ and stays at **215**: **missed**. ptxas spent the freed registers at once: it loads 8 K/Q fragments ahead and keeps more from the prologue; still 255 allocated |
+| instructions per tile | −22 | async −20, pipe −26: **held** |
+| time, pipe | −2 … −5 % | −2.5 % cycles, −1.4 % compare.py: **held at the low end** |
+| time, async | −1 … −2 % | −2.2 % cycles, −1.9 % compare.py: **held** |
+
+**Where the u8 path stands now:** `attention_int8pv_pipe` at 83.1 ms kernel alone, 18.87 M cycles: −5.7 %
+in cycles and −2.5 % in compare.py from `attention_int8pv_async` at the start of M3.12. Tensor pipe 67.8 %,
+the highest so far.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

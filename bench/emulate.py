@@ -82,6 +82,7 @@ def emulate(
     p_mul=None,
     bc=64,
     out_bf16=True,
+    sum_rounded=False,
 ):
     """Tiled online-softmax attention, the way the kernel computes it.
 
@@ -95,6 +96,8 @@ def emulate(
     acc16     P·V accumulates in FP16 inside a KV tile and is flushed into FP32 between tiles
     p_mul     P is multiplied by this before the MMA (default: the format's max). With acc16,
               p_mul·448·bc must stay below 65504 to rule out FP16 overflow in the worst case
+    sum_rounded  the row sum over P as it goes into the MMA (rounded to p_fmt), not over P before
+              rounding: numerator and denominator then see the same P
     """
     q, k, v = q.float(), k.float(), v.float()
     if smooth_k:
@@ -122,10 +125,13 @@ def emulate(
         m_p = s.amax(-1, keepdim=True) if p_local else m_new
         alpha, beta = torch.exp2(m - m_new), torch.exp2(m_p - m_new)
         p = torch.exp2(s - m_p)
-        l = l * alpha + p.sum(-1, keepdim=True) * beta  # the kernel sums P in FP32, before quantizing it
+        row_sum = p.sum(-1, keepdim=True)  # the kernel sums P in FP32, before quantizing it
         p = p * p_mul
         if p_fmt:
             p = to_fmt(p, p_fmt)
+        if sum_rounded:
+            row_sum = p.sum(-1, keepdim=True) / p_mul
+        l = l * alpha + row_sum * beta
         vt = v[..., j : j + bc, :]
         if acc16:
             inner = torch.zeros(o.shape, dtype=torch.half, device=o.device)
