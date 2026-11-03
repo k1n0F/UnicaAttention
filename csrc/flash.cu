@@ -25,6 +25,10 @@ constexpr int MMA_K = 16;
 #ifndef UNICA_MIN_BLOCKS_PER_SM
 #define UNICA_MIN_BLOCKS_PER_SM 1
 #endif
+// M3.5: 0 brings back exp2f in online_softmax_u8, to measure the difference in one run.
+#ifndef UNICA_FAST_EXP2
+#define UNICA_FAST_EXP2 1
+#endif
 
 constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 128;                      // WAN 2.2
@@ -813,6 +817,34 @@ __device__ __forceinline__ void ldmatrix_x2_trans_b8(uint32_t r[4], const void* 
                  : "r"(smem_address(lane_row)));
 }
 
+// 2^x as the bare SFU instruction. exp2f is the same MUFU.EX2 inside a range check (FSETP, two predicated
+// FMULs) that keeps results below 2^-126 as subnormals; here they become 0. Equal to exp2f bit for bit for
+// every x ≥ −126 (exp2_ftz_mismatches checks all of them).
+__device__ __forceinline__ float exp2_ftz(float x) {
+#if UNICA_FAST_EXP2
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+#else
+    return exp2f(x);
+#endif
+}
+
+// Every float bit pattern goes through exp2f and exp2_ftz; count[0] gets the inputs ≥ −126 where they differ
+// (expected 0), count[1] those below −126 (or NaN) where they differ. Grid of any size: the threads stride
+// over all 2^32 patterns.
+extern "C" __global__ void exp2_ftz_mismatches(unsigned* count) {
+    unsigned in_range = 0, below = 0;
+    const unsigned stride = gridDim.x * blockDim.x;
+    for (unsigned bits = blockIdx.x * blockDim.x + threadIdx.x, done = 0; !done; bits += stride) {
+        const float x = __uint_as_float(bits);
+        if (__float_as_uint(exp2_ftz(x)) != __float_as_uint(exp2f(x))) ++(x >= -126.0f ? in_range : below);
+        done = bits > 0xffffffffu - stride;
+    }
+    atomicAdd(&count[0], in_range);
+    atomicAdd(&count[1], below);
+}
+
 // online_softmax for a u8 P. Each row's P is taken against the max of this tile, not the running max, and
 // comes out as 255 · 2^(s · scale_log2 − tile max), in [0, 255]: the largest p of every row and tile is 255,
 // so a tile under an older, larger max still gets all 256 steps. beta = 2^(tile max − running max) brings it
@@ -828,8 +860,8 @@ __device__ __forceinline__ void online_softmax_u8(float scores[KEY_BLOCKS][4], f
             tile_max = fmaxf(tile_max, fmaxf(scores[block][2 * half], scores[block][2 * half + 1]));
         tile_max = quad_max(tile_max) * scale_log2;  // every tile has a valid key, so this is finite
         const float new_max = fmaxf(row_max[half], tile_max);
-        alpha[half] = exp2f(row_max[half] - new_max);
-        beta[half] = exp2f(tile_max - new_max);
+        alpha[half] = exp2_ftz(row_max[half] - new_max);
+        beta[half] = exp2_ftz(tile_max - new_max);
 
         const float offset = LOG2_255 - tile_max;
         float tile_sum = 0.0f;
@@ -837,7 +869,7 @@ __device__ __forceinline__ void online_softmax_u8(float scores[KEY_BLOCKS][4], f
         for (int block = 0; block < KEY_BLOCKS; ++block)
 #pragma unroll
             for (int i = 2 * half; i < 2 * half + 2; ++i) {
-                scores[block][i] = exp2f(fmaf(scores[block][i], scale_log2, offset));
+                scores[block][i] = exp2_ftz(fmaf(scores[block][i], scale_log2, offset));
                 tile_sum += scores[block][i];
             }
         row_sum[half] = row_sum[half] * alpha[half] + tile_sum * beta[half];

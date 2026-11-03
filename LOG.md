@@ -279,6 +279,61 @@ change, so `LDGSTS` writing into permuted rows of the V tile is the first suspec
 Still latency-bound: in 55 % of cycles no warp is ready, and the top stalls are now fixed-latency waits
 (0.39 M), math pipe (0.32 M) and the selected warp itself (0.38 M), with 2 warps per scheduler.
 
+## M3.5 — the bare SFU exponent (prediction, before implementation)
+
+**What it attacks: instructions in the softmax, the serial part of a tile.** Without fast math, `exp2f`
+compiles to the same `MUFU.EX2` plus a range check that keeps results below 2^-126 as subnormals:
+`FSETP.GEU x, -126`, `@!p FMUL x, 0.5` before it and `@!p FMUL r, r, r` after it. SASS of
+`attention_int8pv_async`: 36 `MUFU.EX2` per tile (32 P values, alpha and beta of two rows), each with the
+three extra instructions: **108 of the 734 loop instructions (15 %)**. The predicated FMULs do not run on
+our data, but they still take an issue slot each, and the FSETP sits on the path to every MUFU.
+
+**Change:** `ex2.approx.ftz.f32` directly in `online_softmax_u8` (both u8 kernels), behind
+`UNICA_FAST_EXP2` (default 1) so that the old code stays measurable in the same run. Results below 2^-126
+become 0: a P that small rounds to 0 in u8 anyway, and an alpha or beta that small multiplies a sum that
+the new tile already dwarfs by 2^126. The fp16 kernels keep `exp2f`: not part of this step.
+
+**Hypotheses:**
+
+| | `exp2f` (now) | `ex2.approx.ftz`, predicted |
+|---|---|---|
+| element by element, every float x ≥ −126 | | **identical bit for bit** (same MUFU, the check never fires) |
+| output on the test shapes | | **identical bit for bit** (no exponent there goes below −126) |
+| loop SASS per tile | 734, 36 FSETP.GEU | **626** (−108), 0 FSETP.GEU, still 36 MUFU.EX2 |
+| registers | 253, 0 spills | ≤ 253, 0 spills; still 2 blocks per SM |
+| kernel time | 87.9 ms | **−3 … −7 %: 82–85 ms.** Not −15 %: issue slots are not the limit (34 % busy), the kernel waits on latency; the gain is the shorter softmax phase, in which the warp issues back to back |
+| ncu | | issued instructions −15 %, tensor pipe a few points up, SFU work unchanged |
+
+## M3.5 — result
+
+| | `exp2f` (FAST_EXP2=0) | `ex2.approx.ftz` | predicted |
+|---|---|---|---|
+| all 2^32 floats, x ≥ −126 | | **0 differ** (1 703 935 differ, all in (−150, −126): subnormal vs 0; NaN equal) | held |
+| output, 6 test shapes | | identical bit for bit | held |
+| loop SASS per tile | 782 (counted from the loop label to the back branch) | **676 (−106)**: −36 FSETP, −72 predicated FMUL, +2 MOV; 36 MUFU.EX2 in both | held |
+| registers, spills | 253, 0 | **255**, 0; still 2 blocks per SM | missed: one more, not fewer |
+| kernel, 40 × 32760 (compare.py, 2 runs) | 80.6 / 86.3 ms | 79.5 / 85.2 ms: **−1.3 … −1.4 %** | **missed: −3 … −7 % predicted** |
+| kernel, 4 × 32760 | 9.0 ms | 8.9 ms | |
+
+Nsight Compute (4 heads, its fixed clocks):
+
+| | `exp2f` | `ex2.approx.ftz` |
+|---|---|---|
+| duration | 7.79 ms | 7.71 ms (**−1.0 %**) |
+| instructions executed | 3.083 G | 2.638 G (**−14.4 %**) |
+| issue slots busy | 44.5 % | 38.4 % |
+| tensor pipe / SFU (xu) / FMA / ALU | 62.0 / 17.4 / 16.9 / 16.4 % | 62.5 / 17.6 / 12.6 / 14.5 % |
+| stalls per issued instruction: wait / math pipe / short scoreboard | 1.03 / 0.84 / 0.26 | 1.23 / 1.04 / 0.35 |
+| warps per scheduler | 1.97 | 1.97 |
+
+**Finding: 14 % fewer instructions buy 1 % of time.** The FSETP and FMULs were issued in slots in which the
+warp would have waited anyway, for an exponent or a shuffle in flight. Take them out and the same wait
+shows up as a stall instead (wait and math-pipe stalls per instruction go up by about as much as the
+instruction count goes down). No pipe is near its limit, the SFU included. The time of a tile is set by the
+chain of dependent latencies through it, with 2 warps per scheduler to cover it. That is direct evidence
+for occupancy as the next lever, not instruction count. The change stays (default FAST_EXP2=1): it costs
+nothing and frees issue slots that a third warp per scheduler can use. To be measured again after that.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

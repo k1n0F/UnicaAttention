@@ -103,7 +103,16 @@ def test_attention_warp_matches_fp32():
     assert rel_l2 < 5e-4, rel_l2  # fp16 P gives 0.02 %; bf16 P would give 0.16 % and fail here
 
 
+def test_bare_exp2_equals_exp2f_down_to_minus_126():
+    count = torch.zeros(2, device="cuda", dtype=torch.int32)
+    module("flash")["exp2_ftz_mismatches"](84 * 16, 256, count)  # all 2^32 float bit patterns
+    in_range, below = count.tolist()
+    print(f"exp2_ftz vs exp2f over all 2^32 floats: {in_range} differ at x ≥ −126, {below} below or NaN")
+    assert in_range == 0, in_range
+
+
 if __name__ == "__main__":
+    test_bare_exp2_equals_exp2f_down_to_minus_126()
     test_one_mma_matches_torch_exactly()
     test_one_int8_mma_matches_torch_exactly()
     test_pv_int8_tile_matches_torch_exactly()
