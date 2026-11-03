@@ -46,7 +46,34 @@ def test_v_matches_emulator_bit_for_bit():
         assert torch.equal(v8.float(), expected), (shape, (v8.float() - expected).abs().max())
 
 
+def p_order_slot(key: torch.Tensor) -> torch.Tensor:
+    """csrc/flash.cu's p_order_slot: where key k of a group of 16 sits in the V tile."""
+    k = key % 16
+    return key - k + 2 * (k % 8) - k % 2 + 2 * (k // 8)
+
+
+def test_v_layouts_hold_the_same_bytes_in_p_order():
+    # layout 1: row p_order_slot(key); layout 2: the pairs of csrc/flash.cu v8_offset. Both padded to 64 keys.
+    torch.manual_seed(2)
+    for shape in SHAPES:
+        v = torch.randn(shape, device="cuda").bfloat16()
+        plain, scale = unica.quantize_v(v)
+        n = shape[2]
+        slot = p_order_slot(torch.arange(n, device="cuda"))
+        dims = torch.arange(128, device="cuda")
+        for layout in (1, 2):
+            v8, layout_scale = unica.quantize_v(v, layout)
+            assert v8.shape[2] == -(-n // unica.V8_PAD_KEYS) * unica.V8_PAD_KEYS and torch.equal(layout_scale, scale)
+            flat = v8.reshape(*shape[:2], -1)
+            if layout == 1:
+                offset = slot[:, None] * 128 + dims
+            else:
+                offset = ((slot // 32 * 16 + slot % 16) * 256)[:, None] + dims // 8 * 16 + (slot % 32 // 16 * 8)[:, None] + dims % 8
+            assert torch.equal(flat[..., offset], plain), (shape, layout)
+
+
 if __name__ == "__main__":
     test_matches_emulator_bit_for_bit()
     test_v_matches_emulator_bit_for_bit()
+    test_v_layouts_hold_the_same_bytes_in_p_order()
     print("quantize ok")

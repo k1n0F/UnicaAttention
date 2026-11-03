@@ -74,6 +74,32 @@ class Module:
         return Kernel(f, self)
 
 
+UINT8, UINT16 = 0, 1  # CUtensorMapDataType
+L2_PROMOTION_256B = 3
+
+
+class TensorMap(ctypes.Structure):
+    """A CUtensorMap: what TMA needs to copy boxes of a 2D tensor into shared memory. Passed to a kernel by
+    value, as a `const __grid_constant__ CUtensorMap` parameter. Holds on to its tensor, whose address it
+    contains."""
+
+    _fields_ = [("opaque", ctypes.c_uint64 * 16)]
+
+
+def tensor_map_2d(tensor, element_type, width, rows, row_bytes, box_width, box_rows):
+    """A tensor map over `rows` rows of `width` elements (UINT8 or UINT16), `row_bytes` apart, copied in boxes
+    of box_width × box_rows. A box may be wider or longer than the tensor: what lies outside comes in as
+    zeros, which is how a kernel gets padded rows in shared memory from unpadded ones in global memory."""
+    tensor_map = TensorMap()
+    _check(_cuda.cuTensorMapEncodeTiled(
+        ctypes.byref(tensor_map), element_type, 2, ctypes.c_void_p(tensor.data_ptr()),
+        (ctypes.c_uint64 * 2)(width, rows), (ctypes.c_uint64 * 1)(row_bytes),
+        (ctypes.c_uint32 * 2)(box_width, box_rows), (ctypes.c_uint32 * 2)(1, 1),
+        0, 0, L2_PROMOTION_256B, 0))  # no interleave, no swizzle, zeros outside
+    tensor_map.tensor = tensor
+    return tensor_map
+
+
 class Kernel:
     def __init__(self, f, module):
         self.f = f

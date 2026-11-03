@@ -29,7 +29,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     q = torch.randn(1, args.heads, args.queries, 128, device="cuda", dtype=torch.bfloat16)
     k, v = (torch.randn(1, args.heads, args.keys, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2))
-    inputs = unica.kernel_inputs(q, k, v, kernel)
+    inputs = unica.kernel_inputs(q, k, v, kernel, **tile)
     for _ in range(2):
         unica.attention(q, k, v, kernel, inputs, **tile)
     torch.cuda.synchronize()

@@ -11,7 +11,7 @@ import math
 
 import torch
 
-from unica.cuda import module
+from unica.cuda import UINT8, UINT16, module, tensor_map_2d
 
 HEAD_DIM = 128
 WARP_SIZE = 32
@@ -24,18 +24,20 @@ LOG2E = 1.4426950408889634
 # times them side by side. The quantized ones trade exactness for speed: their error is measured
 # against bench/emulate.py, which predicts it.
 KERNELS = ("attention", "attention_smem", "attention_int8qk", "attention_int8pv", "attention_int8pv_async",
-           "attention_int8pv_pipe")
-QUANTIZED = {"attention_int8qk", "attention_int8pv", "attention_int8pv_async", "attention_int8pv_pipe"}
+           "attention_int8pv_pipe", "attention_int8pv_tma")
+QUANTIZED = {"attention_int8qk", "attention_int8pv", "attention_int8pv_async", "attention_int8pv_pipe",
+             "attention_int8pv_tma"}
 # INT8 Q·Kᵀ, u8 × s8 P·V: rel L2 1.73 % against FP32 on random inputs (SageAttention 2: 3.9 %). The exact
 # path is attention_smem, at 0.17 %, the bf16 output floor.
-DEFAULT_KERNEL = "attention_int8pv_pipe"
+DEFAULT_KERNEL = "attention_int8pv_tma"
 
 # The tile shape csrc/flash.cu is built with when nothing overrides it (its UNICA_* macros). FAST_EXP2=0
 # brings back exp2f in the u8 kernels, to measure M3.5; LAZY_RESCALE=0 the multiply of out in every tile
 # (M3.9); Q_SMEM=0 Q in registers in attention_int8pv_pipe (M3.13); SUM_ROUNDED=0 the denominator over P
-# before rounding (M3.15); TRACE=1 records a timeline (bench/timeline.py).
+# before rounding (M3.15); V_PAIRS=0 V8 in P's order but unpaired for attention_int8pv_tma (M3.17); TRACE=1
+# records a timeline (bench/timeline.py).
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
-        "Q_SMEM": 1, "SUM_ROUNDED": 1, "TRACE": 0}
+        "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0}
 
 
 def attention(
@@ -78,21 +80,33 @@ def attention(
     grid = (math.ceil(n_queries / (warps * ROWS_PER_WARP)), batch * heads)
     scale_log2 = HEAD_DIM**-0.5 * LOG2E
     if inputs is None:
-        inputs = kernel_inputs(q, k, v, kernel)
+        inputs = kernel_inputs(q, k, v, kernel, **tile)
     module("flash", **defines)[kernel](grid, warps * WARP_SIZE, *inputs, out, n_queries, n_keys, scale_log2)
     return out
 
 
-def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str) -> tuple:
+def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str, **tile: int) -> tuple:
     """The arguments `kernel` takes before its output: q, k, v as they are, or quantized. q, k, v must be
-    contiguous. Apart from attention() so that a benchmark can time quantization and kernel separately."""
+    contiguous. Apart from attention() so that a benchmark can time quantization and kernel separately. tile:
+    the settings the kernel is built with (TILE), which decide the boxes and the V8 layout of the TMA kernel."""
     if kernel not in QUANTIZED:
         return q, k, v
     q8, q_scale = quantize_int8(q, None, Q_SCALE_BLOCK)
     k8, k_scale = quantize_int8(k, k.mean(-2, dtype=torch.float32), K_SCALE_BLOCK)  # softmax cancels the mean
     if kernel == "attention_int8qk":
         return q8, k8, q_scale, k_scale, v
-    return q8, k8, q_scale, k_scale, *quantize_v(v)
+    if kernel != "attention_int8pv_tma":
+        return q8, k8, q_scale, k_scale, *quantize_v(v)
+    # TMA boxes 16 bytes wider than the rows: the tiles land padded, as the kernel's ldmatrix expects
+    settings = TILE | tile
+    keys, pairs = settings["KEYS_PER_TILE"], settings["V_PAIRS"]
+    v8, v_scale = quantize_v(v, 2 if pairs else 1)
+    k_map = tensor_map_2d(k8, UINT8, HEAD_DIM, k8.numel() // HEAD_DIM, HEAD_DIM, HEAD_DIM + 16, keys)
+    if pairs:  # rows of 2 · HEAD_DIM bytes, as uint16 so the box (272 bytes) stays within 256 elements
+        v_map = tensor_map_2d(v8, UINT16, HEAD_DIM, v8.numel() // (2 * HEAD_DIM), 2 * HEAD_DIM, HEAD_DIM + 8, keys // 2)
+    else:
+        v_map = tensor_map_2d(v8, UINT8, HEAD_DIM, v8.numel() // HEAD_DIM, HEAD_DIM, HEAD_DIM + 16, keys)
+    return k_map, v_map, q8, q_scale, k_scale, v_scale  # the maps first: they must be 64-byte aligned
 
 
 QUANTIZE_THREADS = 256  # must match csrc/flash.cu
@@ -114,15 +128,22 @@ def quantize_int8(x: torch.Tensor, mean: torch.Tensor | None, block: int) -> tup
     return x8, scale
 
 
-def quantize_v(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+V8_PAD_KEYS = 64  # must match csrc/flash.cu
+
+
+def quantize_v(v: torch.Tensor, layout: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     """v ≈ v8 · scale with one scale per channel over all tokens of a head: int8 [batch, heads, N, 128] and
     float32 [batch, heads, 128]. d is the axis P·V does not sum over, so the kernel applies the scale once,
-    at the end. Bit for bit bench/emulate.py's V quantization."""
+    at the end. Bit for bit bench/emulate.py's V quantization. layout 1 and 2 (for attention_int8pv_tma,
+    csrc/flash.cu v8_offset) reorder the same bytes and pad each head to whole tiles: [batch, heads, N', 128]
+    with N' = N rounded up to V8_PAD_KEYS."""
     v = v.contiguous()
     low, high = torch.aminmax(v, dim=-2)  # one pass, and |v| needs no copy of v
     scale = (torch.maximum(high, -low).float() / 127).clamp_min(1e-12)
-    v8 = torch.empty(v.shape, dtype=torch.int8, device=v.device)
+    batch, heads, n, dim = v.shape
+    tokens = n if layout == 0 else math.ceil(n / V8_PAD_KEYS) * V8_PAD_KEYS
+    v8 = torch.empty(batch, heads, tokens, dim, dtype=torch.int8, device=v.device)
     n_chunks = v.numel() // CHUNK
     grid = math.ceil(n_chunks / QUANTIZE_THREADS)
-    module("flash")["quantize_v"](grid, QUANTIZE_THREADS, v, scale, v8, v.shape[2], n_chunks)
+    module("flash")["quantize_v"](grid, QUANTIZE_THREADS, v, scale, v8, n, n_chunks, layout)
     return v8, scale

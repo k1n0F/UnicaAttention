@@ -56,7 +56,7 @@ if __name__ == "__main__":
             run = lambda kernel=kernel, tile=tile: unica.attention(q, k, v, kernel=kernel, **tile)  # noqa: E731
             times[name].append(time_ms(run, args.runs))
             if kernel in unica.QUANTIZED:
-                quantize = lambda kernel=kernel: unica.kernel_inputs(q, k, v, kernel)  # noqa: E731
+                quantize = lambda kernel=kernel, tile=tile: unica.kernel_inputs(q, k, v, kernel, **tile)  # noqa: E731
                 quant_times[name].append(time_ms(quantize, args.runs))
                 inputs = quantize()
                 run = lambda kernel=kernel, tile=tile: unica.attention(q, k, v, kernel, inputs, **tile)  # noqa: E731

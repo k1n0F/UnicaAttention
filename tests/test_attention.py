@@ -25,6 +25,7 @@ EMULATED = {
     "attention_int8pv": dict(INT8_QK, p_fmt="u8", v_fmt="int8", p_local=True, sum_rounded=True),
 }
 EMULATED["attention_int8pv_async"] = EMULATED["attention_int8pv_pipe"] = EMULATED["attention_int8pv"]
+EMULATED["attention_int8pv_tma"] = EMULATED["attention_int8pv"]
 MAX_FROM_EMULATOR = 1e-3
 
 # (batch, heads, n_queries, n_keys)
@@ -104,6 +105,19 @@ def test_pipelined_qk_changes_nothing_but_time():
             assert torch.equal(pipelined, in_turn), (tile, n_queries, n_keys)
 
 
+def test_tma_tiles_change_nothing_but_time():
+    torch.manual_seed(9)
+    # 1, 2 and 3 tiles, partial ones, several heads (a K box past one head reads the next), cross-attention
+    for batch, heads, n_queries, n_keys in SHAPES + [(1, 2, 100, 128), (1, 2, 100, 129), (1, 2, 100, 192)]:
+        q = torch.randn(batch, heads, n_queries, 128, device="cuda").bfloat16()
+        k, v = (torch.randn(batch, heads, n_keys, 128, device="cuda").bfloat16() for _ in range(2))
+        for tile in ({}, {"KEYS_PER_TILE": 32}):
+            copied = unica.attention(q, k, v, "attention_int8pv_pipe", **tile)
+            for pairs in (0, 1):
+                by_tma = unica.attention(q, k, v, "attention_int8pv_tma", V_PAIRS=pairs, **tile)
+                assert torch.equal(by_tma, copied), (tile, pairs, n_queries, n_keys)
+
+
 def test_bare_exp2_changes_nothing_but_time():
     torch.manual_seed(2)
     for batch, heads, n_queries, n_keys in SHAPES:
@@ -166,6 +180,7 @@ if __name__ == "__main__":
     test_every_kernel_matches_fp32_reference_on_all_shapes()
     test_async_loads_change_nothing_but_time()
     test_pipelined_qk_changes_nothing_but_time()
+    test_tma_tiles_change_nothing_but_time()
     test_bare_exp2_changes_nothing_but_time()
     test_lazy_rescale_changes_nothing_but_time()
     test_both_denominators_match_their_emulator()

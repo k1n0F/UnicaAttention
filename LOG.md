@@ -1004,7 +1004,96 @@ bf16 random inputs, median of 10, whole call (quantization included):
 | **UnicaAttention** | **83.7 ms** | **6.2×** | **1.73 %** | **0.999850** |
 
 Against the goal in the README: 2.25× less error than SageAttention 2, but 12.6 % slower than it. Not a
-win yet. 74.3 ms means ~9.4 ms less, about 11 %.
+win yet. 74.3 ms means ~9.4 ms less, about 11 %. From M1 (~770 ms) that is 9.2× faster.
+
+## M3.17 — TMA tile loads, V8 in P's order and in pairs (prediction, before implementation)
+
+**What it attacks:** non-MMA instructions per tile, as M3.9 to M3.15 did, now in the loads. Executed per warp
+and tile in `attention_int8pv_pipe` (ncu SourceCounters): 571.3, of them 8 `LDGSTS` with ~35–45
+instructions of addresses and bounds checks around them, and 63.6 `MOV`, ~48 of which pair V fragments
+(M3.11).
+
+**Design (the author chose the full version):**
+
+- **TMA** (`cp.async.bulk.tensor.2d`, SASS `UTMALDG.2D`; compiled and run on the card first): one thread
+  issues a whole tile, an `mbarrier` with the expected byte count says when it has landed. The other 127
+  threads compute no addresses at all.
+- **No swizzle.** TMA writes its box densely, but the box may be wider than the tensor: the bytes outside
+  come in as zeros. A box 144 bytes wide over rows of 128 gives the padded rows (K8_STRIDE) that all the
+  ldmatrix addressing already uses, without a byte of padding in global memory. Measured with a probe
+  kernel: rows padded with zeros, rows past the end zero, bit for bit. K8 stays as it is.
+- **V8 changes format**, because TMA copies rows in order and P needs them in p_order_slot order.
+  `V_PAIRS=0`: rows in P's order (`quantize_v` layout 1), box 144 × 64. `V_PAIRS=1`: rows in P's order and
+  paired as in M3.11, each 256-byte row holding 8 dims of slot j, then of slot j + 16, for all 16 blocks of
+  dims (layout 2). The box is 272 × 32, declared as uint16 (136 × 32) since a box dimension is at most 256
+  elements. Both pad each head to whole tiles of 64 keys; keys past n_keys have P̂ = 0, so their bytes
+  never count.
+- New kernel `attention_int8pv_tma`, otherwise `attention_int8pv_pipe` (pipelined Q·Kᵀ, Q from shared
+  memory, Σ P̂). Still one `__syncthreads` per tile, for the buffers about to be overwritten.
+
+**Hypotheses** (each step measured on its own, same run):
+
+| | predicted |
+|---|---|
+| output | **identical bit for bit** to `attention_int8pv_pipe`, both V8 formats |
+| executed per warp-tile | 571 → **~530** with TMA, → **~485** with the pairs too (−15 %) |
+| registers, spills | ≤ 255, no spills; fewer addresses alive |
+| shared memory | ~46.1 KB + 3 mbarriers: still 2 blocks per SM |
+| kernel time | TMA **−2 … −4 %**; the pairs another **−2 … −4 %**; together **−5 … −8 %** |
+
+## M3.17 — result
+
+**Bugs on the way.** The kernel first failed with `cudaErrorMisalignedAddress` in every TMA copy.
+compute-sanitizer pointed at `tma_load_2d`, and a `printf` of the addresses showed the shared tiles aligned
+(1024, 19456: multiples of 128) but the tensor map at `…388`: TMA needs it 64-byte aligned, and a map
+declared right after the 8-byte Q8 pointer lands at offset 8 of the parameters. The probe kernel had the map
+first. Fixed by putting both maps first. Also learned: `nvdisasm` life ranges and `compute-sanitizer` are
+not on the default PATH (the latter is in the toolkit's `compute-sanitizer/`).
+
+**Tests:** bit for bit equal to `attention_int8pv_pipe` on all shapes plus 1, 2 and 3 tiles, K64 and K32,
+both V8 layouts (`test_tma_tiles_change_nothing_but_time`). Layouts 1 and 2 hold exactly the bytes of
+layout 0 at the positions of `v8_offset` (`test_v_layouts_hold_the_same_bytes_in_p_order`). The emulator
+test passes (≤ 0.015 %).
+
+compare.py 40 × 32760 (one run, all three), ncu 4 heads:
+
+| | registers, spills | executed per tile | `op_ld` bank conflicts | active cycles | tensor pipe | kernel |
+|---|---|---|---|---|---|---|
+| `attention_int8pv_pipe` | 255, 12 B | 571.3 | 2.77 M | 18.86 M | 67.8 % | 82.5 ms |
+| **TMA**, V8 in P's order (V_PAIRS=0) | **235, 0** | 516.3 (−55) | 0.32 M | 17.36 M (**−8.0 %**) | 73.7 % | 76.0 ms (**−7.9 %**) |
+| **TMA + pairs** (V_PAIRS=1) | 235, 0 | 467.3 (−49) | 0.28 M | 16.94 M (**−2.4 %**) | **75.5 %** | **74.0 ms (−2.6 %)** |
+
+| | predicted | measured |
+|---|---|---|
+| output | bit for bit | **held** |
+| executed per tile | ~530, then ~485 | 516, then 467: **held, a little better** |
+| registers, spills | ≤ 255, none | 235, none: **held** |
+| TMA | −2 … −4 % | **−8.0 %: missed, twice the gain** |
+| pairs | −2 … −4 % | −2.4 … −2.6 %: **held** |
+| together | −5 … −8 % | **−10.3 %** |
+
+**Why TMA gave twice the prediction.** The prediction counted only the ~55 instructions of the copies. TMA
+also took the copy addresses out of the registers: 255 → 235, and the last spills went. It also took the
+`LDGSTS` writes out of the shared-memory pipe the ldmatrix use: bank conflicts 2.77 M → 0.32 M. Those
+are the arbitration conflicts of M3.6, the copies of the other block meeting this block's reads. At ~1.2
+cycles per instruction the copies alone explain ~2 %; the registers and the shared-memory pipe the rest.
+Not separated further.
+
+## M3.17 — `attention_int8pv_tma` is the default
+
+Its output is identical bit for bit to `attention_int8pv_pipe`, the kernel the author made the default in
+M3.16, so the accuracy decision stands. bench/harness.py, 1 × 40 × 32760 × 128, whole call, three runs:
+
+| | run 1 | run 2 | run 3 | rel L2 |
+|---|---|---|---|---|
+| SageAttention 2 | 75.9 ms | 77.0 ms | 76.4 ms | 3.90 % |
+| **UnicaAttention** | **76.4 ms** | **76.0 ms** | **76.6 ms** | **1.73 %** |
+
+(SDPA 528.0 ms, SageAttention 3 58.1 ms at 19.11 % in run 1.)
+
+**Level with SageAttention 2 in speed** (76.3 against 76.4 ms on average; the runs scatter by more than the
+difference), at 2.25× less error. From M1 (~770 ms): 10.1×. The README goal, faster at no more error, is
+not met yet: level is not faster.
 
 ## M2 — instruction budget, the input for M3
 

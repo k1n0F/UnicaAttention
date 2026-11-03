@@ -32,7 +32,7 @@ def timeline(variant: str, heads: int, tokens: int) -> tuple[torch.Tensor, list[
     tile["TRACE"] = 1
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, heads, tokens, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
-    inputs = unica.kernel_inputs(q, k, v, kernel)
+    inputs = unica.kernel_inputs(q, k, v, kernel, **tile)
     defines = {f"UNICA_{key}": value for key, value in tile.items() if unica.TILE[key] != value}
     clocks = torch.empty(TRACE_SLOTS, TRACE_TILES, TRACE_POINTS, dtype=torch.int64, device="cuda")
     warps = torch.empty(TRACE_SLOTS, dtype=torch.int32, device="cuda")

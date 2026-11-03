@@ -5,6 +5,7 @@
  * attention. Each piece keeps its own test kernel, so a broken layout shows up where it was made.
  */
 
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <math_constants.h>
@@ -36,6 +37,10 @@ constexpr int MMA_K = 16;
 // M3.13: 0 keeps Q in registers in attention_int8pv_pipe.
 #ifndef UNICA_Q_SMEM
 #define UNICA_Q_SMEM 1
+#endif
+// M3.17: 0 gives attention_int8pv_tma V8 in P's order without the pairs (quantize_v layout 1, not 2).
+#ifndef UNICA_V_PAIRS
+#define UNICA_V_PAIRS 1
 #endif
 // M3.15: 0 sums the float P before rounding for the softmax denominator, in the u8 kernels.
 #ifndef UNICA_SUM_ROUNDED
@@ -934,7 +939,12 @@ __device__ __forceinline__ void p_fragment_u8(uint32_t p[4], const float scores[
 // out = out · alpha + beta · (P̂ · V̂) for one tile, V̂ in shared memory in p_order_slot order. P̂ u8 × V̂ s8 is
 // exact in int32, and |sum| ≤ 64 · 255 · 127 < 2^24 keeps even the conversion to float exact. The loops are
 // turned around from pv_smem: one pair of d blocks takes both 32-key steps and is added into out at once,
-// so 8 int32 accumulators are alive at a time, not 64.
+// so 8 int32 accumulators are alive at a time, not 64. PAIRED (M3.17): V̂ in the paired rows of v8_offset's
+// layout 2, V8_STRIDE apart, whose ldmatrix returns each B operand in adjacent registers: no MOV to pair them.
+constexpr int V8_STRIDE = 2 * HEAD_DIM + 16;  // a paired row and 16 bytes of padding: row i starts in bank 4 · i
+static_assert(KEYS_PER_TILE / 2 * V8_STRIDE <= KEYS_PER_TILE * K8_STRIDE, "a paired V tile must fit a V tile");
+
+template <bool PAIRED = false>
 __device__ __forceinline__ void pv_int8(float out[D_BLOCKS][4], const uint32_t p[PV8_STEPS][4], const int8_t* v_tile,
                                         const float alpha[2], const float beta[2], int lane) {
 #if UNICA_LAZY_RESCALE
@@ -942,15 +952,21 @@ __device__ __forceinline__ void pv_int8(float out[D_BLOCKS][4], const uint32_t p
     // is 1 in every row of the warp, the 64 multiplies are skipped. Rounding is the same on both paths.
     if (!__all_sync(0xffffffff, alpha[0] == 1.0f && alpha[1] == 1.0f)) rescale_out(out, alpha);
 #endif
-    const int8_t* lane_row = v_tile + lane * K8_STRIDE;  // keys 0..15 of a step for matrix 0, 16..31 for matrix 1
+    // unpaired: keys 0..15 of a step for matrix 0, 16..31 for matrix 1. Paired: row j of the step for both,
+    // matrix 0 reading the left block of dims of the pair, matrix 1 the right one.
+    const int8_t* lane_row = PAIRED ? v_tile + lane % 16 * V8_STRIDE + lane / 16 * 16 : v_tile + lane * K8_STRIDE;
 #pragma unroll
     for (int pair = 0; pair < D_BLOCKS / 2; ++pair) {
         int acc[2][4] = {};
 #pragma unroll
         for (int step = 0; step < PV8_STEPS; ++step) {
             uint32_t b[4];
-            ldmatrix_x2_trans_b8(b, lane_row + step * MMA_K8 * K8_STRIDE + pair * 2 * MMA_N);
-            const uint32_t left[2] = {b[0], b[2]}, right[2] = {b[1], b[3]};
+            if (PAIRED) {
+                ldmatrix_x2_trans_b8(b, lane_row + step * 16 * V8_STRIDE + pair * 32);
+            } else {
+                ldmatrix_x2_trans_b8(b, lane_row + step * MMA_K8 * K8_STRIDE + pair * 2 * MMA_N);
+            }
+            const uint32_t left[2] = {b[0], PAIRED ? b[1] : b[2]}, right[2] = {PAIRED ? b[2] : b[1], b[3]};
             mma_u8s8_16832(acc[0], p[step], left);
             mma_u8s8_16832(acc[1], p[step], right);
         }
@@ -993,12 +1009,37 @@ extern "C" __global__ void pv_int8_tile(const float* P, const int8_t* V, float* 
     for (int block = 0; block < D_BLOCKS; ++block) store_acc(O + block * MMA_N, HEAD_DIM, out[block], row, col);
 }
 
+// M3.17: V8 in global memory as TMA copies it. TMA writes rows in order, so the rows are put in P's order
+// (p_order_slot) here instead of in the loader, and each head is padded to whole tiles of V8_PAD_KEYS keys
+// (their bytes are never read with a P̂ other than 0). Layout 1: one row of HEAD_DIM bytes per slot. Layout 2:
+// the pairs of M3.11, so that ldmatrix returns the B operands of P·V in adjacent registers: a row of
+// 2 · HEAD_DIM bytes per slot j of each 16 in a 32-key step, holding for every block of 8 dims those dims of
+// slot j, then of slot j + 16. The byte offset of chunk `chunk` (dims 8c .. 8c + 7 of one key) of quantize_v.
+constexpr int V8_PAD_KEYS = 64;
+
+__host__ __device__ constexpr int v8_tokens(int n_tokens) {
+    return (n_tokens + V8_PAD_KEYS - 1) / V8_PAD_KEYS * V8_PAD_KEYS;
+}
+
+__device__ __forceinline__ size_t v8_offset(int layout, int chunk, int n_tokens) {
+    if (layout == 0) return size_t(chunk) * CHUNK;
+    const int head = chunk / (n_tokens * CHUNKS_PER_ROW);
+    const int key = chunk / CHUNKS_PER_ROW % n_tokens;
+    const int c = chunk % CHUNKS_PER_ROW;
+    const int slot = p_order_slot(key);
+    const size_t head_base = size_t(head) * v8_tokens(n_tokens) * HEAD_DIM;
+    if (layout == 1) return head_base + size_t(slot) * HEAD_DIM + c * CHUNK;
+    return head_base + size_t(slot / MMA_K8 * 16 + slot % 16) * 2 * HEAD_DIM + c * 16 + slot % MMA_K8 / 16 * 8;
+}
+
 // V for attention_int8pv: v ≈ v8 · v_scale[dim], one scale per channel over all tokens of a head. d is the
 // axis P·V does not sum over, so the scale stays out of the mma and store_out applies it once. v_scale comes
 // from torch: the max of a channel needs every token. Bit for bit bench/emulate.py: IEEE division, round half
 // to even, clamp to ±127. Grid: ceil(n_chunks / QUANTIZE_THREADS), n_chunks = heads · n_tokens · CHUNKS_PER_ROW.
+// layout (M3.17, see v8_offset): 0 [heads][n_tokens][HEAD_DIM]; 1 and 2 for TMA, [heads][v8_tokens][HEAD_DIM]
+// bytes each.
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
-    quantize_v(const __nv_bfloat16* V, const float* v_scale, int8_t* V8, int n_tokens, int n_chunks) {
+    quantize_v(const __nv_bfloat16* V, const float* v_scale, int8_t* V8, int n_tokens, int n_chunks, int layout) {
     const int chunk = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
     if (chunk >= n_chunks) return;
     const float* scale = v_scale + chunk / (n_tokens * CHUNKS_PER_ROW) * HEAD_DIM + chunk % CHUNKS_PER_ROW * CHUNK;
@@ -1010,7 +1051,7 @@ extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
         const int value = __float2int_rn(fminf(fmaxf(rintf(values[i] / scale[i]), -127.0f), 127.0f));
         packed[i / 4] |= uint32_t(value & 0xff) << (8 * (i % 4));
     }
-    *reinterpret_cast<uint2*>(V8 + size_t(chunk) * CHUNK) = make_uint2(packed[0], packed[1]);
+    *reinterpret_cast<uint2*>(V8 + v8_offset(layout, chunk, n_tokens)) = make_uint2(packed[0], packed[1]);
 }
 
 // M3.3 step 2: attention_int8qk with P·V in u8 × s8. V8 is int8 [heads][n_keys][HEAD_DIM], v_scale float
@@ -1340,6 +1381,150 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
         add_row_sum_u8(row_sum, p, alpha, beta);
         pv_int8(out, p, v_tiles[now], alpha, beta, lane);
+
+        const int next_valid = n_keys - key0 - KEYS_PER_TILE;  // ≤ 0 in the last iteration: all masked
+        if (next_valid < KEYS_PER_TILE) mask_scores(scores[later], col, next_valid);
+    };
+
+    int t = 0;
+    for (; t + 1 < n_tiles; t += 2) {
+        iteration(t, Parity<0>{});
+        iteration(t + 1, Parity<1>{});
+    }
+    if (t < n_tiles) iteration(t, Parity<0>{});
+
+    store_out(O + q_offset, out, row_sum, row, col, n_rows, v_scale);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// M3.17: tiles by TMA.
+// ---------------------------------------------------------------------------------------------------
+
+// An mbarrier in shared memory that `count` arrivals complete, plus the bytes announced with expect_bytes.
+__device__ __forceinline__ void mbarrier_init(uint64_t* barrier, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_address(barrier)), "r"(count));
+}
+
+// This thread's arrival, announcing `bytes` that TMA copies will deliver before the phase completes.
+__device__ __forceinline__ void mbarrier_expect_bytes(uint64_t* barrier, int bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_address(barrier)), "r"(bytes)
+                 : "memory");
+}
+
+// Waits until the phase with parity `phase` of the barrier has completed.
+__device__ __forceinline__ void mbarrier_wait(uint64_t* barrier, int phase) {
+    uint32_t done = 0;
+    while (!done)
+        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                     : "=r"(done)
+                     : "r"(smem_address(barrier)), "r"(phase)
+                     : "memory");
+}
+
+// One box of a 2D tensor map, starting at element x of row y, into shared memory (128-byte aligned); its bytes
+// count towards `barrier`. Elements outside the tensor arrive as zeros.
+__device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap& map, int x, int y, uint64_t* barrier) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+        ::"r"(smem_address(dst)), "l"(&map), "r"(x), "r"(y), "r"(smem_address(barrier))
+        : "memory");
+}
+
+constexpr int K_TILE_BYTES = KEYS_PER_TILE * K8_STRIDE;  // a box of 144 bytes × KEYS_PER_TILE rows
+constexpr int V_TILE_BYTES = UNICA_V_PAIRS ? KEYS_PER_TILE / 2 * V8_STRIDE : KEYS_PER_TILE * K8_STRIDE;
+
+// M3.17: attention_int8pv_pipe with its tiles copied by TMA. One thread issues each tile and announces its
+// bytes on an mbarrier; every thread waits on the barrier, none computes an address. The boxes are 16 bytes
+// wider than a row of K8 or V8, so the tiles land with the padded stride the ldmatrix addressing expects.
+// k_map: K8 as rows of HEAD_DIM bytes, box K8_STRIDE × KEYS_PER_TILE. v_map: V8 in quantize_v layout 2
+// (UNICA_V_PAIRS, uint16 rows of 2 · HEAD_DIM bytes, box V8_STRIDE bytes × KEYS_PER_TILE / 2) or layout 1 (as
+// k_map). Q, scales, grid and block as attention_int8pv. The maps come first: TMA needs them 64-byte aligned,
+// and a map after the 8-byte Q8 lands at offset 8 of the parameters (cudaErrorMisalignedAddress, M3.17).
+extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
+    attention_int8pv_tma(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
+                         const int8_t* Q8, const float* q_scale, const float* k_scale, const float* v_scale,
+                         __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2) {
+    __shared__ __align__(128) int8_t k_tiles[2][K_TILE_BYTES];
+    __shared__ __align__(128) int8_t v_tiles[2][KEYS_PER_TILE * K8_STRIDE];
+    __shared__ __align__(16) int8_t q_tiles[WARPS_PER_BLOCK][ROWS_PER_WARP * K8_STRIDE];
+    // landed[p]: the copies issued in iterations t with t % 2 == p; landed[2]: those of the prologue
+    __shared__ __align__(8) uint64_t landed[3];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row = lane / 4;
+    const int col = 2 * (lane % 4);
+
+    const int row0 = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP;
+    const int n_rows = min(n_queries - row0, ROWS_PER_WARP);
+
+    const size_t q_offset = (size_t(blockIdx.y) * n_queries + row0) * HEAD_DIM;
+    v_scale += size_t(blockIdx.y) * HEAD_DIM;
+    k_scale += size_t(blockIdx.y) * ((n_keys + K_SCALE_BLOCK - 1) / K_SCALE_BLOCK);
+    const float q_scale_log2 =
+        q_scale[size_t(blockIdx.y) * ((n_queries + Q_SCALE_BLOCK - 1) / Q_SCALE_BLOCK) + row0 / Q_SCALE_BLOCK] *
+        scale_log2;
+    const int n_tiles = (n_keys + KEYS_PER_TILE - 1) / KEYS_PER_TILE;
+
+    // Row coordinates in the maps. A K tile past the end of the head reads the next head or zeros: masked.
+    const int k_row0 = blockIdx.y * n_keys;
+    constexpr int V_ROWS_PER_TILE = UNICA_V_PAIRS ? KEYS_PER_TILE / 2 : KEYS_PER_TILE;
+    const int v_row0 = blockIdx.y * v8_tokens(n_keys) / (KEYS_PER_TILE / V_ROWS_PER_TILE);
+    auto load_k = [&](int buffer, int tile, uint64_t* barrier) {
+        tma_load_2d(k_tiles[buffer], k_map, 0, k_row0 + tile * KEYS_PER_TILE, barrier);
+    };
+    auto load_v = [&](int buffer, int tile, uint64_t* barrier) {
+        tma_load_2d(v_tiles[buffer], v_map, 0, v_row0 + tile * V_ROWS_PER_TILE, barrier);
+    };
+
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 3; ++i) mbarrier_init(&landed[i], 1);
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        mbarrier_expect_bytes(&landed[2], (n_tiles > 1 ? 2 : 1) * K_TILE_BYTES + V_TILE_BYTES);
+        load_k(0, 0, &landed[2]);
+        load_v(0, 0, &landed[2]);
+        if (n_tiles > 1) load_k(1, 1, &landed[2]);
+    }
+    load_q8_async(q_tiles[warp], Q8 + q_offset, Q8, n_rows, lane);
+    cp_async_commit();
+
+    float row_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
+    float row_sum[2] = {0.0f, 0.0f};
+    float out[D_BLOCKS][4] = {};
+
+    cp_async_wait();
+    mbarrier_wait(&landed[2], 0);
+    __syncthreads();  // the Q tiles of the other lanes
+    float scores[2][KEY_BLOCKS][4];  // tile t in scores[t % 2]; Q·Kᵀ(t + 1) writes the other
+    qk_scores_int8_q_smem(scores[0], q_tiles[warp], k_tiles[0], lane);
+    if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
+
+    // As in attention_int8pv_pipe. Iteration t reads K(t + 1) and V(t), issued in iteration t − 1 (or the
+    // prologue), and issues K(t + 2) into the K buffer of t and V(t + 1) into the other V buffer.
+    auto iteration = [&](int t, auto parity) {
+        constexpr int now = decltype(parity)::value, later = 1 - now;
+        const int key0 = t * KEYS_PER_TILE;
+        if (t > 0) mbarrier_wait(&landed[later], (t - 1) / 2 % 2);  // its ((t − 1) / 2)-th phase
+        __syncthreads();  // every warp is done with K(t) and V(t − 1)
+        if (threadIdx.x == 0 && t + 1 < n_tiles) {
+            // ldmatrix read these buffers through the generic proxy; TMA writes them through the async one
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            mbarrier_expect_bytes(&landed[now], (t + 2 < n_tiles ? K_TILE_BYTES : 0) + V_TILE_BYTES);
+            if (t + 2 < n_tiles) load_k(now, t + 2, &landed[now]);
+            load_v(later, t + 1, &landed[now]);
+        }
+
+        float alpha[2], beta[2];
+        qk_scores_int8_q_smem(scores[later], q_tiles[warp], k_tiles[later], lane);  // stale in the last iteration
+        online_softmax_u8(scores[now], row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
+        uint32_t p[PV8_STEPS][4];
+#pragma unroll
+        for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
+        add_row_sum_u8(row_sum, p, alpha, beta);
+        pv_int8<UNICA_V_PAIRS>(out, p, v_tiles[now], alpha, beta, lane);
 
         const int next_valid = n_keys - key0 - KEYS_PER_TILE;  // ≤ 0 in the last iteration: all masked
         if (next_valid < KEYS_PER_TILE) mask_scores(scores[later], col, next_valid);
