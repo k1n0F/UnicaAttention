@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
-from emulate import emulate, errors, fp4_blocks, quant, reference, to_e2m1
+from emulate import emulate, errors, block_scaled, quant, reference, to_e2m1
 
 torch.manual_seed(0)
 q, k, v = torch.randn(3, 1, 2, 1000, 128, device="cuda").unbind(0)  # 1000 tokens: the last KV tile is partial
@@ -32,5 +32,5 @@ assert torch.equal(to_e2m1(ties), torch.tensor([0, 1, 1, 2, 2, 4, 4.0]))  # to t
 assert torch.equal(to_e2m1(torch.tensor([7.0, 1e6, -9.0])), torch.tensor([6.0, 6.0, -6.0]))
 for fmt in ("nvfp4", "mxfp4"):  # a block that is already on the grid at a power-of-two scale comes back unchanged
     on_grid = grid.repeat(4).reshape(1, 1, 1, 32) * 0.25
-    assert torch.equal(fp4_blocks(on_grid, fmt, -1), on_grid), fmt
+    assert torch.equal(block_scaled(on_grid, fmt, -1), on_grid), fmt
 print("ok")

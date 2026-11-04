@@ -1542,6 +1542,159 @@ half to start with, since P had been the most sensitive operand (M3.3).
   near SageAttention 2's 3.9 %.
 - **NVFP4 beats MXFP4 everywhere** (a scale per 16 in e4m3 against a power of two per 32).
 
+## M4.3 — correcting V's FP4 residual (checked in the emulator, not built)
+
+**Idea** (brought by the author): V = V₁ + R, V₁ in NVFP4, so P·V = P·V₁ + P·R. Correct with all of R, or
+only with its largest part. Random 4 × 4096, P in NVFP4 in every row of the table:
+
+| | q × 1 | q × 2 | q × 4 |
+|---|---|---|---|
+| today (u8 × s8) | 1.70 % | 2.65 % | 3.17 % |
+| b: V in NVFP4 | 13.67 % | 11.38 % | 10.04 % |
+| V exact (what P alone costs) | 9.48 % | | |
+| V₁ + the largest 1 / 2 / 4 of each 16 residuals, exact | 12.30 / 11.47 / 10.62 % | | |
+| **V₁ + R in NVFP4 too (a second OMMA)** | 9.52 % | 6.07 % | 3.33 % |
+
+V alone: 9.50 % → 0.87 % with the second FP4 term.
+
+- **The full residual buys back exactly what FP4 saved.** Two OMMA at 2× the rate take the tensor time of one
+  8-bit mma, and P stays in FP4. Today's speed, and worse than today on every data set.
+- **The residual is not sparse.** The largest 1 of 16 holds 37 % of its energy, 2 hold 56 %, 4 hold 76 %:
+  rounding noise is spread over every element. A partial correction cannot run on the tensor cores (an mma
+  is dense), and on the FMA pipe the largest 1 of 16 alone is ~256 FFMA per lane and tile, against 467
+  instructions in today's whole tile (M3.8: ~1.2 cycles each). For 13.7 → 12.3 %.
+- Not pursued. The cheap kind of correction is a compact part that is exact: the per-channel mean of V
+  (o = P·(V − μ) + μ, since a row of P sums to 1). Zero on random data by construction; to be seen on real V.
+
+## M4.4 — centred V, FP4 P × FP8 V, two FP4 terms (emulator)
+
+Three ideas of the author's. The price in tensor time of P·V, against today's u8 × s8 (1.0×): one OMMA k64 takes
+the time of one IMMA k32 and covers twice the keys, so each FP4 term costs 0.5×. e2m1 × e4m3 runs as QMMA k32:
+1.0×. Only `kind::mxf8f6f4` takes e2m1 × e4m3 with block scales, and its scales are ue8m0 per 32 (MXFP4 P,
+MXFP8 V). New in the emulator: `smooth_v`, `p_terms` / `v_terms` (x ≈ x₀ + x₁, x₁ the same format of the
+residual), `p1_v1`, the format `mxfp8`. Before the run only the price table was written down, no error
+numbers, so these rows are an exploration, not tested hypotheses.
+
+4 × 4096, rel L2. The second block adds to V a constant per channel (2σ, random per channel): the case real V
+with channel offsets would be. There the output is dominated by that constant, so its errors are small; compare
+them only within the block.
+
+| | P·V tensor | random q × 1 / × 2 / × 4 | V with channel offsets q × 1 / × 2 / × 4 |
+|---|---|---|---|
+| today, u8 × s8 | 1.0× | 1.70 / 2.65 / 3.17 % | 0.16 / 0.22 / 0.75 % |
+| b: NVFP4 P × NVFP4 V | 0.5× | 13.67 / 11.38 / 10.04 % | 0.96 / 1.53 / 5.15 % |
+| **b + centred V** | **0.5×** | 13.54 / 11.38 / 10.05 % | **0.24 / 0.61 / 2.25 %** |
+| MXFP4 P × MXFP8 V | 1.0× | 15.70 / 11.90 / 4.77 % | 0.33 / 0.73 / 1.65 % |
+| MXFP8 P × MXFP8 V | 1.0× | 4.07 / 3.89 / 4.23 % | 0.27 / 0.43 / 1.57 % |
+| P 1 term × V 2 terms | 1.0× | 9.52 / 6.07 / 3.33 % | 0.20 / 0.37 / 0.88 % |
+| P 2 terms × V 1 term | 1.0× | 9.94 / 9.80 / 9.96 % | 0.95 / 1.47 / 5.12 % |
+| P 2 × V 2, without P₁V₁ | 1.5× | 2.02 / 2.57 / 3.15 % | 0.17 / 0.24 / 0.84 % |
+| P 2 × V 2, all four | 2.0× | 1.82 / 2.55 / 3.15 % | 0.17 / 0.23 / 0.84 % |
+
+- **Centring V is free and exact, and it helps exactly when V has channel offsets**: b's error falls 4× there
+  (0.96 → 0.24 %), and not at all on random data. Whether real V has them decides its worth.
+- **FP4 P × FP8 V loses on both counts**: today's tensor time, and worse than b on random data, since the only
+  scaled form forces MXFP4 on P.
+- **Two FP4 terms never beat u8 × s8 at the same tensor time.** At 1.0× the best is 9.5 % against 1.7 %; today's
+  accuracy needs 1.5×. The hardware sells precision by the bit: an FP4 term is half the price of an 8-bit one and
+  holds half the bits, and on P, which lies in [0, 1], the uniform grid of u8 spends its bits better than two
+  e2m1 terms with their scales.
+- So FP4 pays only where fewer bits suffice: a layer that tolerates ~10 %, or data made friendlier first
+  (centring). Both are questions for real Q, K, V.
+
+## M4.5 — rotating Q and K (Hadamard) before quantization (emulator)
+
+The author's idea: a transform of Q and K that keeps every q·k. An orthogonal H does: (q·H)·(k·H) = q·H·Hᵀ·kᵀ = q·k.
+The Hadamard matrix (QuaRot, SpinQuant) mixes the channels of d, so an outlier is spread over all of them.
+`rotate_qk` in the emulator: H block-diagonal in blocks of 16 or 128 channels, applied after the K mean.
+
+**Hypotheses:** random data **~0** (a rotated Gaussian is Gaussian). With channels of uneven size (WAN has RMSNorm
+with learned weights on q and k) a clear gain **for FP4**, and also **for INT8**, whose one scale per token covers all
+128 channels, so an outlier sets it for all.
+
+Synthetic channels: each channel of Q and of K times a factor (lognormal σ = 0.5 or 1.0, or 4 channels × 10),
+normalised so that the scores keep the size of plain random data. 4 × 4096, rel L2, q × 1 / × 2 / × 4:
+
+| channels | INT8 Q·Kᵀ (today) | + Hadamard 128 | Q·Kᵀ NVFP4 | + Hadamard 16 | + Hadamard 128 |
+|---|---|---|---|---|---|
+| random | 1.70 / 2.65 / 3.17 % | 1.70 / 2.68 / 3.23 % | 14.0 / 25.9 / 32.8 % | 14.0 / 25.7 / 32.7 % | 14.0 / 26.0 / 32.6 % |
+| lognormal 0.5 | 2.87 / 4.83 / 6.12 % | **1.75 / 2.71 / 3.28 %** | 14.3 / 26.5 / 32.8 % | 14.7 / 27.0 / 33.7 % | 14.9 / 27.3 / 34.5 % |
+| lognormal 1.0 | 5.69 / 8.46 / 12.27 % | **1.93 / 2.71 / 3.79 %** | 17.4 / 27.5 / 36.1 % | 18.8 / 29.6 / 38.3 % | 18.8 / 30.1 / 41.5 % |
+| 4 channels × 10 | 8.41 / 14.69 / 18.47 % | **2.34 / 3.79 / 4.65 %** | 16.9 / 32.5 / 39.0 % | 17.2 / 33.2 / 39.5 % | 27.4 / 51.9 / 58.7 % |
+
+| | predicted | measured |
+|---|---|---|
+| random | ~0 | ~0: **held** |
+| INT8, uneven channels | a clear gain | **held, strongly**: 3–4× less error, back near the random-data level |
+| FP4, uneven channels | a clear gain | **wrong: worse**, up to 1.6× with 4 outliers and H128 |
+
+**Why it helps INT8 and hurts FP4.** INT8 has one scale for all 128 channels of a token: an outlier sets it, and
+every other channel is left with a few levels. FP4 has a scale per 16 channels: an outlier is the maximum of its
+own block and lands on the grid's top value nearly exactly, and the blocks without it keep their own scale. Fine
+block scales already handle channel outliers. The rotation then mixes the outlier into every element, each with
+e2m1's ~9 % error, and the term that dominates q·k loses the precision it had for free. A rotation makes data
+Gaussian, and Gaussian is the worst case for FP4.
+
+**For today's kernel:** if real Q and K have uneven channels, a Hadamard rotation in the quantize pass could cut
+the INT8 Q·Kᵀ error several times, with the attention kernel unchanged (the scores are the same). The quantize pass
+is memory-bound (M3.20), and a 128-point fast Hadamard transform is 7 butterfly steps per token. Real data decides
+here too: on block 19 unica measured 1.13–1.26 %, below random's 1.70 %, which does not suggest strong outliers
+there.
+
+## M4.6 — the candidates on real Q, K, V: 22 blocks of a WAN 2.2 video
+
+Run by the ComfyUI app's agent: the Rigsy WAN 2.2 I2V workflow as in M5.3 and M5.5 (nvfp4 high and low noise
+models, lightx2v 4 steps, 480 × 864, 81 frames, 34 020 tokens, seed 42; Unica Attention (native) after
+`PathchSageAttentionKJ` in sageattn3 mode). `measure_every` 7, coprime to 40, so the 22 samples fall on 22
+different blocks over all 4 steps; 2 heads each. The node now also emulates the candidates of M4.4–M4.5 on the
+same Q, K, V and records how uneven the channels are (largest channel RMS / median, 1 = even) and V's offset
+(RMS of the channel means / RMS of V). `build/wan_attention_errors_m4.csv`. rel L2 against FP32:
+
+| step, block | unica | + Hadamard | SA2 | SA3 | FP4 P·V | + centred V | channel spread q / k | V offset |
+|---|---|---|---|---|---|---|---|---|
+| 0, 6 | 0.662 | 0.605 | 0.708 | 5.50 | 2.38 | 2.29 | 1.73 / 2.39 | 0.341 |
+| 0, 13 | 1.111 | 0.984 | 1.062 | 8.70 | 3.62 | 3.43 | 2.40 / 1.92 | 0.257 |
+| 0, 20 | 1.151 | 1.076 | 1.569 | 9.36 | 5.53 | 5.47 | 1.79 / 1.79 | 0.183 |
+| 0, 27 | 0.843 | 0.814 | 0.873 | 7.46 | 3.66 | 3.38 | 1.62 / 1.72 | 0.226 |
+| 0, 34 | 0.764 | 0.661 | 1.001 | 7.12 | 3.48 | 3.37 | 2.65 / 4.20 | 0.330 |
+| 1, 1 | 1.108 | 0.977 | 2.326 | 11.95 | 8.30 | 8.07 | **5.96 / 10.74** | 0.226 |
+| 1, 8 | 0.920 | 0.834 | 1.584 | 8.63 | 5.01 | 4.79 | 2.15 / 2.32 | 0.282 |
+| 1, 15 | 1.076 | 0.900 | 1.501 | 9.19 | 4.45 | 4.39 | 2.79 / 2.25 | 0.247 |
+| 1, 22 | 1.231 | 1.088 | 1.736 | 10.36 | 5.26 | 5.15 | 1.97 / 3.20 | 0.174 |
+| 1, 29 | 0.583 | 0.555 | 0.781 | 5.70 | 2.58 | 2.45 | 2.30 / 2.03 | 0.314 |
+| 1, 36 | 0.352 | 0.303 | 0.437 | 3.46 | 1.47 | 1.37 | 1.95 / 3.33 | 0.268 |
+| 2, 3 | 1.277 | 1.051 | 2.361 | 12.65 | 8.11 | 7.91 | **4.48 / 6.78** | 0.222 |
+| 2, 10 | 0.658 | 0.610 | 0.836 | 5.76 | 2.64 | 2.61 | 1.82 / 1.58 | 0.266 |
+| 2, 17 | 1.361 | 1.049 | 1.662 | 11.44 | 4.22 | 4.13 | 2.58 / 2.65 | 0.206 |
+| 2, 24 | 0.760 | 0.722 | 0.943 | 6.69 | 3.20 | 3.12 | 1.98 / 1.82 | 0.253 |
+| 2, 31 | 1.012 | 0.907 | 1.251 | 9.45 | 3.67 | 3.52 | 2.37 / 2.66 | 0.277 |
+| 2, 38 | 0.176 | 0.175 | 0.180 | 2.08 | 0.81 | 0.55 | 1.53 / 1.50 | 0.327 |
+| 3, 5 | 0.684 | 0.647 | 0.851 | 6.35 | 2.88 | 2.85 | 2.18 / 2.57 | 0.225 |
+| 3, 12 | 0.629 | 0.596 | 0.595 | 4.95 | 2.48 | 2.44 | 1.92 / 1.63 | 0.237 |
+| 3, 19 | 1.263 | 1.107 | 1.674 | 11.18 | 4.75 | 4.65 | 2.11 / 2.06 | 0.228 |
+| 3, 26 | 1.353 | 1.161 | 2.068 | 11.48 | 6.32 | 6.18 | 1.88 / 1.81 | 0.231 |
+| 3, 33 | 0.876 | 0.754 | 1.830 | 14.00 | 6.43 | 5.65 | **7.09 / 12.77** | 0.459 |
+| **median** | **0.90 %** | **0.82 %** | **1.16 %** | **8.67 %** | **3.67 %** | **3.47 %** | | |
+| max | 1.36 % | 1.16 % | 2.36 % | 14.0 % | 8.30 % | 8.07 % | | |
+
+(unica is the kernel itself, the other candidates the emulator, which matches the kernel to ≤ 0.015 % on random
+data.)
+
+- **Today's kernel against SageAttention 2 over 22 blocks:** median 0.90 % against 1.16 %; SageAttention 2 up to
+  2.1× worse (blocks with uneven channels), unica worse in 2 of 22 by ≤ 5 % of their error. A wider and
+  stronger result than the 2 blocks of M5.3.
+- **Hadamard on today's INT8 Q·Kᵀ: better in all 22 blocks, median 1.12×, at most 1.30×** (step 2, block 17:
+  1.36 → 1.05 %). Smaller than the synthetic 3–4× of M4.5. Real channels are uneven by 1.5–2.8 in most blocks
+  (×7–13 only in blocks 1, 3 and 33), and unica's error also holds P·V and the bf16 output (0.18 % at block 38),
+  which a rotation of Q and K does not touch.
+- **FP4 P·V on real data: median 3.67 %, 0.81–8.30 %.** Far kinder than random (13.7 %): real attention is
+  sharp, and P's FP4 error shrinks with sharpness (M4.2). Against SageAttention 3 on the same calls: **2.4× less
+  error** at the median (3.67 against 8.67 %), at least 1.4× in every block. Against SageAttention 2: 3.2× more.
+- **Centring V: median 1.03×, at most 1.47×** (block 38). Real V does have offsets (0.17–0.46 of its RMS), much
+  smaller than the 2σ of the synthetic case in M4.4, and the block scales per 16 keys absorb most of them.
+- The blocks with very uneven channels (1, 3, 33) are where SageAttention 2 and 3 and FP4 P·V do worst; unica's
+  error stays near 1 % there.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

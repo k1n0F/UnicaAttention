@@ -59,7 +59,8 @@ def to_fmt(x, fmt):
 
 
 E2M1_MAX = 6.0
-FP4_BLOCK = {"nvfp4": 16, "mxfp4": 32}  # elements along the summed axis that share one scale
+# block-scaled formats: elements along the summed axis that share one scale
+FP4_BLOCK = {"nvfp4": 16, "mxfp4": 32, "mxfp8": 32}  # mxfp8: e4m3, the only scaled form that takes e2m1 × e4m3
 
 
 def to_e2m1(x):
@@ -71,7 +72,7 @@ def to_e2m1(x):
     return (torch.round(a / step) * step).clamp(max=E2M1_MAX).copysign(x)
 
 
-def fp4_blocks(x, fmt, dim):
+def block_scaled(x, fmt, dim):
     """x as a block-scaled FP4 MMA sees it: e2m1 values times one scale per FP4_BLOCK[fmt] elements along
     `dim`, the axis the MMA sums over. Returns the dequantized x̂ · s: the MMA applies the scales itself, with
     an f32 accumulator, so the emulator can multiply them in before an FP32 GEMM.
@@ -79,7 +80,16 @@ def fp4_blocks(x, fmt, dim):
     nvfp4  scale = amax / 6 rounded to e4m3, under one FP32 scale per head that puts the largest block at 448
     mxfp4  scale = 2^(floor(log2 amax) − 2), the OCP MX rule (6 = 1.5 · 2²); a block whose amax / scale lies in
            (6, 8) saturates at 6
+    mxfp8  e4m3 values, scale = 2^(floor(log2 amax) − 8) (448 = 1.75 · 2⁸)
     """
+    if fmt == "mxfp8":
+        x = x.movedim(dim, -1)
+        n = x.shape[-1]
+        blocks = F.pad(x, (0, -n % 32)).unflatten(-1, (-1, 32))
+        amax = blocks.abs().amax(-1, keepdim=True)
+        s = torch.exp2(torch.floor(torch.log2(amax.clamp_min(2.0**-126))) - 8)
+        x_hat = (blocks / s).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3).float() * s
+        return x_hat.flatten(-2)[..., :n].movedim(-1, dim)
     block = FP4_BLOCK[fmt]
     x = x.movedim(dim, -1)
     n = x.shape[-1]
@@ -92,6 +102,14 @@ def fp4_blocks(x, fmt, dim):
         s = (amax / E2M1_MAX / per_head).to(E4M3).float() * per_head  # a scale below e4m3's range becomes 0
     x_hat = to_e2m1(blocks / s.clamp_min(1e-30)) * s
     return x_hat.flatten(-2)[..., :n].movedim(-1, dim)
+
+
+def hadamard(n, device):
+    """The n × n Hadamard matrix (Sylvester), scaled to be orthogonal: H · Hᵀ = I."""
+    h = torch.ones(1, 1, device=device)
+    while len(h) < n:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)])
+    return h / len(h) ** 0.5
 
 
 def quant(x, fmt, block):
@@ -119,6 +137,11 @@ def emulate(
     bc=64,
     out_bf16=True,
     sum_rounded=False,
+    smooth_v=False,
+    rotate_qk=None,
+    p_terms=1,
+    v_terms=1,
+    p1_v1=True,
 ):
     """Tiled online-softmax attention, the way the kernel computes it.
 
@@ -134,22 +157,38 @@ def emulate(
               p_mul·448·bc must stay below 65504 to rule out FP16 overflow in the worst case
     sum_rounded  the row sum over P as it goes into the MMA (rounded to p_fmt), not over P before
               rounding: numerator and denominator then see the same P
+    rotate_qk None | 16 | 32 | 64 | 128: Q and K times the orthogonal Hadamard matrix, block-diagonal in blocks of
+              this many channels of d, before quantization. Spreads a channel outlier over the block
+    smooth_v  subtract the mean of V over tokens and add it to the output: a row of P sums to 1, so
+              P·(V − μ) + μ = P·V
+    p_terms, v_terms  1 or 2 block-scaled terms: x ≈ x₀ + x₁, x₁ the same format of the residual x − x₀.
+              Each pair of terms is one more mma; p1_v1=False leaves out P₁·V₁
     """
     q, k, v = q.float(), k.float(), v.float()
     if smooth_k:
         k = k - k.mean(-2, keepdim=True)
+    if rotate_qk:  # (q·H)·(k·H) = q·H·Hᵀ·kᵀ = q·k: the scores do not change, the values do
+        h = hadamard(rotate_qk, q.device)
+        q, k = ((x.unflatten(-1, (-1, rotate_qk)) @ h).flatten(-2) for x in (q, k))
+    v_mean = v.mean(-2, keepdim=True) if smooth_v else 0.0
+    v = v - v_mean
     if qk in FP4_BLOCK:  # scales along d, inside the MMA
-        q, k = fp4_blocks(q, qk, -1), fp4_blocks(k, qk, -1)
+        q, k = block_scaled(q, qk, -1), block_scaled(k, qk, -1)
         sq = sk = torch.ones_like(q[..., :1])
     else:
         (q, sq), (k, sk) = quant(q, qk, q_block), quant(k, qk, k_block)
     if v_fmt in FP4_BLOCK:  # scales per channel and block of keys, the axis P·V sums over
-        v, sv = fp4_blocks(v, v_fmt, -2), 1.0
+        v_parts, sv = [block_scaled(v, v_fmt, -2)], 1.0
+        if v_terms == 2:
+            v_parts.append(block_scaled(v - v_parts[0], v_fmt, -2))
+        v = torch.stack(v_parts)  # [terms, ...]
     elif v_fmt:
         sv = (v.abs().amax(-2, keepdim=True) / QMAX[v_fmt]).clamp_min(1e-12)
         v = to_fmt(v / sv, v_fmt)
     else:
         sv = 1.0
+    if v.dim() == q.dim():
+        v = v.unsqueeze(0)  # one term
     if p_mul is None:
         p_mul = QMAX.get(p_fmt, 1.0)
 
@@ -169,24 +208,31 @@ def emulate(
         p = torch.exp2(s - m_p)
         row_sum = p.sum(-1, keepdim=True)  # the kernel sums P in FP32, before quantizing it
         p = p * p_mul
+        p_parts = [p]
         if p_fmt in FP4_BLOCK:  # blocks of keys inside the tile
-            p = fp4_blocks(p, p_fmt, -1)
+            p_parts = [block_scaled(p, p_fmt, -1)]
+            if p_terms == 2:
+                p_parts.append(block_scaled(p - p_parts[0], p_fmt, -1))
+            p = sum(p_parts)
         elif p_fmt:
-            p = to_fmt(p, p_fmt)
+            p = p_parts[0] = to_fmt(p, p_fmt)
         if sum_rounded:
             row_sum = p.sum(-1, keepdim=True) / p_mul
         l = l * alpha + row_sum * beta
         vt = v[..., j : j + bc, :]
-        if acc16:
+        if len(p_parts) > 1 or len(vt) > 1:
+            inner = sum(pi @ vj for i, pi in enumerate(p_parts) for jv, vj in enumerate(vt) if p1_v1 or i + jv < 2)
+        elif acc16:
+            vt = vt[0]
             inner = torch.zeros(o.shape, dtype=torch.half, device=o.device)
             for c in range(0, p.shape[-1], MMA_K):
                 inner = (inner.float() + p[..., c : c + MMA_K] @ vt[..., c : c + MMA_K, :]).half()
             overflow |= torch.isinf(inner).any()
             inner = inner.float()
         else:
-            inner = p @ vt
+            inner = p @ vt[0]
         m, o = m_new, o * alpha + inner * beta
-    o = o * (sv / p_mul) / l
+    o = o * (sv / p_mul) / l + v_mean
     if overflow:
         print("  FP16 accumulator overflowed")
     return o.bfloat16().float() if out_bf16 else o
