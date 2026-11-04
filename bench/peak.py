@@ -33,6 +33,9 @@ FORMS = {
     "peak_i2f": (32, "T/s"),  # one conversion per lane
     "peak_ex2": (32, "T/s"),
 }
+# M4: FP4. k64 forms do 16384 flop per instruction; the pair kernels the same per chain and round
+FORMS |= {name: (2 * 16 * 8 * 64, "TFLOPS") for name in ("peak_nvf4", "peak_mxf4", "peak_pair_nvf4_s8s8", "peak_pair_nvf4_u8s8")}
+FORMS |= {name: (2 * 16 * 8 * 32, "TFLOPS") for name in ("peak_e2m1_e4m3_f32", "peak_e2m1_e4m3_f16", "peak_mxf8f6f4_e2m1_e4m3", "peak_mxf8f6f4_e4m3_e4m3")}
 # M3.8: u8 × s8 with distinct operand registers and N FFMA per mma
 FORMS |= {f"peak_u8s8_mixed_{n}": (2 * 16 * 8 * 32, "TOPS") for n in (0, 4, 8, 12, 16)}
 FORMS |= {f"peak_u8s8_mixed_8_{kind}": (2 * 16 * 8 * 32, "TOPS") for kind in ("FFMA_IMM", "FMUL", "FMNMX", "IADD", "I2F", "EX2")}

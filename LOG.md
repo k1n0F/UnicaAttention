@@ -1460,6 +1460,88 @@ Earlier runs by the Rigsy app's agent: SageAttention 3 46.2 / 44.1 s, UnicaAtten
 videos diverge visibly on one seed (assets/compare.gif). The arithmetic differs, so the trajectory does too.
 No ranking of quality follows from one seed.
 
+## M4.1 — FP4 on sm_120a: which forms exist, and their rates
+
+The author's plan: FP4 in one half of the tile at a time, Q·Kᵀ first, then P·V, then the other way round.
+Before any kernel, what the hardware offers (compiled with nvcc 13.2, `-arch=sm_120a`):
+
+| PTX | SASS |
+|---|---|
+| `m16n8k64 … kind::mxf4nvf4.block_scale.scale_vec::4X … ue4m3` (NVFP4: scale per 16) | `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` |
+| `m16n8k64 … kind::mxf4nvf4` / `kind::mxf4 … scale_vec::2X … ue8m0` (MXFP4: scale per 32) | `OMMA.SF.16864.F32.E2M1.E2M1.E8` |
+| the same with an f16 accumulator | **refused by ptxas** |
+| `m16n8k32 … kind::f8f6f4 … e2m1.e4m3` (f32 or f16) | `QMMA.16832.F32/F16.E2M1.E4M3`: the FP8 unit, e2m1 kept in bytes |
+| `m16n8k32 … kind::mxf8f6f4.block_scale … ue8m0` | `QMMA.SF.16832.F32.*.E8` |
+
+**Hypotheses:** OMMA ~900 TFLOPS, 2× INT8; if its f32 accumulator halves the rate as FP8's does, ~450 and FP4
+buys nothing. QMMA with e2m1 as FP8: ~226 (f32) / ~456 (f16). Half the work in FP4, half in 8-bit: the
+harmonic mean, ~600.
+
+**Measured** (bench/peak.py, two runs; the clock was high in the first):
+
+| form | run 1 | run 2 | predicted |
+|---|---|---|---|
+| `peak_u8s8` (today's mma, reference) | 496 TOPS | 446 | |
+| `peak_e4m3_f32` / `_f16` | 246 / 496 | 223 / 454 | |
+| **`peak_nvf4`** | **990 TFLOPS** | **931** | ~900: **held**, 2.0–2.1× INT8 |
+| `peak_mxf4` | 991 | | the same: held |
+| `peak_e2m1_e4m3_f32` / `_f16` | 245 / 495 | | held: FP8 rates |
+| **`peak_mxf8f6f4_e2m1_e4m3`** (block-scaled, f32) | **494** | 452 | ~226: **missed**, full rate |
+| **`peak_mxf8f6f4_e4m3_e4m3`** (block-scaled, f32) | | **446** | full rate |
+| `peak_pair_nvf4_s8s8` / `_u8s8` (half the work each way) | 643 / 656 | | ~600: held (harmonic mean of run 1: 661) |
+
+- **Only the block-scaled k64 form doubles the rate**, and it needs FP4 on both sides of the mma. FP4 against
+  FP8 goes through the FP8 unit at FP8's rate.
+- **Not predicted:** a block-scaled QMMA accumulates in f32 at full rate, where the plain one runs at half. So
+  e4m3 P·V with an f32 accumulator no longer costs half the rate. M3.3 ruled e4m3 P·V out on accuracy, not on
+  this, but the f32 accumulator would remove the flush. Kept for later.
+
+## M4.2 — FP4 accuracy, emulator (before any kernel)
+
+`bench/emulate.py` got FP4: `to_e2m1` (nearest, ties to the even mantissa, saturating at 6) and
+`fp4_blocks` (one scale per 16 or 32 elements along the summed axis: d for Q and K, keys for P and V).
+NVFP4: amax / 6 rounded to e4m3 under one FP32 scale per head. MXFP4: the OCP rule, 2^(floor(log2 amax) − 2).
+Each config is today's kernel (INT8 Q·Kᵀ, u8 × s8 P·V, Σ P̂) with one half replaced.
+
+**Hypotheses:** the output error is ~0.92 × the score error (the model that gives INT8 Q·Kᵀ's 1.33 %), and
+e2m1 with a scale per 16 has a relative RMS error of ~9 %. Q·Kᵀ in NVFP4 **~12 %**, MXFP4 ~15 %; P·V in NVFP4
+**~12–13 %**; both in FP4 **~17–19 %** (SageAttention 3 measures 19.1 %). My intuition: Q·Kᵀ is the better
+half to start with, since P had been the most sensitive operand (M3.3).
+
+**Measured**, rel L2 against FP32:
+
+| config | 4 × 4096 | 2 × 8192 | q × 2 | q × 4 |
+|---|---|---|---|---|
+| today: INT8 Q·Kᵀ + u8 × s8 P·V | 1.70 % | 1.77 % | 2.65 % | 3.17 % |
+| Q·Kᵀ NVFP4 alone | 14.00 % | 14.26 % | 25.80 % | 32.77 % |
+| Q·Kᵀ MXFP4 alone | 16.93 % | 17.29 % | 31.13 % | 38.83 % |
+| P NVFP4 alone (tile-local max) | 9.25 % | 9.43 % | 3.67 % | 0.83 % |
+| V NVFP4 alone | 9.81 % | 9.86 % | 9.50 % | 9.50 % |
+| **a:** Q·Kᵀ NVFP4 + u8 × s8 P·V | 14.04 % | 14.31 % | 25.90 % | 32.82 % |
+| a: Q·Kᵀ MXFP4 + u8 × s8 P·V | 16.96 % | 17.33 % | 31.14 % | 38.87 % |
+| **b:** INT8 Q·Kᵀ + NVFP4 P·V | **13.67 %** | **13.81 %** | **11.38 %** | **10.04 %** |
+| b: INT8 Q·Kᵀ + MXFP4 P·V | 19.15 % | 19.36 % | 15.90 % | 12.02 % |
+| c: NVFP4 both | 19.53 % | 19.86 % | 28.52 % | 34.14 % |
+
+| | predicted | measured |
+|---|---|---|
+| Q·Kᵀ NVFP4 | ~12 % | 14.0 %: held, a little worse |
+| Q·Kᵀ MXFP4 | ~15 % | 16.9 %: held, a little worse |
+| P·V NVFP4 | ~12–13 % | 13.7 %: held |
+| both NVFP4 | ~17–19 % | 19.5 %: held; the emulator reproduces SageAttention 3's 19.1 % |
+| start with Q·Kᵀ | | **wrong** |
+
+**Findings:**
+
+- **Q·Kᵀ is the worst half for FP4**, not P·V. The error of a score grows with its size, and exp amplifies it:
+  14 % on random data, 26 % and 33 % on sharper attention.
+- **In P·V the error comes from V, not from P.** P alone costs 9 % on random data and less the sharper the
+  attention (0.8 % at q × 4): the large P are few and land on the grid near 1. V costs 9.5–9.9 % everywhere.
+  The mma takes e2m1 on both sides, so P cannot go to FP4 alone.
+- **b beats a on every data set**, and beats both-FP4 (SageAttention 3's class) by 1.4–3.4×. Neither comes
+  near SageAttention 2's 3.9 %.
+- **NVFP4 beats MXFP4 everywhere** (a scale per 16 in e4m3 against a power of two per 32).
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

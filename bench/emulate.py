@@ -58,6 +58,42 @@ def to_fmt(x, fmt):
     raise ValueError(fmt)
 
 
+E2M1_MAX = 6.0
+FP4_BLOCK = {"nvfp4": 16, "mxfp4": 32}  # elements along the summed axis that share one scale
+
+
+def to_e2m1(x):
+    """Round to the nearest e2m1 value (±0, 0.5, 1, 1.5, 2, 3, 4, 6), ties to even, saturating at 6, as
+    cvt.rn.satfinite.e2m1x2.f32 does. The grid step is 0.5 below 2, 1 below 4, 2 up to 6; on each piece an even
+    multiple of the step is an even mantissa, so torch.round's ties to even are e2m1's."""
+    a = x.abs()
+    step = torch.where(a < 2, 0.5, torch.where(a < 4, 1.0, 2.0))
+    return (torch.round(a / step) * step).clamp(max=E2M1_MAX).copysign(x)
+
+
+def fp4_blocks(x, fmt, dim):
+    """x as a block-scaled FP4 MMA sees it: e2m1 values times one scale per FP4_BLOCK[fmt] elements along
+    `dim`, the axis the MMA sums over. Returns the dequantized x̂ · s: the MMA applies the scales itself, with
+    an f32 accumulator, so the emulator can multiply them in before an FP32 GEMM.
+
+    nvfp4  scale = amax / 6 rounded to e4m3, under one FP32 scale per head that puts the largest block at 448
+    mxfp4  scale = 2^(floor(log2 amax) − 2), the OCP MX rule (6 = 1.5 · 2²); a block whose amax / scale lies in
+           (6, 8) saturates at 6
+    """
+    block = FP4_BLOCK[fmt]
+    x = x.movedim(dim, -1)
+    n = x.shape[-1]
+    blocks = F.pad(x, (0, -n % block)).unflatten(-1, (-1, block))
+    amax = blocks.abs().amax(-1, keepdim=True)
+    if fmt == "mxfp4":
+        s = torch.exp2(torch.floor(torch.log2(amax.clamp_min(2.0**-126))) - 2)
+    else:
+        per_head = (amax.amax((-3, -2, -1), keepdim=True) / (E2M1_MAX * E4M3_MAX)).clamp_min(1e-30)
+        s = (amax / E2M1_MAX / per_head).to(E4M3).float() * per_head  # a scale below e4m3's range becomes 0
+    x_hat = to_e2m1(blocks / s.clamp_min(1e-30)) * s
+    return x_hat.flatten(-2)[..., :n].movedim(-1, dim)
+
+
 def quant(x, fmt, block):
     """x ≈ x̂ · s: values x̂ as they enter the MMA, and a scale s per token, [..., N, 1]."""
     if fmt is None:
@@ -102,8 +138,14 @@ def emulate(
     q, k, v = q.float(), k.float(), v.float()
     if smooth_k:
         k = k - k.mean(-2, keepdim=True)
-    (q, sq), (k, sk) = quant(q, qk, q_block), quant(k, qk, k_block)
-    if v_fmt:
+    if qk in FP4_BLOCK:  # scales along d, inside the MMA
+        q, k = fp4_blocks(q, qk, -1), fp4_blocks(k, qk, -1)
+        sq = sk = torch.ones_like(q[..., :1])
+    else:
+        (q, sq), (k, sk) = quant(q, qk, q_block), quant(k, qk, k_block)
+    if v_fmt in FP4_BLOCK:  # scales per channel and block of keys, the axis P·V sums over
+        v, sv = fp4_blocks(v, v_fmt, -2), 1.0
+    elif v_fmt:
         sv = (v.abs().amax(-2, keepdim=True) / QMAX[v_fmt]).clamp_min(1e-12)
         v = to_fmt(v / sv, v_fmt)
     else:
@@ -127,7 +169,9 @@ def emulate(
         p = torch.exp2(s - m_p)
         row_sum = p.sum(-1, keepdim=True)  # the kernel sums P in FP32, before quantizing it
         p = p * p_mul
-        if p_fmt:
+        if p_fmt in FP4_BLOCK:  # blocks of keys inside the tile
+            p = fp4_blocks(p, p_fmt, -1)
+        elif p_fmt:
             p = to_fmt(p, p_fmt)
         if sum_rounded:
             row_sum = p.sum(-1, keepdim=True) / p_mul
@@ -177,20 +221,37 @@ CONFIGS = {
     "INT8 QK + u8/s8 PV, tile-local P": dict(qk="int8", p_fmt="u8", v_fmt="int8", p_local=True),
     "INT8 per token + u8/s8 PV, local P": dict(qk="int8", q_block=1, k_block=1, p_fmt="u8", v_fmt="int8", p_local=True),
 }
+# M4: FP4 in one half of the tile or both, against today's kernel (the first line)
+TODAY = dict(qk="int8", p_fmt="u8", v_fmt="int8", p_local=True, sum_rounded=True)
+CONFIGS |= {
+    "M4 today: INT8 QK + u8/s8 PV": TODAY,
+    "M4 QK nvfp4 alone": dict(qk="nvfp4"),
+    "M4 QK mxfp4 alone": dict(qk="mxfp4"),
+    "M4 P nvfp4 alone, local": dict(p_fmt="nvfp4", p_local=True),
+    "M4 V nvfp4 alone": dict(v_fmt="nvfp4"),
+    "M4 a: QK nvfp4 + u8/s8 PV": TODAY | dict(qk="nvfp4"),
+    "M4 a: QK mxfp4 + u8/s8 PV": TODAY | dict(qk="mxfp4"),
+    "M4 b: INT8 QK + nvfp4 PV": TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4"),
+    "M4 b: INT8 QK + mxfp4 PV": TODAY | dict(p_fmt="mxfp4", v_fmt="mxfp4"),
+    "M4 c: nvfp4 QK + nvfp4 PV": TODAY | dict(qk="nvfp4", p_fmt="nvfp4", v_fmt="nvfp4"),
+}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--heads", type=int, default=40)
     ap.add_argument("--tokens", type=int, default=32760)
     ap.add_argument("--bc", type=int, default=64)
+    ap.add_argument("--only", default="", help="run only the configs whose name contains this")
+    ap.add_argument("--q-mul", type=float, default=1.0, help="sharper attention: q times this")
     args = ap.parse_args()
 
     torch.manual_seed(0)
     shape = (1, args.heads, args.tokens, 128)
     q, k, v = (torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    q = (q.float() * args.q_mul).bfloat16()
     ref = reference(q, k, v)
-    print(f"shape {shape}, bf16 random inputs, KV tile {args.bc}\n")
+    print(f"shape {shape}, bf16 random inputs, q x {args.q_mul}, KV tile {args.bc}\n")
     print(f"{'config':38} {'rel L2':>8} {'cos':>9} {'max abs':>9}")
-    for name, cfg in CONFIGS.items():
+    for name, cfg in ((n, c) for n, c in CONFIGS.items() if args.only in n):
         e = errors(emulate(q, k, v, bc=args.bc, **cfg), ref)
         print(f"{name:38} {e['rel_l2']:8.2%} {e['cos']:9.6f} {e['max_abs']:9.2e}")

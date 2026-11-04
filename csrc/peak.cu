@@ -34,8 +34,18 @@ constexpr int CHAINS = 8;
         out[blockIdx.x * blockDim.x + threadIdx.x] = sum;                                    \
     }
 
+// Block-scaled mma (M4): the same, plus one scale register for A and one for B. Every byte of a scale
+// register holds the same scale, so the byte and thread selectors can stay 0.
+#define MMA4_SCALED(PTX, acc, a, b, scale)                                                   \
+    asm(PTX " {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %10, {0, 0};" \
+        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])                           \
+        : "r"(a), "r"(a), "r"(a), "r"(a), "r"(b), "r"(b), "r"(scale))
+
 constexpr uint32_t ONES_BF16 = 0x3f803f80, ONES_F16 = 0x3c003c00;
 constexpr uint32_t ONES_INT8 = 0x01010101, ONES_E4M3 = 0x38383838;
+constexpr uint32_t ONES_E2M1 = 0x22222222;  // 1.0 = 0b0010 in every nibble (bias 1)
+constexpr uint32_t ONES_E2M1_IN_BYTES = 0x02020202;  // kind::f8f6f4 keeps each e2m1 in a byte of its own
+constexpr uint32_t SCALES_UE4M3 = 0x38383838, SCALES_UE8M0 = 0x7f7f7f7f;  // 1.0 in each format
 
 // m16n8k16, 4096 flop each: the exact path (half bf16 Q·Kᵀ, half fp16 P·V), FP32 accumulate.
 PEAK_KERNEL(peak_bf16_f16_f32, float, 4,
@@ -60,6 +70,48 @@ PEAK_KERNEL(peak_mix_s8s8_u8s8, int, 4,
 PEAK_KERNEL(peak_mix_s8s8_e4m3_f16, int, 4,
             if (chain % 2) MMA2("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16", acc[chain], ONES_E4M3, ONES_E4M3);
             else MMA4("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", "r", acc[chain], ONES_INT8, ONES_INT8))
+
+// M4, FP4. Compiled on sm_120a: only the block-scaled k64 forms reach OMMA.SF.16864, the real FP4 unit,
+// and only with an f32 accumulator (an f16 one is refused by ptxas). kind::f8f6f4 keeps e2m1 in bytes and runs
+// as QMMA.16832, the FP8 unit at k32, whether the other side is e2m1 or e4m3.
+#define NVF4 "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3"
+#define MXF4 "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::2X.f32.e2m1.e2m1.f32.ue8m0"
+// m16n8k64, 16384 flop each.
+PEAK_KERNEL(peak_nvf4, float, 4, MMA4_SCALED(NVF4, acc[chain], ONES_E2M1, ONES_E2M1, SCALES_UE4M3))
+PEAK_KERNEL(peak_mxf4, float, 4, MMA4_SCALED(MXF4, acc[chain], ONES_E2M1, ONES_E2M1, SCALES_UE8M0))
+// m16n8k32 again: e2m1 against e4m3 in the FP8 unit, without and with block scales.
+PEAK_KERNEL(peak_e2m1_e4m3_f32, float, 4,
+            MMA4("mma.sync.aligned.m16n8k32.row.col.kind::f8f6f4.f32.e2m1.e4m3.f32", "f", acc[chain], ONES_E2M1_IN_BYTES, ONES_E4M3))
+PEAK_KERNEL(peak_e2m1_e4m3_f16, uint32_t, 2,
+            MMA2("mma.sync.aligned.m16n8k32.row.col.kind::f8f6f4.f16.e2m1.e4m3.f16", acc[chain], ONES_E2M1_IN_BYTES, ONES_E4M3))
+PEAK_KERNEL(peak_mxf8f6f4_e2m1_e4m3, float, 4,
+            MMA4_SCALED("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e2m1.e4m3.f32.ue8m0",
+                        acc[chain], ONES_E2M1_IN_BYTES, ONES_E4M3, SCALES_UE8M0))
+PEAK_KERNEL(peak_mxf8f6f4_e4m3_e4m3, float, 4,
+            MMA4_SCALED("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0",
+                        acc[chain], ONES_E4M3, ONES_E4M3, SCALES_UE8M0))
+// The two half-FP4 kernels the author wants to try, as mixes: one half of a tile's mma in FP4 (k64, so half as
+// many instructions for the same work), the other in 8-bit, equal work on both sides as in a tile. Per round
+// of the chains: 4 k64 and 8 k32 instructions, 131072 flop = CHAINS × 16384, which is what bench/peak.py counts.
+#define PAIR_KERNEL(NAME, EIGHT_BIT_PTX)                                                                   \
+    extern "C" __global__ void NAME(float* out, int iterations) {                                         \
+        float fp4_acc[CHAINS][4] = {};                                                                    \
+        int int_acc[CHAINS][4] = {};                                                                      \
+        for (int i = 0; i < iterations; ++i) {                                                            \
+            _Pragma("unroll") for (int chain = 0; chain < CHAINS; ++chain) {                              \
+                if (chain % 2) {                                                                          \
+                    MMA4(EIGHT_BIT_PTX, "r", int_acc[chain], ONES_INT8, ONES_INT8);                       \
+                    MMA4(EIGHT_BIT_PTX, "r", int_acc[chain - 1], ONES_INT8, ONES_INT8);                   \
+                } else MMA4_SCALED(NVF4, fp4_acc[chain], ONES_E2M1, ONES_E2M1, SCALES_UE4M3);             \
+            }                                                                                             \
+        }                                                                                                 \
+        float sum = 0.0f;                                                                                 \
+        _Pragma("unroll") for (int chain = 0; chain < CHAINS; ++chain)                                   \
+            _Pragma("unroll") for (int r = 0; r < 4; ++r) sum += fp4_acc[chain][r] + float(int_acc[chain][r]); \
+        out[blockIdx.x * blockDim.x + threadIdx.x] = sum;                                                 \
+    }
+PAIR_KERNEL(peak_pair_nvf4_s8s8, "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32")  // FP4 P·V, INT8 Q·Kᵀ
+PAIR_KERNEL(peak_pair_nvf4_u8s8, "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32")  // FP4 Q·Kᵀ, u8 P·V
 
 // Conversions the two P·V variants need, per 32-bit result: int32 -> f32 (flushing the u8 × s8
 // accumulator), f16x2 -> 2 × f32 (flushing the f16 one), and the exponent for scale.
