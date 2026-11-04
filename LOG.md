@@ -1695,6 +1695,40 @@ data.)
 - The blocks with very uneven channels (1, 3, 33) are where SageAttention 2 and 3 and FP4 P·V do worst; unica's
   error stays near 1 % there.
 
+## Baselines — two modes, baseline 1 (2026-11-05)
+
+The author's rule: the baseline is the best result reached so far, and only something better replaces it. A
+candidate runs against the current baseline of its mode in the same run, the baseline staying runnable behind
+flags. A win becomes the next baseline (git tag `baseline-N`); a loss stays here as an experiment.
+
+| mode | rival | a win |
+|---|---|---|
+| **accurate** | SageAttention 2 | +1–3 % speed while keeping the error (1.7 % on random data) |
+| **fast** | SageAttention 3 | SageAttention 3's speed or better, with less error than it |
+
+A difference in speed below ~2 % is a tie (M3.10: the code layout alone moves ±2 %).
+
+**Baseline 1, both modes:** `attention_int8pv_tma` (INT8 Q·Kᵀ, u8 × s8 P·V, TMA tiles, Σ P̂), K64, 4 warps.
+bench/harness.py, whole call, median of 10, two runs per shape in one session, ComfyUI's models unloaded (it kept
+~1.9 GB of context):
+
+| | 32 760 tokens | 34 020 tokens (the real call) | rel L2, random |
+|---|---|---|---|
+| PyTorch SDPA | 518.8 / 523.7 ms | 564.1 / 560.2 ms | 0.23 % |
+| SageAttention 2 | 75.2 / 75.5 ms | 81.6 / 81.0 ms | 3.90 % |
+| SageAttention 3 | 59.2 / 58.5 ms | 61.9 / 61.2 ms | 19.11 % |
+| **UnicaAttention** | **75.1 / 77.2 ms** | **83.3 / 83.3 ms** | **1.73 %** |
+
+Real WAN 2.2, 22 blocks (M4.6), median rel L2: unica 0.90 %, SageAttention 2 1.16 %, SageAttention 3 8.67 %.
+A whole 4-step video (M5.5): SageAttention 2 48.7–49.0 s, unica 48.8–49.5 s, SageAttention 3 45.2–45.7 s.
+
+- At 32 760 unica ties SageAttention 2 (75.1 / 77.2 against 75.2 / 75.5 ms). **At the real 34 020 it is 2–3 %
+  behind** (83.3 against 81.0–81.6 ms), a gap that M5.4 (81.2 ms, another session) did not show. The accurate
+  mode's goal is exactly this gap.
+- The fast mode starts 26–36 % behind SageAttention 3 (75–83 against 58–62 ms), with 11× less error on random
+  data and 9.6× less on real data.
+- From M1 (~770 ms): 10.2× at 32 760.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
