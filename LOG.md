@@ -2308,6 +2308,86 @@ warm-up with `fuse_rope` on not counted; both variants already without the layou
   different trajectory, as with SageAttention 2 / 3 / unica in M5.5. A wrong rotation (axis or frequency) would break
   the motion or the image; neither happens.
 
+## M4.20 — the fast mode's error: Q smoothing (B) and a per-layer map (A), measured before any kernel
+
+**B, Q smoothing.** q = q̄ + (q − q̄): quantize q − q̄, add q̄ · k back. Unlike K's mean, q̄ · k varies along the keys,
+so softmax does not cancel it. SageAttention 3 takes q̄ per block of 128 queries and a precomputed [N/128 × N] matrix
+of corrections (~1.5 GB per call here: our speed margin). One q̄ per head makes the correction one vector per key,
+b_j = q̄ · k_j: a GEMV before the kernel, one addition per score or folded into the K tile. Emulator (`smooth_q`: "head"
+or a block size; q̄ · k in float on the unquantized k), `attention_fp4`'s configuration, 4 × 4096:
+
+| q | FP4 both | + q̄ per head | + q̄ per 64 queries |
+|---|---|---|---|
+| random | 19.63 % | 19.65 % | 19.56 % |
+| + 1σ offset per channel | 23.81 % | **19.37 %** | 19.17 % |
+| + 3σ offset per channel | 24.02 % | **12.15 %** | 12.18 % |
+
+Nothing on random data, by construction; a lot on channel offsets; and per head does as well as per 64 queries.
+
+**A, a per-layer map.** M4.15's oracle mix (FP4 both where its error stays below SageAttention 3's, FP4 P·V elsewhere)
+reached SageAttention 3's speed at 5.4 % against 8.7 % real error. A real policy needs a map fixed in advance, which only
+works if a block's tolerance does not depend on the seed and the prompt.
+
+**Run** (ComfyUI app's agent): the M4.6 setup twice, seed 42 with the usual prompt and seed 7 with another one, both
+`measure_every` 7 (the same 22 (step, block) pairs); new columns `emu_fp4_both_smoothq` (per head), `_smoothq64`,
+`emu_today_smoothq` (the INT8 baseline with q̄ per head), `q_offset` (RMS of Q's channel means over RMS of Q).
+
+**Hypotheses:** real Q carries channel offsets like V's (`q_offset` 0.2–0.4); q̄ per head takes FP4 both's real median
+8.9 → **~7–8 %**, still above FP4 P·V (3.8 %); per 64 queries within 0.3 points of per head. The INT8 baseline barely
+moves (its scale is per 128 tokens over all of d). The block ranking of FP4 both's error holds across the two runs
+(rank correlation > 0.8).
+
+**Result** (`build/wan_attention_errors_m4.20.csv`; A: seed 42, the usual prompt, 22 rows; B: seed 7, "a red fox walking
+through fresh snow…" over the same input image, 23 rows). Medians:
+
+| | A | B |
+|---|---|---|
+| `q_offset` | 0.40 (0.21–0.50) | 0.42 (0.27–0.61) |
+| FP4 both | 8.90 % | 7.15 % |
+| + q̄ per head | 8.36 % (−6 %) | 6.92 % (−3 %) |
+| **+ q̄ per 64 queries** | **6.92 % (−22 %)** | **6.14 % (−14 %)** |
+| SageAttention 3 | 8.67 % | 7.28 % |
+| FP4 both + q̄ per head below SageAttention 3 | 18 of 22 blocks (11 without) | 20 of 23 |
+| baseline (INT8) → + q̄ per head | 0.898 → 0.862 % | 0.844 → 0.820 % |
+| FP4 P·V | 3.81 % | 3.58 % |
+
+- Real Q does carry channel offsets (0.40–0.42, the top of the predicted range), but **they move along the tokens**: one
+  q̄ per head takes only 3–6 % off (predicted ~7–8 % absolute: A's 8.36 % just misses), one per 64 queries 14–22 %. On
+  synthetic data, with one offset for all tokens, the two were equal.
+- With q̄ per 64 queries FP4 both sits 20 % below SageAttention 3's median, the fast mode's rule, but its correction is a
+  [N/64 × N] matrix, ~1.5 GB per call.
+- The baseline gains 3–4 % from q̄ per head for the cost of one vector per key: a free candidate for the accurate mode.
+- **A bug in the measurement:** the node's call count ran on from A into B, so B sampled other blocks (calls ≡ 1 mod 7,
+  not 0) and A's per-layer map cannot be compared block by block. The count is now step · blocks + block + 1 within a
+  run (the step advances when sigma falls, restarts when it rises), and the CSV has `step` and `block`.
+
+**Next run:** q̄ per 128 queries (SageAttention 3's block), 512 and per frame (1620 tokens: WAN's tokens run frame by
+frame, 21 × 30 × 54). If q̄ moves mostly between frames, per frame keeps most of the 64-query gain with a correction of
+21 rows per head (~57 MB per call). A and B again, with the fixed count, for the map.
+
+**M4.20b result** (`build/wan_attention_errors_m4.20b.csv`; A and B on the same 22 (step, block) pairs, the per-run count
+checked; medians, and the blocks below SageAttention 3 out of 22):
+
+| | A | B | below SA3, A / B |
+|---|---|---|---|
+| SageAttention 3 | 8.67 % | 8.89 % | |
+| FP4 both | 8.90 % | 9.08 % | 11 / 10 |
+| + q̄ per head | 8.36 % | 8.49 % | 18 / 20 |
+| **+ q̄ per frame (1620 queries)** | **7.77 %** | **8.09 %** | **22 / 22** |
+| + q̄ per 512 | 7.49 % | 7.85 % | 22 / 22 |
+| + q̄ per 128 (SageAttention 3's block) | 7.05 % | 7.49 % | 22 / 22 |
+| + q̄ per 64 | 6.92 % | 7.31 % | 22 / 22 |
+| FP4 P·V | 3.81 % | 4.03 % | 22 / 22 |
+| baseline (INT8) → + q̄ per head | 0.898 → 0.862 % | 0.915 → 0.874 % | |
+
+- **Per frame keeps about half of the 64-query gain** (−13 / −11 % against −22 / −20 %) and already puts FP4 both below
+  SageAttention 3 **in every block of both scenes**, median −10 / −9 %. Its correction is 21 rows per head.
+- **The per-layer map is stable:** rank correlation between the two scenes 0.98 for FP4 both's error, 0.99 for
+  SageAttention 3's and FP4 P·V's, 0.97 for their ratio (predicted > 0.8: **held**). The set where FP4 both beats
+  SageAttention 3 is 11 and 10 blocks, 9 in both; the blocks that differ sit at a ratio of 0.99–1.01.
+- So the fast mode has two roads: FP4 both with q̄ per frame everywhere (if its correction is cheap in the kernel), or
+  a fixed map mixing FP4 both and FP4 P·V (stable enough to fix in advance).
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

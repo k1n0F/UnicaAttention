@@ -187,6 +187,7 @@ def emulate(
     p_outer=None,
     v_outer=None,
     p_pow2=False,
+    smooth_q=None,
 ):
     """Tiled online-softmax attention, the way the kernel computes it.
 
@@ -216,6 +217,9 @@ def emulate(
               (FP4_SLOT_KEY), so that a block of 16 for a scale is the kernel's 16 keys. Needs bc = 64
     p_outer, v_outer  the outer scale of block_scaled for P and V
     p_pow2    P's block scales as powers of two (block_scaled's pow2)
+    smooth_q  None | "head" | n: subtract the mean of Q over the head's queries ("head") or over each block of n
+              queries before quantizing it, and add q̄ · k back to the scores, exactly (float, unquantized k): it
+              varies along the keys, so softmax does not cancel it. With "head" it is one vector per key (M4.20)
     """
     q, k, v = q.float(), k.float(), v.float()
     if smooth_k:
@@ -225,6 +229,18 @@ def emulate(
         q, k = ((x.unflatten(-1, (-1, rotate_qk)) @ h).flatten(-2) for x in (q, k))
     v_mean = v.mean(-2, keepdim=True) if smooth_v else 0.0
     v = v - v_mean
+    q_mean = None
+    if smooth_q:
+        if smooth_q == "head":
+            q_mean = q.mean(-2, keepdim=True)
+        else:
+            n_q = q.shape[-2]
+            blocks = F.pad(q, (0, 0, 0, -n_q % smooth_q)).unflatten(-2, (-1, smooth_q))
+            sizes = torch.full((blocks.shape[-3],), float(smooth_q), device=q.device)
+            sizes[-1] = n_q - smooth_q * (blocks.shape[-3] - 1)
+            q_mean = (blocks.sum(-2) / sizes[:, None]).repeat_interleave(smooth_q, -2)[..., :n_q, :]
+        q = q - q_mean
+    k_exact = k  # for q̄ · k
     if qk in FP4_BLOCK:  # scales along d, inside the MMA
         q, k = block_scaled(q, qk, -1), block_scaled(k, qk, -1)
         sq = sk = torch.ones_like(q[..., :1])
@@ -235,7 +251,7 @@ def emulate(
         assert bc == 64, "the slot order is that of a 64-key tile"
         n = k.shape[-2]
         order = torch.arange(-(-n // 64) * 64, device=q.device).view(-1, 64)[:, FP4_SLOT_KEY.to(q.device)].flatten()
-        k, sk, v = (F.pad(x, (0, 0, 0, len(order) - n))[..., order, :] for x in (k, sk, v))
+        k, sk, v, k_exact = (F.pad(x, (0, 0, 0, len(order) - n))[..., order, :] for x in (k, sk, v, k_exact))
         key_valid = order < n
     if v_fmt in FP4_BLOCK:  # scales per channel and block of keys, the axis P·V sums over
         v_parts, sv = [block_scaled(v, v_fmt, -2, v_outer)], 1.0
@@ -262,6 +278,8 @@ def emulate(
         # For int8, q̂·k̂ is an integer with |q̂·k̂| ≤ 127²·128 < 2²⁴, so the FP32 GEMM gives exactly the INT32 MMA result
         kt, skt = k[..., j : j + bc, :].transpose(-1, -2), sk[..., j : j + bc, :].transpose(-1, -2)
         s = (q @ kt) * (sq * skt) * scale
+        if q_mean is not None:
+            s = s + (q_mean @ k_exact[..., j : j + bc, :].transpose(-1, -2)) * scale
         if key_valid is not None:
             s = s.masked_fill(~key_valid[j : j + bc], -torch.inf)
         m_new = torch.maximum(m, s.amax(-1, keepdim=True))

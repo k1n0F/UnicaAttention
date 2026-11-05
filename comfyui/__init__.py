@@ -40,21 +40,26 @@ import unica  # noqa: E402
 from emulate import TODAY, emulate, errors, reference  # noqa: E402
 
 MODE = "unica"
-ERRORS_CSV = REPO / "build" / "wan_attention_errors_m4.12.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
+ERRORS_CSV = REPO / "build" / "wan_attention_errors_m4.20b.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
 # attention_fp4pv as the emulator computes it (LOG M4.8, tests/test_fp4.py)
 FP4PV = TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4", p_local=False, p_mul=1024.0, p_outer=1.0, v_outer="channel",
                      fp4_slots=True)
-# Candidates, emulated on the same real Q, K, V (today's kernel is measured itself, as "unica"). M4.12 (H9): which
-# layers tolerate FP4 in Q·Kᵀ on top of FP4 P·V
+# Candidates, emulated on the same real Q, K, V (today's kernel is measured itself, as "unica"). M4.20: Q's mean
+# subtracted before quantization, q̄ · k added back (per head: one vector per key; per 64 queries: SageAttention 3's way),
+# and which layers tolerate FP4 in Q·Kᵀ (the per-layer map of the fast mode)
 EMULATED = {
-    "emu_hadamard": TODAY | dict(rotate_qk=128),
     "emu_fp4pv": FP4PV,
-    "emu_fp4qk": TODAY | dict(qk="nvfp4"),
     "emu_fp4_both": FP4PV | dict(qk="nvfp4"),
+    "emu_fp4_both_smoothq": FP4PV | dict(qk="nvfp4", smooth_q="head"),
+    "emu_fp4_both_smoothq64": FP4PV | dict(qk="nvfp4", smooth_q=64),
+    "emu_fp4_both_smoothq128": FP4PV | dict(qk="nvfp4", smooth_q=128),  # SageAttention 3's block
+    "emu_fp4_both_smoothq512": FP4PV | dict(qk="nvfp4", smooth_q=512),
+    "emu_fp4_both_smoothq_frame": FP4PV | dict(qk="nvfp4", smooth_q=1620),  # one 30 × 54 frame of the 81-frame video
+    "emu_today_smoothq": TODAY | dict(smooth_q="head"),
 }
-CSV_FIELDS = ["time", "node", "call", "batch", "tokens", "keys", "heads_measured", "unica_rel_l2", "unica_cos",
+CSV_FIELDS = ["time", "node", "call", "step", "block", "batch", "tokens", "keys", "heads_measured", "unica_rel_l2", "unica_cos",
               "sage2_rel_l2", "sage2_cos", "sage3_rel_l2", "sage3_cos",
-              *(f"{name}_rel_l2" for name in EMULATED), "q_channel_spread", "k_channel_spread", "v_offset",
+              *(f"{name}_rel_l2" for name in EMULATED), "q_channel_spread", "k_channel_spread", "v_offset", "q_offset",
               "unica_ms", "sage2_ms", "sage3_ms"]
 HEAD_DIM = 128
 log = logging.getLogger("UnicaAttention")
@@ -107,19 +112,41 @@ class Measurement:
 
     def __init__(self, node: str) -> None:
         self.node, self.every, self.heads, self.calls = node, 0, 0, 0
+        self.sigma, self.step, self.block = None, 0, None
 
-    def __call__(self, q, k, v) -> None:
-        """q, k, v in [batch, tokens, heads, 128]."""
-        self.calls += 1
-        if self.every <= 0 or self.calls % self.every:
-            return
+    def due(self, options: dict | None = None) -> bool:
+        """Advances the call count and says whether this call is measured. With ComfyUI's transformer_options the count
+        is step · blocks + block + 1 within one run: the step advances when sigma falls and restarts when it rises (a
+        new run), so every run measures the same (step, block) pairs (M4.20 found the plain count running on across
+        runs). Without them (WanVideoWrapper), a plain count."""
+        block, sigmas = (options or {}).get("block_index"), (options or {}).get("sigmas")
+        if block is None or sigmas is None:
+            self.calls += 1
+            self.step = self.block = None
+        else:
+            sigma = float(sigmas.max())
+            if self.sigma is None or sigma > self.sigma:
+                self.step = 0
+            elif sigma < self.sigma:
+                self.step += 1
+            self.sigma, self.block = sigma, block
+            self.calls = self.step * options.get("total_blocks", 40) + block + 1
+        return self.every > 0 and self.calls % self.every == 0
+
+    def __call__(self, q, k, v, options: dict | None = None) -> None:
+        """q, k, v in [batch, tokens, heads, 128]; options: the call's transformer_options, if any."""
+        if self.due(options):
+            self.measure(q, k, v)
+
+    def measure(self, q, k, v) -> None:
         from sageattention import sageattn
 
         h = min(self.heads, q.shape[2])
         sub = [x[:, :, :h].contiguous() for x in (q, k, v)]
         bhnd = [x.transpose(1, 2).contiguous() for x in sub]
         ref = reference(*bhnd)  # FP32, [batch, heads, tokens, 128]
-        row = {"time": time.strftime("%H:%M:%S"), "node": self.node, "call": self.calls, "batch": q.shape[0],
+        row = {"time": time.strftime("%H:%M:%S"), "node": self.node, "call": self.calls, "step": self.step,
+               "block": self.block, "batch": q.shape[0],
                "tokens": q.shape[1], "keys": k.shape[1], "heads_measured": h}
         mine, row["unica_ms"] = timed(unica_nhd, *sub)
         sage2, row["sage2_ms"] = timed(lambda *x: sageattn(*(t.clone() for t in x), tensor_layout="NHD"), *sub)
@@ -132,7 +159,7 @@ class Measurement:
         for name, config in EMULATED.items():
             row[f"{name}_rel_l2"] = errors(emulate(*bhnd, **config), ref)["rel_l2"]
         row["q_channel_spread"], row["k_channel_spread"] = channel_spread(bhnd[0]), channel_spread(bhnd[1])
-        row["v_offset"] = v_offset(bhnd[2])
+        row["v_offset"], row["q_offset"] = v_offset(bhnd[2]), v_offset(bhnd[0])
         ERRORS_CSV.parent.mkdir(exist_ok=True)
         new = not ERRORS_CSV.exists()
         with ERRORS_CSV.open("a", newline="") as f:
@@ -224,7 +251,7 @@ def native_override(previous):
         # [batch, tokens, heads, 128], WanVideoWrapper's layout, as views
         nhd = [x.transpose(1, 2) if skip_reshape else x.view(x.shape[0], x.shape[1], heads, dim) for x in (q, k, v)]
         out = unica_nhd(*nhd)
-        native_measurement(*nhd)
+        native_measurement(*nhd, options=kwargs.get("transformer_options"))
         return out.transpose(1, 2) if skip_output_reshape else out.view(out.shape[0], out.shape[1], heads * dim)
 
     override.unica = True
@@ -247,11 +274,9 @@ def fused_rope_forward(module, original):
         k = module.norm_k(module.k(x)).view(b, s, n, d)
         v = module.v(x).view(b, s, n, d)
         # the measurement compares on the rotated q and k: rotate them only for a call it will measure
-        if native_measurement.every > 0 and (native_measurement.calls + 1) % native_measurement.every == 0:
+        if native_measurement.due(transformer_options):
             from comfy.ldm.flux.math import apply_rope1
-            native_measurement(apply_rope1(q, freqs), apply_rope1(k, freqs), v)
-        else:
-            native_measurement.calls += 1
+            native_measurement.measure(apply_rope1(q, freqs), apply_rope1(k, freqs), v)
         out = unica.attention(*(t.transpose(1, 2).to(torch.bfloat16) for t in (q, k, v)), rope=freqs)
         return module.o(out.transpose(1, 2).reshape(b, s, n * d).to(x.dtype))
 
