@@ -2052,6 +2052,111 @@ version's cost and can go into the quantize kernels; the kernel is the finding.
 - Next (H9b): a deeper pipeline, copies issued 2–3 tiles ahead. The FP4 tiles are small (K4 5 KB, V4 6 KB), so a third
   and fourth stage cost 11 KB each: 34 or 45 KB per block, still 2 blocks per SM.
 
+## M4.13 — H9b: copies 2–3 tiles ahead (prediction, before measuring)
+
+**Change** (`STAGES`, default 2 = M4.12, `attention_fp4` only): STAGES buffers of K and of V; iteration j reads K(j + 1)
+and V(j), one group of copies on `full[j % STAGES]`; iteration t issues group t + STAGES − 1. Why no buffer is
+overwritten early is in the kernel's comment: the slots a group writes and the barrier it uses were last read in
+iteration t − 1, before the barrier at the top of iteration t. Output bit for bit the same at 2, 3 and 4 stages on
+7 shapes (1 to 64 tiles, cross-attention, a single token). Compiled: 2 stages 227 registers, 22.6 KB; 3 stages 237,
+33.8 KB; 4 stages 237, 45.1 KB; no spills, 2 blocks per SM in all.
+
+**Hypotheses:**
+
+| | 3 stages | 4 stages |
+|---|---|---|
+| trace: P packed → next tile's start | 1883 → **~1250** (the wait gone, P·V and the barrier as in fp4pv) | the same |
+| long-scoreboard stalls | 383 K → ~100 K | the same |
+| kernel, 40 × 32 760 | 62.5 → **47–50 ms (−20 … −25 %)** | within 2 % of 3 stages: one iteration ahead more buys nothing once the latency is covered |
+| whole call against SageAttention 3 | kernel faster than SageAttention 3's whole call; the whole call still carries 10 ms of torch quantization | |
+
+**Result: 0, wrong.** compare.py, 5 rounds, kernel alone: 2 stages 62.6 ms, 3 stages 62.5, 4 stages 62.5. ncu: active
+cycles 15.02 M → 15.04 M, long-scoreboard stalls 373 K → 369 K. The data was not late for want of a head start.
+
+**Where the warps wait** (ncu SourceCounters, 622 K stall samples, 2 stages): **~37 % on the mbarrier wait loop**
+(`SYNCS.PHASECHK.TRANS64.TRYWAIT` and its back branch, both barriers), OMMA 19 %, MUFU 7.5 %, FMNMX 5.7 %. So the
+tiles do arrive late, and a deeper pipeline does not help: the copies are slow, not early enough.
+
+| (ncu, 4 heads) | `attention_int8pv_tma` | `attention_fp4pv` | `attention_fp4` |
+|---|---|---|---|
+| TMA box rows: K / V | 64 × 128 B / 32 × 256 B | 64 × 128 B / **128 × 48 B** | **64 × 80 B / 128 × 48 B** |
+| bytes from L2 | 20.4 GB | | 15.0 GB |
+| long-scoreboard stalls (per warp, K) | **22** | 124 | **373** |
+
+The FP4 kernel moves a quarter less data and waits 17 times longer for it, and the waits grow with the short rows.
+A 2D box of many short rows (48 and 80 bytes, not on 32-byte sector boundaries) is a slow way to copy a tile.
+
+## M4.14 — H9c: each tile as one contiguous block (prediction, before measuring)
+
+**Change** (`BULK_COPY`, `attention_fp4`): a K4 tile (64 × 80 = 5120 bytes) and a V4 tile (128 × 48 = 6144 bytes) each lie in
+one piece in global memory, once K4 is padded to whole tiles per head (zeros), as V4 already is. `cp.async.bulk`
+(1D, the same mbarrier accounting) copies them with no box at all; the layout in shared memory is the same. Output
+bit for bit the same with and without, at 2 and 3 stages, on 6 shapes.
+
+**Hypotheses:** long-scoreboard stalls down to the baseline's order (~20–120 K); tensor pipe 44 → ~65 %; kernel 62.5 →
+**45–50 ms** (−20 … −28 %); and the same change on `attention_fp4pv`'s V4 later, a few percent.
+
+**Result: held.**
+
+| | 2D box | 1D bulk | 1D bulk, 3 stages | predicted |
+|---|---|---|---|---|
+| kernel, compare.py (5 rounds, one run) | 64.8 ms | **45.9 ms (−29 %)** | 47.6 ms | 45–50 ms: **held** |
+| whole call (with 10.6 ms of torch quantization) | 76.2 ms | 56.5 ms | 58.6 ms | |
+| active cycles (ncu, 4 heads) | 15.10 M | **10.84 M (−28 %)** | | |
+| long-scoreboard stalls (per warp, K) | 378 | **31** | | ~20–120: **held** |
+| tensor pipe | 43.7 % | **60.9 %** | | ~65 %: close |
+| bytes from L2 | 15.2 GB | **12.1 GB** (11.8 expected: no more partial sectors) | | |
+| executed instructions | 1.437 G | 1.292 G (fewer rounds of the wait loop) | | |
+| barrier stalls | 21 K | 102 K | | |
+| sustained, 6 s of calls (clock_probe) | | **47.5 ms at 2715 MHz, 360 W** (`attention_fp4pv` 65.4 ms at 2640) | | |
+
+- **The tiles were slow to copy, not late to start.** A 2D TMA box of 64 rows of 80 bytes and 128 of 48, none on a
+  32-byte sector boundary, read 1.27× the bytes and kept the warps on the mbarrier. One contiguous `cp.async.bulk` per
+  tile reads exactly the tile.
+- A third stage adds nothing (47.6 against 45.9 ms, within the spread): two are enough once the copy is fast.
+- **The kernel alone (45.9 ms) is now faster than SageAttention 3's whole call (58–60 ms).** The whole call still
+  carries 10.6 ms of quantization in torch, the next thing to go. Error: SageAttention 3's class (M4.12 real data).
+- The waits moved to the per-tile barrier (21 → 102 K): with the copies fast, the warps of a block now wait for each
+  other.
+
+## M4.15 — the same copy for `attention_fp4pv`, and the FP4 quantization without the float copy (prediction)
+
+- `attention_fp4pv` takes V4 tiles by `cp.async.bulk` too (`BULK_COPY`; its K stays an int8 box of 128-byte rows).
+  Output bit for bit the same. **Prediction:** long-scoreboard stalls 124 → ~30 K, kernel **−5 … −10 %** (64 → 58–61 ms).
+- `quantize_fp4_rows`: the head's max |x − mean| from each channel's min and max (`torch.aminmax`, one pass), instead of
+  a float copy of K − mean and a max over it: max |x − mean| = max over channels of max(max_c − mean_c, mean_c −
+  min_c), the extreme elements going through the same float subtraction, so the scale is the same bit for bit (the
+  quantizer test passes unchanged). **Prediction:** `attention_fp4`'s quantization 10.6 → **~3.3 ms** (Q: aminmax +
+  quantize; K: mean + aminmax + quantize; V: aminmax + quantize; ~2.6 GB at 810 GB/s), whole call ~46 + 3.3 ≈ **49 ms,
+  15–18 % below SageAttention 3**.
+
+**Result** (compare.py, 5 rounds, one run):
+
+| | whole call | quantization | kernel | predicted |
+|---|---|---|---|---|
+| baseline 1 | 77.8 ms | 2.90 ms | 74.9 ms | |
+| `attention_fp4pv`, 2D box | 70.5 ms | 2.98 ms | 67.8 ms | |
+| `attention_fp4pv`, bulk V | 66.2 ms | 2.96 ms | **62.8 ms (−7.4 %)** | −5 … −10 %: **held** |
+| `attention_fp4`, bulk K and V | **50.7 ms** | **3.82 ms** (was 10.6) | 47.2 ms | ~3.3 ms quantization: close |
+
+**Against SageAttention 3, whole call** (one process, 6 rounds taking turns, order flipped; the card ran fast this
+time, all kernels with it):
+
+| | 32 760 | vs SA3 | 34 020 | vs SA3 |
+|---|---|---|---|---|
+| SageAttention 2 | 69.5 ms | +29.4 % | 78.8 ms | +33.0 % |
+| **SageAttention 3** | **53.7 ms** | | **59.2 ms** | |
+| baseline 1 | 72.7 ms | +35.6 % | 80.9 ms | +36.6 % |
+| `attention_fp4pv` (bulk) | 61.0 ms | +13.7 % | 68.2 ms | +15.2 % |
+| **`attention_fp4` (bulk)** | **46.5 ms** | **−13.3 %** | **53.6 ms** | **−9.6 %** |
+
+Predicted −15 … −18 %: the direction held, the size a little short. **`attention_fp4` is faster than SageAttention 3**
+at its error class (random 19.2 against 19.1 %, real WAN median 8.90 against 8.67 %). From M1 (~770 ms): 16.6×.
+`BULK_COPY=1` is now the default in both FP4 kernels (the 2D box stays behind `BULK_COPY=0`).
+
+By the fast mode's rule this is not yet a win: the speed is there, the lower error is not. Two ways from here: lower
+`attention_fp4`'s error at its speed, or mix it per layer with `attention_fp4pv` (3.8 % real, +14 % time).
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

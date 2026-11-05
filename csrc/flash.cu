@@ -1757,12 +1757,24 @@ __device__ __forceinline__ void pv_fp4(float out[D_BLOCKS][4], float row_sum_acc
     mma_nvf4_16864(row_sum_acc, p, ones, scale_p, UE4M3_ONES);
 }
 
+// M4.14 (H9c): V4 tiles (and attention_fp4's K4 tiles) copied as one contiguous block each (cp.async.bulk, 1D) instead of a 2D TMA box of
+// 64 rows of 80 bytes and 128 rows of 48: both tiles lie in one piece in global memory, K4 padded to whole tiles
+#ifndef UNICA_BULK_COPY
+#define UNICA_BULK_COPY 1
+#endif
+
+// `bytes` (a multiple of 16) from global memory into shared memory (both 16-byte aligned), counted on `barrier`
+__device__ __forceinline__ void bulk_load(void* dst, const void* src, int bytes, uint64_t* barrier) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 ::"r"(smem_address(dst)), "l"(src), "r"(bytes), "r"(smem_address(barrier)) : "memory");
+}
+
 // M4.8: attention_int8pv_tma with P·V in NVFP4. Q·Kᵀ, its pipelining and the K tiles are unchanged. v_map: V4
 // (quantize_v4) as rows of V4_ROW_BYTES, box V4_ROW_BYTES × HEAD_DIM: one tile. v_outer: the float scale per
 // channel, applied in store_out. Arguments, grid and block as attention_int8pv_tma.
 extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
     attention_fp4pv(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
-                    const int8_t* Q8, const float* q_scale, const float* k_scale, const float* v_outer,
+                    const uint8_t* V4, const int8_t* Q8, const float* q_scale, const float* k_scale, const float* v_outer,
                     __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2) {
     __shared__ __align__(128) int8_t k_tiles[2][K_TILE_BYTES];
     __shared__ __align__(128) uint8_t v_tiles[2][V4_TILE_BYTES];
@@ -1791,7 +1803,10 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         tma_load_2d(k_tiles[buffer], k_map, 0, k_row0 + tile * KEYS_PER_TILE, barrier);
     };
     auto load_v = [&](int buffer, int tile, uint64_t* barrier) {
-        tma_load_2d(v_tiles[buffer], v_map, 0, v_row0 + tile * HEAD_DIM, barrier);
+        if (UNICA_BULK_COPY)
+            bulk_load(v_tiles[buffer], V4 + (size_t(blockIdx.y) * n_tiles + tile) * V4_TILE_BYTES, V4_TILE_BYTES, barrier);
+        else
+            tma_load_2d(v_tiles[buffer], v_map, 0, v_row0 + tile * HEAD_DIM, barrier);
     };
 
     if (threadIdx.x == 0) {
@@ -1875,10 +1890,11 @@ constexpr int K4_TILE_BYTES = KEYS_PER_TILE * FP4_ROW_BYTES;
 // Q or K for attention_fp4: x − mean (K: softmax cancels the mean) ≈ e2m1 · (e4m3 scale per 16 channels) · outer[head],
 // outer = max |x − mean| over the head / (6 · 448). One thread per (token, block of 16 channels). Bit for bit
 // bench/emulate.py's block_scaled(x − mean, "nvfp4", -1) (tests/test_fp4.py). mean: float [heads][HEAD_DIM] or null.
+// X4 has padded_tokens ≥ n_tokens rows per head; the rows past n_tokens are not written.
 // Grid: ceil(heads · n_tokens · 8 / QUANTIZE_THREADS).
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     quantize_fp4_rows(const __nv_bfloat16* X, const float* mean, const float* outer, uint8_t* X4, int n_tokens,
-                      int n_threads) {
+                      int padded_tokens, int n_threads) {
     const int index = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
     if (index >= n_threads) return;
     const int block = index % D_BLOCKS_FP4;
@@ -1901,7 +1917,7 @@ extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     const float scale = from_e4m3(scale_byte) * outer[head];
 #pragma unroll
     for (int i = 0; i < FP4_SCALE_BLOCK; ++i) values[i] = scale > 0.0f ? values[i] / scale : 0.0f;
-    uint8_t* out = X4 + row * FP4_ROW_BYTES;
+    uint8_t* out = X4 + (size_t(head) * padded_tokens + row % n_tokens) * FP4_ROW_BYTES;  // rows of each head padded
     *reinterpret_cast<uint2*>(out + block * 8) = make_uint2(pack_e2m1x8(values), pack_e2m1x8(values + 8));
     out[FP4_SCALES_AT + block] = uint8_t(scale_byte);
 }
@@ -1926,16 +1942,31 @@ __device__ __forceinline__ void qk_scores_fp4(float scores[KEY_BLOCKS][4], const
     }
 }
 
+// M4.13 (H9b): how many tiles of K and of V attention_fp4 keeps in shared memory. Copies are issued STAGES − 1
+// iterations ahead: with 2 (M4.12) a tile's data had one iteration, ~1 µs, to arrive, which a short FP4 tile outruns.
+#ifndef UNICA_STAGES
+#define UNICA_STAGES 2
+#endif
+constexpr int STAGES = UNICA_STAGES;
+constexpr int AHEAD = STAGES - 1;
+
 // M4.12: attention_fp4pv with Q·Kᵀ in NVFP4. k_map: K4 (quantize_fp4_rows on K − mean) as rows of FP4_ROW_BYTES, box
 // FP4_ROW_BYTES × KEYS_PER_TILE. Q4 as rows of FP4_ROW_BYTES, read once into registers. qk_outer[head]: the product of
 // Q's and K's float scales, folded into scale_log2. v_map and v_outer as attention_fp4pv.
+//
+// Copies (M4.13): iteration j reads K(j + 1) (the Q·Kᵀ of the next tile) and V(j), group j of the copies, which lands
+// on full[j % STAGES]. K(j + 1) goes to slot (j + 1) % STAGES and V(j) to slot j % STAGES. Iteration t issues group
+// t + AHEAD: its K slot is t % STAGES, which held K(t), read by iteration t − 1; its V slot is (t − 1) % STAGES, which
+// held V(t − 1), read by iteration t − 1; its barrier was last waited on in iteration t − 1. All of that is behind the
+// __syncthreads at the top of iteration t. K(0), for the Q·Kᵀ before the loop, lands on first_k.
 extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
     attention_fp4(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
-                  const uint8_t* Q4, const float* qk_outer, const float* v_outer, __nv_bfloat16* O, int n_queries,
+                  const uint8_t* K4, const uint8_t* V4, const uint8_t* Q4, const float* qk_outer, const float* v_outer, __nv_bfloat16* O, int n_queries,
                   int n_keys, float scale_log2) {
-    __shared__ __align__(128) uint8_t k_tiles[2][K4_TILE_BYTES];
-    __shared__ __align__(128) uint8_t v_tiles[2][V4_TILE_BYTES];
-    __shared__ __align__(8) uint64_t landed[3];
+    __shared__ __align__(128) uint8_t k_tiles[STAGES][K4_TILE_BYTES];
+    __shared__ __align__(128) uint8_t v_tiles[STAGES][V4_TILE_BYTES];
+    __shared__ __align__(8) uint64_t full[STAGES];
+    __shared__ __align__(8) uint64_t first_k;
 
     const int warp = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -1970,58 +2001,69 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         }
     }
 
-    const int k_row0 = blockIdx.y * n_keys;
+    // K4 is padded to whole tiles per head (its padding rows are zeros), like V4
+    const int k_row0 = blockIdx.y * n_tiles * KEYS_PER_TILE;
     const int v_row0 = blockIdx.y * n_tiles * HEAD_DIM;
     auto load_k = [&](int buffer, int tile, uint64_t* barrier) {
-        tma_load_2d(k_tiles[buffer], k_map, 0, k_row0 + tile * KEYS_PER_TILE, barrier);
+        if (UNICA_BULK_COPY)
+            bulk_load(k_tiles[buffer], K4 + (size_t(blockIdx.y) * n_tiles + tile) * K4_TILE_BYTES, K4_TILE_BYTES, barrier);
+        else
+            tma_load_2d(k_tiles[buffer], k_map, 0, k_row0 + tile * KEYS_PER_TILE, barrier);
     };
     auto load_v = [&](int buffer, int tile, uint64_t* barrier) {
-        tma_load_2d(v_tiles[buffer], v_map, 0, v_row0 + tile * HEAD_DIM, barrier);
+        if (UNICA_BULK_COPY)
+            bulk_load(v_tiles[buffer], V4 + (size_t(blockIdx.y) * n_tiles + tile) * V4_TILE_BYTES, V4_TILE_BYTES, barrier);
+        else
+            tma_load_2d(v_tiles[buffer], v_map, 0, v_row0 + tile * HEAD_DIM, barrier);
     };
 
+    // group j: K(j + 1), if there is one, and V(j); thread 0 only
+    auto issue_group = [&](int j) {
+        mbarrier_expect_bytes(&full[j % STAGES], (j + 1 < n_tiles ? K4_TILE_BYTES : 0) + V4_TILE_BYTES);
+        if (j + 1 < n_tiles) load_k((j + 1) % STAGES, j + 1, &full[j % STAGES]);
+        load_v(j % STAGES, j, &full[j % STAGES]);
+    };
     if (threadIdx.x == 0) {
-        for (int i = 0; i < 3; ++i) mbarrier_init(&landed[i], 1);
+        for (int i = 0; i < STAGES; ++i) mbarrier_init(&full[i], 1);
+        mbarrier_init(&first_k, 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        mbarrier_expect_bytes(&landed[2], (n_tiles > 1 ? 2 : 1) * K4_TILE_BYTES + V4_TILE_BYTES);
-        load_k(0, 0, &landed[2]);
-        load_v(0, 0, &landed[2]);
-        if (n_tiles > 1) load_k(1, 1, &landed[2]);
+        mbarrier_expect_bytes(&first_k, K4_TILE_BYTES);
+        load_k(0, 0, &first_k);
+        for (int j = 0; j < AHEAD && j < n_tiles; ++j) issue_group(j);
     }
 
     float row_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
     float row_sum_acc[4] = {};
     float out[D_BLOCKS][4] = {};
 
-    mbarrier_wait(&landed[2], 0);
+    mbarrier_wait(&first_k, 0);
     float scores[2][KEY_BLOCKS][4];
     qk_scores_fp4(scores[0], q, q_scale, k_tiles[0], lane);
     if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
     [[maybe_unused]] const int slot = TRACE_SLOT(lane);
 
     auto iteration = [&](int t, auto parity) {
-        constexpr int now = decltype(parity)::value, later = 1 - now;
+        constexpr int now = decltype(parity)::value, later = 1 - now;  // the scores, still in two sets
         const int key0 = t * KEYS_PER_TILE;
-        if (t > 0) mbarrier_wait(&landed[later], (t - 1) / 2 % 2);
-        __syncthreads();
-        if (threadIdx.x == 0 && t + 1 < n_tiles) {
+        mbarrier_wait(&full[t % STAGES], t / STAGES % 2);  // K(t + 1) and V(t)
+        __syncthreads();  // every warp is done with iteration t − 1, whose buffers group t + AHEAD reuses
+        if (threadIdx.x == 0 && t + AHEAD < n_tiles) {
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            mbarrier_expect_bytes(&landed[now], (t + 2 < n_tiles ? K4_TILE_BYTES : 0) + V4_TILE_BYTES);
-            if (t + 2 < n_tiles) load_k(now, t + 2, &landed[now]);
-            load_v(later, t + 1, &landed[now]);
+            issue_group(t + AHEAD);
         }
 
         float alpha[2];
         uint32_t p[4], scale_p;
         TRACE_MARK(slot, lane, t, 0);
-        qk_scores_fp4(scores[later], q, q_scale, k_tiles[later], lane);  // stale in the last iteration
+        qk_scores_fp4(scores[later], q, q_scale, k_tiles[(t + 1) % STAGES], lane);  // stale in the last iteration
         online_softmax_fp4(scores[now], row_max, alpha, p, scale_p, score_scale, lane);
         TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
         TRACE_MARK_AFTER(slot, lane, t, 2, scale_p);
         TRACE_MARK_AFTER(slot, lane, t, 3, p[0] ^ p[1] ^ p[2] ^ p[3]);
-        pv_fp4(out, row_sum_acc, p, scale_p, v_tiles[now], alpha, lane);
+        pv_fp4(out, row_sum_acc, p, scale_p, v_tiles[t % STAGES], alpha, lane);
 
         const int next_valid = n_keys - key0 - KEYS_PER_TILE;
         if (next_valid < KEYS_PER_TILE) mask_scores(scores[later], col, next_valid);

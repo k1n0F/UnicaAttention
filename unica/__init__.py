@@ -37,7 +37,7 @@ DEFAULT_KERNEL = "attention_int8pv_tma"
 # before rounding (M3.15); V_PAIRS=0 V8 in P's order but unpaired for attention_int8pv_tma (M3.17); TRACE=1
 # records a timeline (bench/timeline.py).
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
-        "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0}
+        "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0, "STAGES": 2, "BULK_COPY": 1}
 
 
 def attention(
@@ -94,11 +94,11 @@ def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str
     if kernel == "attention_fp4":  # M4.12: Q and K in NVFP4 too
         keys = (TILE | tile)["KEYS_PER_TILE"]
         q4, q_outer = quantize_fp4_rows(q, None)
-        k4, k_outer = quantize_fp4_rows(k, k.mean(-2, dtype=torch.float32))  # softmax cancels the mean
+        k4, k_outer = quantize_fp4_rows(k, k.mean(-2, dtype=torch.float32), keys)  # softmax cancels the mean
         v4, v_outer = quantize_v4(v)
         k_map = tensor_map_2d(k4, UINT8, FP4_ROW_BYTES, k4.numel() // FP4_ROW_BYTES, FP4_ROW_BYTES, FP4_ROW_BYTES, keys)
         v_map = tensor_map_2d(v4, UINT8, V4_ROW_BYTES, v4.numel() // V4_ROW_BYTES, V4_ROW_BYTES, V4_ROW_BYTES, HEAD_DIM)
-        return k_map, v_map, q4, (q_outer * k_outer).contiguous(), v_outer
+        return k_map, v_map, k4, v4, q4, (q_outer * k_outer).contiguous(), v_outer
     q8, q_scale = quantize_int8(q, None, Q_SCALE_BLOCK)
     k8, k_scale = quantize_int8(k, k.mean(-2, dtype=torch.float32), K_SCALE_BLOCK)  # softmax cancels the mean
     if kernel == "attention_int8qk":
@@ -108,7 +108,7 @@ def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str
         v4, v_outer = quantize_v4(v)
         k_map = tensor_map_2d(k8, UINT8, HEAD_DIM, k8.numel() // HEAD_DIM, HEAD_DIM, HEAD_DIM + 16, keys)
         v_map = tensor_map_2d(v4, UINT8, V4_ROW_BYTES, v4.numel() // V4_ROW_BYTES, V4_ROW_BYTES, V4_ROW_BYTES, HEAD_DIM)
-        return k_map, v_map, q8, q_scale, k_scale, v_outer
+        return k_map, v_map, v4, q8, q_scale, k_scale, v_outer
     if kernel != "attention_int8pv_tma":
         return q8, k8, q_scale, k_scale, *quantize_v(v)
     # TMA boxes 16 bytes wider than the rows: the tiles land padded, as the kernel's ldmatrix expects
@@ -188,19 +188,27 @@ def quantize_v4(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 FP4_ROW_BYTES = 80  # must match csrc/flash.cu
 
 
-def quantize_fp4_rows(x: torch.Tensor, mean: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp4_rows(x: torch.Tensor, mean: torch.Tensor | None, pad_to: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
     """Q or K for attention_fp4 (M4.12): x − mean in NVFP4 along d, e2m1 with an e4m3 scale per 16 channels, under one
     float scale per head, max |x − mean| / (6 · 448). Returns uint8 [batch, heads, N, 80] (csrc/flash.cu K4: 64 bytes of
     e2m1 in channel order, then the 8 scales) and float32 [batch, heads]. Bit for bit bench/emulate.py's
-    block_scaled(x − mean, "nvfp4", -1)."""
+    block_scaled(x − mean, "nvfp4", -1). pad_to: rows per head rounded up to a multiple of it, the extra rows zeros
+    (K for attention_fp4: whole tiles, so that a tile is one contiguous block)."""
     x = x.contiguous()
     batch, heads, n, dim = x.shape
-    centred = x.float() - mean[..., None, :] if mean is not None else x
-    amax = centred.abs().amax((-2, -1)).float()  # one more pass over x; the kernel could fold it in later
+    # max |x − mean| over the head from each channel's min and max (one pass, no float copy of x): the extreme
+    # elements go through the same float subtraction as in the emulator, so the max is the same bit for bit
+    low, high = torch.aminmax(x, dim=-2)
+    low, high = low.float(), high.float()
+    if mean is not None:
+        low, high = low - mean, high - mean
+    amax = torch.maximum(high.abs(), low.abs()).amax(-1)
     outer = (amax / (E2M1_MAX * E4M3_MAX)).clamp_min(1e-30)
-    x4 = torch.empty(batch, heads, n, FP4_ROW_BYTES, dtype=torch.uint8, device=x.device)
+    tokens = math.ceil(n / pad_to) * pad_to
+    x4 = torch.empty(batch, heads, tokens, FP4_ROW_BYTES, dtype=torch.uint8, device=x.device)
+    x4[:, :, n:] = 0
     n_threads = batch * heads * n * (dim // 16)
     mean_arg = mean.contiguous() if mean is not None else ctypes.c_void_p(0)
     module("flash")["quantize_fp4_rows"](math.ceil(n_threads / QUANTIZE_THREADS), QUANTIZE_THREADS, x, mean_arg, outer,
-                                         x4, n, n_threads)
+                                         x4, n, tokens, n_threads)
     return x4, outer
