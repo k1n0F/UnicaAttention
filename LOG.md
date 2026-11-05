@@ -1895,6 +1895,163 @@ instructions +1.7 % (the integer encoding of the scale byte). Wall time, same ru
 68.6 / 69.8 ms, within the spread. The chain was not the limit: it runs under the next tile's Q·Kᵀ. 3.4 points of
 error for nothing; **not kept**, the kernel is back to e4m3 scales (the emulator keeps `p_pow2`).
 
+## M4.10 — the chain to the first P·V mma, measured
+
+**The question:** instruction counts say nothing about the chain. Removing work that runs in parallel with other work
+saves nothing (H7a). How long is the way from a tile's start to the first moment its P·V mma can issue, and what
+is on it?
+
+**Probe:** `trace_mark_after` (csrc/flash.cu, `UNICA_TRACE=1`) reads `clock64` with a value as its input, so the read
+waits until the value exists, wherever ptxas put the instructions that make it. Four points per tile in both TMA
+kernels: tile start (after the barrier), the row max known (alpha), P's scale known (beta / the scale register),
+P packed (the A fragment: the first P·V mma could issue). SM 0, 1 × 32 760, 24 warps, tiles 2 … n − 2, medians:
+
+| cycles per tile | `attention_int8pv_tma` | `attention_fp4pv` |
+|---|---|---|
+| whole tile, start to next start | 2808 | 2512 |
+| start → row max known | **1397** | **1157** |
+| row max → P's scale known | 13 | 25 |
+| row max → P packed | 60 | **33** |
+| P packed → next tile's start (P·V, barrier) | 1367 | 1280 |
+
+No mark out of order in any tile.
+
+- **The softmax itself is short:** from the max to a packed P, 33 cycles in the FP4 kernel, the scale chain (EX2 →
+  e4m3 → back → LG2) 25 of them. That is why H7a gained nothing.
+- **The row max is known only after ~1150–1400 cycles**, though the scores of tile t exist when the iteration starts.
+  SASS shows why: ptxas spreads the max, its shuffles, the scales and the exponents between the 32 IMMA of
+  Q·Kᵀ(t + 1), and a warp issues in order. With two warps sharing the tensor pipe an IMMA occupies a warp ~32
+  cycles, so whatever sits between them advances at the IMMA's pace: 32 × ~36 ≈ 1150. After the last IMMA come 17
+  MUFU in one run (the rest of P's exponents) and the e2m1 conversions, with no tensor work for this warp.
+- So the chain of a tile is the warp's **own stream of tensor instructions**, plus the stretches between them that
+  have no mma: the MUFU and F2FP after Q·Kᵀ(t + 1), and in P·V the barrier. The levers this points to: fewer tensor
+  instructions per warp (Q·Kᵀ is 32 of the 49 per tile), and moving the work after the last IMMA (17 MUFU, 16 F2FP)
+  under the IMMA stream or onto an idle pipe (the FMA pipe is 6.5 % busy).
+- k = 64 has a structural cost: one OMMA reads all 64 keys of P, so P·V cannot start before every exponent of the
+  tile is done. The u8 path could start its first k32 step after half of them.
+
+## M4.11 — H11: part of P's exponents on the FMA pipe (prediction, then result)
+
+**What it attacks:** the run of 17 MUFU after the last IMMA of Q·Kᵀ(t + 1) (M4.10), the work a warp does there with
+no mma, on the SFU's pipe (xu = exactly the 42 MUFU per tile; F2FP runs on the ALU pipe, measured). FlashAttention 4
+computes part of its exponents with a polynomial for the same reason.
+
+**Change** (flag `POLY_EXP` = how many of P's 4 A registers, 8 exponents each, use it): `exp2_poly`, x = n + f with n
+rounded into the mantissa by adding 1.5 · 2²³, 2^f from a degree-3 near-minimax polynomial on [−0.5, 0.5] (relative
+error 7.5e-5), n added to the exponent field as an integer, x clamped at −125. 8 FMA/ALU instructions for one MUFU.
+
+**Hypotheses:** 8 exponents: −1.5 … −2.5 % (the polynomial fills the issue slots a warp leaves between MUFU that wait
+for the SFU); 16: −1 … +2 %. Error: unchanged against FP32, < 0.1 % from the emulator.
+
+**Result** (compare.py, 5 rounds, kernel alone; ncu, 4 heads):
+
+| exponents on the polynomial | 0 | 8 | 16 | 32 |
+|---|---|---|---|---|
+| kernel | 64.3 ms | 65.0 ms (+1 %) | 67.1 ms (+4 %) | 73.4 ms (+14 %) |
+| active cycles | 14.51 M | 14.76 M (+1.7 %) | 15.10 M (+4.1 %) | |
+| executed per warp and tile | 368.7 | 418.1 | 472.9 | |
+| xu / FMA pipe | 28.9 / 6.5 % | 23.0 / 11.2 % | 17.2 / 15.8 % | |
+| tensor pipe | 67.5 % | 66.4 % | 64.9 % | |
+| rel L2 vs FP32 (4 × 4096) / vs the emulator | 13.736 % / 0.04 % | 13.736 % / 0.18 % | 13.736 % / 0.25 % | 13.736 % / 0.35 % |
+
+- **Wrong, in the wrong direction.** The SFU's pipe emptied as planned (29 → 17 %), and each added instruction cost
+  ~0.4 cycles while the removed MUFU saved nothing. The run of MUFU is not on the critical path either. Not kept.
+- What the numbers do say: per scheduler a warp's tile takes 1162 cycles, of which its 49 tensor instructions take
+  794 (16.2 each, the peak spacing): **68 %**, as ncu reads. The other 368 cycles per tile no tensor instruction of
+  either warp on the scheduler issues: both warps are between mma at the same time. Neither the softmax chain (M4.9,
+  M4.10) nor the SFU (M4.11) is what holds them there.
+- The lever left on this kernel's own terms is the number of tensor instructions per warp: Q·Kᵀ is 32 of the 49.
+  That is H9.
+
+## M4.12 — H9, step 1: Q·Kᵀ in NVFP4 too, `attention_fp4` (prediction, before measuring)
+
+**Design.** Q and K in NVFP4 along d (e2m1, an e4m3 scale per 16 channels, one float scale per head; K minus its mean
+as before). m16n8k64 sums over d: a tile takes 2 k-steps × 8 blocks of keys = **16 OMMA instead of 32 IMMA**. K4 / Q4
+rows of 80 bytes: 64 bytes of e2m1 in channel order, then the 8 scales; one `ldmatrix.x4` gives a block's B registers
+of both k-steps and one LDS.64 its two scale registers. Q stays in registers (8 + 2). The scores come out in the same
+m16n8 layout, so softmax and P·V are `attention_fp4pv`'s. The two float scales per head fold into scale_log2.
+`quantize_fp4_rows` is the emulator bit for bit; the kernel is the emulator (`attention_fp4pv`'s configuration with
+`qk="nvfp4"`) within 0.05 % on the 6 shapes, cross-attention included. Compiled: 227 registers, no spills,
+**22.5 KB** shared memory (fp4pv 40.0, baseline 46.1). Per-head max of K − mean still costs an extra pass in torch.
+
+**Hypotheses** (against `attention_fp4pv`):
+
+| | predicted |
+|---|---|
+| tensor instructions per warp and tile | 49 → 33 (−33 %) |
+| active cycles | **−22 … −33 %**: M4.11 split a warp's tile per scheduler into 794 cycles of tensor work and 368 without. −22 % if those 368 stay, −33 % if they shrink with the work |
+| kernel, 40 × 32 760 | 64 → **43–50 ms** |
+| whole call against SageAttention 3 (60.6 ms) | **10–22 % faster** |
+| error | the emulator: 19.6 % on random data (SageAttention 3 19.1 %); real WAN from the M4.12 run |
+
+**Real WAN, the M4.6 setup again** (`build/wan_attention_errors_m4.12.csv`, 22 blocks; `emu_fp4pv` now the kernel's
+exact configuration, so it reads 3.81 % where M4.6's variant b read 3.67 %):
+
+| step, block | unica | SA2 | SA3 | FP4 P·V | FP4 Q·Kᵀ alone | **FP4 both** | both / SA3 |
+|---|---|---|---|---|---|---|---|
+| 0, 6 | 0.662 | 0.708 | 5.50 | 2.54 | 5.15 | 5.60 | 1.02 |
+| 0, 13 | 1.111 | 1.062 | 8.70 | 3.76 | 8.48 | 9.19 | 1.06 |
+| 0, 20 | 1.151 | 1.569 | 9.36 | 5.74 | 7.76 | 9.32 | 1.00 |
+| 0, 27 | 0.843 | 0.873 | 7.46 | 3.83 | 6.10 | 6.93 | 0.93 |
+| 0, 34 | 0.764 | 1.001 | 7.12 | 3.58 | 5.84 | 6.67 | 0.94 |
+| 1, 1 | 1.108 | 2.326 | 11.95 | 8.27 | 9.16 | 12.02 | 1.01 |
+| 1, 8 | 0.920 | 1.584 | 8.63 | 5.07 | 7.07 | 8.61 | 1.00 |
+| 1, 15 | 1.076 | 1.501 | 9.19 | 4.53 | 8.41 | 9.52 | 1.04 |
+| 1, 22 | 1.231 | 1.736 | 10.36 | 5.35 | 9.34 | 10.71 | 1.03 |
+| 1, 29 | 0.583 | 0.781 | 5.70 | 2.56 | 4.76 | 5.37 | 0.94 |
+| 1, 36 | 0.352 | 0.437 | 3.46 | 1.64 | 2.83 | 3.15 | 0.91 |
+| 2, 3 | 1.277 | 2.361 | 12.65 | 8.12 | 10.10 | 12.78 | 1.01 |
+| 2, 10 | 0.658 | 0.836 | 5.76 | 2.68 | 6.20 | 6.33 | 1.10 |
+| 2, 17 | 1.361 | 1.662 | 11.44 | 4.36 | 11.46 | 12.22 | 1.07 |
+| 2, 24 | 0.760 | 0.943 | 6.69 | 3.25 | 5.80 | 6.50 | 0.97 |
+| 2, 31 | 1.012 | 1.251 | 9.45 | 3.79 | 9.22 | 9.96 | 1.05 |
+| 2, 38 | 0.176 | 0.180 | 2.08 | 0.79 | 0.57 | **0.96** | **0.46** |
+| 3, 5 | 0.684 | 0.851 | 6.35 | 2.89 | 5.58 | 6.18 | 0.97 |
+| 3, 12 | 0.629 | 0.595 | 4.95 | 2.60 | 4.27 | 4.77 | 0.96 |
+| 3, 19 | 1.263 | 1.674 | 11.18 | 4.88 | 11.07 | 12.08 | 1.08 |
+| 3, 26 | 1.353 | 2.068 | 11.48 | 6.48 | 10.03 | 11.76 | 1.02 |
+| 3, 33 | 0.876 | 1.830 | 14.00 | 6.44 | 12.43 | 13.94 | 1.00 |
+| **median** | **0.90 %** | **1.16 %** | **8.67 %** | **3.81 %** | 7.41 % | **8.90 %** | |
+
+- **FP4 in both halves is SageAttention 3's class on real data too:** median 8.90 against 8.67 %, below it in 11 of
+  22 blocks, the ratio 0.91–1.10 everywhere but the last block (0.46). The error comes from Q·Kᵀ (7.41 % alone).
+- So `attention_fp4` alone cannot meet the fast mode's rule (less error than SageAttention 3). Whatever it gains in
+  speed has to be mixed with `attention_fp4pv` per layer, or bought back elsewhere.
+
+## M4.12 — result: the Q·Kᵀ half got faster, and the tile now waits for its data
+
+Whole call, one process, 6 rounds taking turns with the order flipped, ComfyUI's models unloaded:
+
+| | 32 760 | 34 020 |
+|---|---|---|
+| SageAttention 3 | 58.0 ms | 62.8 ms |
+| `attention_fp4pv` | 66.3 ms | 73.3 ms |
+| **`attention_fp4`** | **72.8 ms** | **78.4 ms** |
+| baseline 1 | 76.2 ms | 82.4 ms |
+| SageAttention 2 | 75.8 ms | 83.5 ms |
+
+compare.py, 5 rounds: `attention_fp4pv` kernel 64.5 ms + quantization 2.94 ms; **`attention_fp4` kernel 62.5 ms (−3 %) +
+quantization 10.35 ms**. The quantization in torch (a float copy of K − mean for its max, a max over Q) is a first
+version's cost and can go into the quantize kernels; the kernel is the finding.
+
+| | `attention_fp4pv` | `attention_fp4` | predicted |
+|---|---|---|---|
+| kernel, compare.py | 64.5 ms | 62.5 ms (−3 %) | 43–50 ms: **missed by far** |
+| active cycles (ncu, 4 heads) | 14.49 M | 15.06 M (+4 %) | −22 … −33 % |
+| executed instructions | 1.553 G | 1.452 G (−6.5 %) | |
+| tensor pipe | 67.6 % | **43.8 %** | |
+| stalls (per warp, K): long scoreboard / barrier / math pipe | 124 / 66 / 224 | **383** / 20 / 95 | |
+| trace, SM 0: whole tile | 2490 | 2638 | |
+| trace: start → P packed | 1199 | **672 (−44 %)** | |
+| trace: P packed → next tile's start | 1236 | **1883 (+650)** | |
+
+- The Q·Kᵀ half did what it should: the way to a packed P fell from 1199 to 672 cycles.
+- **All of it went into waiting at the end of the tile**, where a warp waits on the mbarrier for the next tile's K
+  and V (long scoreboard ×3). The copies are issued one iteration ahead, ~2500 cycles (~1 µs). That covered the
+  L2 → shared memory latency while a tile took that long; a shorter tile now outruns its data.
+- Next (H9b): a deeper pipeline, copies issued 2–3 tiles ahead. The FP4 tiles are small (K4 5 KB, V4 6 KB), so a third
+  and fourth stage cost 11 KB each: 34 or 45 KB per block, still 2 blocks per SM.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

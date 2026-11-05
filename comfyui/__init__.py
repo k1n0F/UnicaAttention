@@ -37,22 +37,24 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "bench"))
 
 import unica  # noqa: E402
-from emulate import TODAY, emulate, errors, negligible_tiles, reference  # noqa: E402
+from emulate import TODAY, emulate, errors, reference  # noqa: E402
 
 MODE = "unica"
-ERRORS_CSV = REPO / "build" / "wan_attention_errors_m4.7.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
-# M4.4-M4.5 candidates, emulated on the same real Q, K, V (today's kernel is measured itself, as "unica")
+ERRORS_CSV = REPO / "build" / "wan_attention_errors_m4.12.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
+# attention_fp4pv as the emulator computes it (LOG M4.8, tests/test_fp4.py)
+FP4PV = TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4", p_local=False, p_mul=1024.0, p_outer=1.0, v_outer="channel",
+                     fp4_slots=True)
+# Candidates, emulated on the same real Q, K, V (today's kernel is measured itself, as "unica"). M4.12 (H9): which
+# layers tolerate FP4 in Q·Kᵀ on top of FP4 P·V
 EMULATED = {
     "emu_hadamard": TODAY | dict(rotate_qk=128),
-    "emu_fp4pv": TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4"),
-    "emu_fp4pv_centred_v": TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4", smooth_v=True),
-    "emu_fp4qk": TODAY | dict(qk="nvfp4"),  # M4.7 H3
-    "emu_skip12": TODAY | dict(skip_below=2.0**-12),  # M4.7 H2: what skipping negligible tiles does to the error
+    "emu_fp4pv": FP4PV,
+    "emu_fp4qk": TODAY | dict(qk="nvfp4"),
+    "emu_fp4_both": FP4PV | dict(qk="nvfp4"),
 }
-SKIP_SHARES = {f"skip{rows}_t{e}": (rows, 2.0**-e) for rows in (64, 16) for e in (12, 20)}  # M4.7 H2
 CSV_FIELDS = ["time", "node", "call", "batch", "tokens", "keys", "heads_measured", "unica_rel_l2", "unica_cos",
               "sage2_rel_l2", "sage2_cos", "sage3_rel_l2", "sage3_cos",
-              *(f"{name}_rel_l2" for name in EMULATED), *SKIP_SHARES, "q_channel_spread", "k_channel_spread", "v_offset",
+              *(f"{name}_rel_l2" for name in EMULATED), "q_channel_spread", "k_channel_spread", "v_offset",
               "unica_ms", "sage2_ms", "sage3_ms"]
 HEAD_DIM = 128
 log = logging.getLogger("UnicaAttention")
@@ -130,8 +132,6 @@ class Measurement:
             row[f"{name}_rel_l2"] = errors(emulate(*bhnd, **config), ref)["rel_l2"]
         row["q_channel_spread"], row["k_channel_spread"] = channel_spread(bhnd[0]), channel_spread(bhnd[1])
         row["v_offset"] = v_offset(bhnd[2])
-        shares = negligible_tiles(bhnd[0], bhnd[1], {tau for _, tau in SKIP_SHARES.values()})
-        row |= {name: shares[key] for name, key in SKIP_SHARES.items()}
         ERRORS_CSV.parent.mkdir(exist_ok=True)
         new = not ERRORS_CSV.exists()
         with ERRORS_CSV.open("a", newline="") as f:
@@ -140,12 +140,11 @@ class Measurement:
                 writer.writeheader()
             writer.writerow(row)
         log.info("%s call %d, %d tokens: rel L2 unica %.3f %%, SageAttention 2 %.3f %%%s; emulated %s; "
-                 "channel spread q %.2f k %.2f, v offset %.3f; negligible tiles %s", self.node, self.calls,
+                 "channel spread q %.2f k %.2f, v offset %.3f", self.node, self.calls,
                  q.shape[1], 100 * row["unica_rel_l2"], 100 * row["sage2_rel_l2"],
                  f", SageAttention 3 {100 * row['sage3_rel_l2']:.3f} %" if "sage3_rel_l2" in row else "",
                  ", ".join(f"{name[4:]} {100 * row[f'{name}_rel_l2']:.3f} %" for name in EMULATED),
-                 row["q_channel_spread"], row["k_channel_spread"], row["v_offset"],
-                 ", ".join(f"{name} {100 * row[name]:.1f} %" for name in SKIP_SHARES))
+                 row["q_channel_spread"], row["k_channel_spread"], row["v_offset"])
 
 
 measurement = Measurement("WanVideo")

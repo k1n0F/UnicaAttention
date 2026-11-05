@@ -3,8 +3,9 @@ M4.8: the NVFP4 P·V path against bench/emulate.py.
 
 1. quantize_v4 holds, after decoding, exactly the V of block_scaled(..., "nvfp4", outer="channel") with the keys of
    each tile in the FP4 mma's slot order.
-2. attention_fp4pv is the emulator's FP4 P·V configuration (KERNEL_CONFIG) within 0.1 %: not bit for bit, since P̂
-   comes out of ex2.approx with an lg2.approx offset where the emulator divides.
+2. quantize_fp4_rows (Q and K of attention_fp4) is block_scaled(x − mean, "nvfp4", -1) bit for bit.
+3. attention_fp4pv and attention_fp4 are the emulator's configurations within 0.1 %: not bit for bit, since P̂ comes
+   out of ex2.approx with an lg2.approx offset where the emulator divides.
 """
 
 from __future__ import annotations
@@ -59,6 +60,21 @@ def test_quantize_v4_is_the_emulator():
         assert torch.equal(got, expected), (n, (got - expected).abs().max().item())
 
 
+def test_quantize_fp4_rows_is_the_emulator():
+    torch.manual_seed(0)
+    for n in (1, 64, 1000):
+        x = torch.randn(1, 3, n, 128, device="cuda", dtype=torch.bfloat16)
+        x[..., :4] *= 30  # outlier channels
+        x[0, 2] *= 1e-3
+        for mean in (None, x.mean(-2, dtype=torch.float32)):
+            x4, outer = unica.quantize_fp4_rows(x, mean)
+            nibbles = torch.stack([x4[..., :64] & 0xF, x4[..., :64] >> 4], -1).flatten(-2).long()
+            scales = x4[..., 64:72].view(torch.float8_e4m3fn).float() * outer[..., None, None]
+            got = E2M1_VALUES.to(x.device)[nibbles] * scales.repeat_interleave(16, -1)
+            centred = x.float() - mean[..., None, :] if mean is not None else x.float()
+            assert torch.equal(got, block_scaled(centred, "nvfp4", -1)), (n, mean is None)
+
+
 def test_kernel_is_the_emulator():
     for shape, sharpness in (((1, 1, 64, 128), 1), ((1, 2, 1000, 128), 1), ((2, 2, 777, 128), 1),
                              ((1, 4, 4096, 128), 1), ((1, 2, 2048, 128), 4)):
@@ -66,14 +82,16 @@ def test_kernel_is_the_emulator():
         q, k, v = (torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3))
         q = (q.float() * sharpness).bfloat16()
         ref = reference(q, k, v)
-        out = unica.attention(q, k, v, "attention_fp4pv").float()
-        emulated = emulate(q, k, v, **KERNEL_CONFIG)
-        assert not torch.isnan(out).any(), shape
-        assert errors(out, emulated)["rel_l2"] < 1e-3, (shape, sharpness, errors(out, emulated))
-        assert abs(errors(out, ref)["rel_l2"] - errors(emulated, ref)["rel_l2"]) < 1e-4, (shape, sharpness)
+        for kernel, config in (("attention_fp4pv", KERNEL_CONFIG), ("attention_fp4", KERNEL_CONFIG | dict(qk="nvfp4"))):
+            out = unica.attention(q, k, v, kernel).float()
+            emulated = emulate(q, k, v, **config)
+            assert not torch.isnan(out).any(), (kernel, shape)
+            assert errors(out, emulated)["rel_l2"] < 1e-3, (kernel, shape, sharpness, errors(out, emulated))
+            assert abs(errors(out, ref)["rel_l2"] - errors(emulated, ref)["rel_l2"]) < 1e-4, (kernel, shape, sharpness)
 
 
 if __name__ == "__main__":
     test_quantize_v4_is_the_emulator()
+    test_quantize_fp4_rows_is_the_emulator()
     test_kernel_is_the_emulator()
     print("fp4 ok")

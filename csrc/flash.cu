@@ -1172,6 +1172,14 @@ __device__ __forceinline__ void trace_mark(int slot, int lane, int tile, int poi
     if (slot >= 0 && lane == 0 && tile < TRACE_TILES) trace_clocks[slot][tile][point] = now;
 }
 
+// The same, read only once `after` is computed: the value is an input of the clock read, so the read waits for it.
+// This marks when a chain of work ends, wherever ptxas put the instructions of that chain (M4.10).
+__device__ __forceinline__ void trace_mark_after(int slot, int lane, int tile, int point, uint32_t after) {
+    long long now;
+    asm volatile("{ .reg .u32 unused; mov.u32 unused, %1; mov.u64 %0, %%clock64; }" : "=l"(now) : "r"(after) : "memory");
+    if (slot >= 0 && lane == 0 && tile < TRACE_TILES) trace_clocks[slot][tile][point] = now;
+}
+
 // clocks: int64 [TRACE_SLOTS][TRACE_TILES][TRACE_POINTS], warps: int32 [TRACE_SLOTS], used: int32 [1]. Then
 // clears the slots for the next run. One thread.
 extern "C" __global__ void trace_read(long long* clocks, int* warps, int* used) {
@@ -1182,9 +1190,11 @@ extern "C" __global__ void trace_read(long long* clocks, int* warps, int* used) 
 }
 #define TRACE_SLOT(lane) trace_slot(lane)
 #define TRACE_MARK(slot, lane, tile, point) trace_mark(slot, lane, tile, point)
+#define TRACE_MARK_AFTER(slot, lane, tile, point, after) trace_mark_after(slot, lane, tile, point, after)
 #else
 #define TRACE_SLOT(lane) (-1)
 #define TRACE_MARK(slot, lane, tile, point) ((void)0)
+#define TRACE_MARK_AFTER(slot, lane, tile, point, after) ((void)0)
 #endif
 
 // M3.4: attention_int8pv with two buffers per tile. Tile t + 1 is on its way while tile t is computed, and
@@ -1501,6 +1511,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     float scores[2][KEY_BLOCKS][4];  // tile t in scores[t % 2]; Q·Kᵀ(t + 1) writes the other
     qk_scores_int8_q_smem(scores[0], q_tiles[warp], k_tiles[0], lane);
     if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
+    [[maybe_unused]] const int slot = TRACE_SLOT(lane);
 
     // As in attention_int8pv_pipe. Iteration t reads K(t + 1) and V(t), issued in iteration t − 1 (or the
     // prologue), and issues K(t + 2) into the K buffer of t and V(t + 1) into the other V buffer.
@@ -1517,12 +1528,16 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
             load_v(later, t + 1, &landed[now]);
         }
 
+        TRACE_MARK(slot, lane, t, 0);
         float alpha[2], beta[2];
         qk_scores_int8_q_smem(scores[later], q_tiles[warp], k_tiles[later], lane);  // stale in the last iteration
         online_softmax_u8(scores[now], row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
+        TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
+        TRACE_MARK_AFTER(slot, lane, t, 2, __float_as_uint(beta[0]) ^ __float_as_uint(beta[1]));
         uint32_t p[PV8_STEPS][4];
 #pragma unroll
         for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
+        TRACE_MARK_AFTER(slot, lane, t, 3, p[0][0] ^ p[0][1] ^ p[0][2] ^ p[0][3] ^ p[1][0] ^ p[1][1] ^ p[1][2] ^ p[1][3]);
         add_row_sum_u8(row_sum, p, alpha, beta);
         pv_int8<UNICA_V_PAIRS>(out, p, v_tiles[now], alpha, beta, lane);
 
@@ -1803,6 +1818,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     float scores[2][KEY_BLOCKS][4];
     qk_scores_int8_q_smem(scores[0], q_tiles[warp], k_tiles[0], lane);
     if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
+    [[maybe_unused]] const int slot = TRACE_SLOT(lane);
 
     auto iteration = [&](int t, auto parity) {
         constexpr int now = decltype(parity)::value, later = 1 - now;
@@ -1818,8 +1834,12 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
 
         float alpha[2];
         uint32_t p[4], scale_p;
+        TRACE_MARK(slot, lane, t, 0);
         qk_scores_int8_q_smem(scores[later], q_tiles[warp], k_tiles[later], lane);  // stale in the last iteration
         online_softmax_fp4(scores[now], row_max, alpha, p, scale_p, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], lane);
+        TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
+        TRACE_MARK_AFTER(slot, lane, t, 2, scale_p);
+        TRACE_MARK_AFTER(slot, lane, t, 3, p[0] ^ p[1] ^ p[2] ^ p[3]);
         pv_fp4(out, row_sum_acc, p, scale_p, v_tiles[now], alpha, lane);
 
         const int next_valid = n_keys - key0 - KEYS_PER_TILE;
@@ -1834,6 +1854,187 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     if (t < n_tiles) iteration(t, Parity<0>{});
 
     const float row_sum[2] = {row_sum_acc[0], row_sum_acc[2]};  // 0 outside lane 4g: store_out's quad sum adds them
+    store_out(O + q_offset, out, row_sum, row, col, n_rows, v_outer);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// M4.12 (H9): Q·Kᵀ in NVFP4 too. Q and K as e2m1 with an e4m3 scale per 16 channels of d and one float scale per
+// head; m16n8k64 sums over d, so a key tile takes 2 k-steps × 8 blocks of keys = 16 OMMA instead of 32 IMMA.
+// ---------------------------------------------------------------------------------------------------
+
+// K4 / Q4: one row per token, d in order as e2m1 (d 2b in the low nibble of byte b), then the 8 e4m3 scales of the
+// 16-channel blocks (byte 64 + i for d 16i .. 16i + 15). A 16-byte matrix of ldmatrix gives lane l word l % 4 of row
+// l / 4: bytes 0..15 of 8 keys are B register 0 of the k-step over d 0..63, bytes 16..31 register 1, bytes 32..63 the
+// same for d 64..127. Word s of the scales (bytes 64 + 4s ..) is the scale register of k-step s. 80-byte rows: the 8
+// rows of an ldmatrix start in 8 different groups of 4 banks, and a TMA box is a multiple of 16 bytes.
+constexpr int FP4_ROW_BYTES = 80;
+constexpr int FP4_SCALES_AT = 64;
+constexpr int D_BLOCKS_FP4 = HEAD_DIM / FP4_SCALE_BLOCK;  // 8 scales per token
+constexpr int K4_TILE_BYTES = KEYS_PER_TILE * FP4_ROW_BYTES;
+
+// Q or K for attention_fp4: x − mean (K: softmax cancels the mean) ≈ e2m1 · (e4m3 scale per 16 channels) · outer[head],
+// outer = max |x − mean| over the head / (6 · 448). One thread per (token, block of 16 channels). Bit for bit
+// bench/emulate.py's block_scaled(x − mean, "nvfp4", -1) (tests/test_fp4.py). mean: float [heads][HEAD_DIM] or null.
+// Grid: ceil(heads · n_tokens · 8 / QUANTIZE_THREADS).
+extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
+    quantize_fp4_rows(const __nv_bfloat16* X, const float* mean, const float* outer, uint8_t* X4, int n_tokens,
+                      int n_threads) {
+    const int index = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
+    if (index >= n_threads) return;
+    const int block = index % D_BLOCKS_FP4;
+    const size_t row = index / D_BLOCKS_FP4;  // head · n_tokens + token
+    const int head = int(row / n_tokens);
+    float values[FP4_SCALE_BLOCK];
+    float amax = 0.0f;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        float chunk[CHUNK];
+        load_chunk(chunk, X + row * HEAD_DIM + block * FP4_SCALE_BLOCK + half * CHUNK,
+                   mean ? mean + head * HEAD_DIM + block * FP4_SCALE_BLOCK + half * CHUNK : nullptr);
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) {
+            values[half * CHUNK + i] = chunk[i];
+            amax = fmaxf(amax, fabsf(chunk[i]));
+        }
+    }
+    const uint32_t scale_byte = to_e4m3(amax * (1.0f / 6.0f) / outer[head]);  // · (1/6): as torch, M4.8
+    const float scale = from_e4m3(scale_byte) * outer[head];
+#pragma unroll
+    for (int i = 0; i < FP4_SCALE_BLOCK; ++i) values[i] = scale > 0.0f ? values[i] / scale : 0.0f;
+    uint8_t* out = X4 + row * FP4_ROW_BYTES;
+    *reinterpret_cast<uint2*>(out + block * 8) = make_uint2(pack_e2m1x8(values), pack_e2m1x8(values + 8));
+    out[FP4_SCALES_AT + block] = uint8_t(scale_byte);
+}
+
+// Scores of one tile: 8 blocks of 8 keys, each 2 k-steps of 64 channels. q: Q's A fragments of both steps, held in
+// registers for the whole kernel; q_scale: their scale registers. One ldmatrix.x4 gives a block's B registers of
+// both steps; one LDS.64 its two scale registers (lane 4g: key 8b + g).
+__device__ __forceinline__ void qk_scores_fp4(float scores[KEY_BLOCKS][4], const uint32_t q[2][4], const uint32_t q_scale[2],
+                                              const uint8_t* k_tile, int lane) {
+    const uint8_t* lane_row = k_tile + (lane % 8) * FP4_ROW_BYTES + 16 * (lane / 8);
+#pragma unroll
+    for (int block = 0; block < KEY_BLOCKS; ++block) {
+        uint32_t b[4];
+        ldmatrix_x4(b, lane_row + block * MMA_N * FP4_ROW_BYTES);
+        const uint2 k_scale = *reinterpret_cast<const uint2*>(k_tile + (block * MMA_N + lane / 4) * FP4_ROW_BYTES + FP4_SCALES_AT);
+        const uint32_t low[2] = {b[0], b[1]}, high[2] = {b[2], b[3]};
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        mma_nvf4_16864(acc, q[0], low, q_scale[0], k_scale.x);
+        mma_nvf4_16864(acc, q[1], high, q_scale[1], k_scale.y);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) scores[block][i] = acc[i];
+    }
+}
+
+// M4.12: attention_fp4pv with Q·Kᵀ in NVFP4. k_map: K4 (quantize_fp4_rows on K − mean) as rows of FP4_ROW_BYTES, box
+// FP4_ROW_BYTES × KEYS_PER_TILE. Q4 as rows of FP4_ROW_BYTES, read once into registers. qk_outer[head]: the product of
+// Q's and K's float scales, folded into scale_log2. v_map and v_outer as attention_fp4pv.
+extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
+    attention_fp4(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
+                  const uint8_t* Q4, const float* qk_outer, const float* v_outer, __nv_bfloat16* O, int n_queries,
+                  int n_keys, float scale_log2) {
+    __shared__ __align__(128) uint8_t k_tiles[2][K4_TILE_BYTES];
+    __shared__ __align__(128) uint8_t v_tiles[2][V4_TILE_BYTES];
+    __shared__ __align__(8) uint64_t landed[3];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row = lane / 4;
+    const int col = 2 * (lane % 4);
+
+    const int row0 = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP;
+    const int n_rows = min(n_queries - row0, ROWS_PER_WARP);
+    const size_t q_offset = (size_t(blockIdx.y) * n_queries + row0) * HEAD_DIM;
+    v_outer += size_t(blockIdx.y) * HEAD_DIM;
+    const float score_scale = qk_outer[blockIdx.y] * scale_log2;
+    const int n_tiles = (n_keys + KEYS_PER_TILE - 1) / KEYS_PER_TILE;
+
+    // Q's A fragments: register r of step s holds row g + 8 · (r % 2), d = 64s + 8 · (lane % 4) + 32 · (r / 2) + j.
+    // The scale registers: lane 4g row g, lane 4g + 1 row g + 8 (the others are not read). Rows past n_queries: 0.
+    uint32_t q[2][4], q_scale[2];
+    {
+        const uint8_t* q_rows = Q4 + (size_t(blockIdx.y) * n_queries + row0) * FP4_ROW_BYTES;
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const int q_row = row + 8 * (r % 2);
+                q[s][r] = q_row < n_rows ? *reinterpret_cast<const uint32_t*>(q_rows + q_row * FP4_ROW_BYTES + 32 * s +
+                                                                             4 * (lane % 4) + 16 * (r / 2))
+                                         : 0u;
+            }
+            const int scale_row = row + 8 * (lane % 2);
+            q_scale[s] = scale_row < n_rows
+                             ? *reinterpret_cast<const uint32_t*>(q_rows + scale_row * FP4_ROW_BYTES + FP4_SCALES_AT + 4 * s)
+                             : 0u;
+        }
+    }
+
+    const int k_row0 = blockIdx.y * n_keys;
+    const int v_row0 = blockIdx.y * n_tiles * HEAD_DIM;
+    auto load_k = [&](int buffer, int tile, uint64_t* barrier) {
+        tma_load_2d(k_tiles[buffer], k_map, 0, k_row0 + tile * KEYS_PER_TILE, barrier);
+    };
+    auto load_v = [&](int buffer, int tile, uint64_t* barrier) {
+        tma_load_2d(v_tiles[buffer], v_map, 0, v_row0 + tile * HEAD_DIM, barrier);
+    };
+
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 3; ++i) mbarrier_init(&landed[i], 1);
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        mbarrier_expect_bytes(&landed[2], (n_tiles > 1 ? 2 : 1) * K4_TILE_BYTES + V4_TILE_BYTES);
+        load_k(0, 0, &landed[2]);
+        load_v(0, 0, &landed[2]);
+        if (n_tiles > 1) load_k(1, 1, &landed[2]);
+    }
+
+    float row_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
+    float row_sum_acc[4] = {};
+    float out[D_BLOCKS][4] = {};
+
+    mbarrier_wait(&landed[2], 0);
+    float scores[2][KEY_BLOCKS][4];
+    qk_scores_fp4(scores[0], q, q_scale, k_tiles[0], lane);
+    if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
+    [[maybe_unused]] const int slot = TRACE_SLOT(lane);
+
+    auto iteration = [&](int t, auto parity) {
+        constexpr int now = decltype(parity)::value, later = 1 - now;
+        const int key0 = t * KEYS_PER_TILE;
+        if (t > 0) mbarrier_wait(&landed[later], (t - 1) / 2 % 2);
+        __syncthreads();
+        if (threadIdx.x == 0 && t + 1 < n_tiles) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            mbarrier_expect_bytes(&landed[now], (t + 2 < n_tiles ? K4_TILE_BYTES : 0) + V4_TILE_BYTES);
+            if (t + 2 < n_tiles) load_k(now, t + 2, &landed[now]);
+            load_v(later, t + 1, &landed[now]);
+        }
+
+        float alpha[2];
+        uint32_t p[4], scale_p;
+        TRACE_MARK(slot, lane, t, 0);
+        qk_scores_fp4(scores[later], q, q_scale, k_tiles[later], lane);  // stale in the last iteration
+        online_softmax_fp4(scores[now], row_max, alpha, p, scale_p, score_scale, lane);
+        TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
+        TRACE_MARK_AFTER(slot, lane, t, 2, scale_p);
+        TRACE_MARK_AFTER(slot, lane, t, 3, p[0] ^ p[1] ^ p[2] ^ p[3]);
+        pv_fp4(out, row_sum_acc, p, scale_p, v_tiles[now], alpha, lane);
+
+        const int next_valid = n_keys - key0 - KEYS_PER_TILE;
+        if (next_valid < KEYS_PER_TILE) mask_scores(scores[later], col, next_valid);
+    };
+
+    int t = 0;
+    for (; t + 1 < n_tiles; t += 2) {
+        iteration(t, Parity<0>{});
+        iteration(t + 1, Parity<1>{});
+    }
+    if (t < n_tiles) iteration(t, Parity<0>{});
+
+    const float row_sum[2] = {row_sum_acc[0], row_sum_acc[2]};
     store_out(O + q_offset, out, row_sum, row, col, n_rows, v_outer);
 }
 #endif  // UNICA_KEYS_PER_TILE == 64

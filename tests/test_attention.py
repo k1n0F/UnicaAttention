@@ -29,6 +29,7 @@ EMULATED["attention_int8pv_tma"] = EMULATED["attention_int8pv"]
 # M4.8: P against the running max times 2^10 and V per channel, both NVFP4, keys in the FP4 mma's slot order
 EMULATED["attention_fp4pv"] = dict(EMULATED["attention_int8pv"], p_fmt="nvfp4", v_fmt="nvfp4", p_local=False,
                                    p_mul=1024.0, p_outer=1.0, v_outer="channel", fp4_slots=True)
+EMULATED["attention_fp4"] = dict(EMULATED["attention_fp4pv"], qk="nvfp4")  # M4.12: Q·Kᵀ in NVFP4 too
 MAX_FROM_EMULATOR = 1e-3
 
 # (batch, heads, n_queries, n_keys)
