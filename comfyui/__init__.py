@@ -24,6 +24,7 @@ already be built (run the tests once): ComfyUI's shell has no nvcc.
 
 from __future__ import annotations
 
+import collections
 import csv
 import logging
 import sys
@@ -40,13 +41,19 @@ import unica  # noqa: E402
 from emulate import TODAY, emulate, errors, reference  # noqa: E402
 
 MODE = "unica"
-ERRORS_CSV = REPO / "build" / "wan_attention_errors_m4.21.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
+ERRORS_CSV = REPO / "build" / "attention_errors_v_modes.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
+# while this file exists, every measured call also saves its q, k, v (the measured heads) to build/dumps/
+DUMP_FLAG = REPO / "build" / "dumps.flag"
+OUTLIER_KEYS = 8  # M4.25: keys per head the accurate mode's v_scale "outliers" takes out of INT8
 # attention_fp4pv as the emulator computes it (LOG M4.8, tests/test_fp4.py)
 FP4PV = TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4", p_local=False, p_mul=1024.0, p_outer=1.0, v_outer="channel",
                      fp4_slots=True)
 # The fast mode's kernels, measured themselves on the same real Q, K, V (M4.21): attention_fp4, and with Q smoothed per
 # 512 queries (M4.20 emulated it below SageAttention 3 in 22 of 22 blocks)
 KERNELS = {
+    "accurate_per_channel": dict(V_TOKEN=0),  # M4.23: both V scales, whatever v_scale the node runs with
+    "accurate_per_token": dict(V_TOKEN=1),
+    "accurate_outliers": dict(V_OUTLIERS=OUTLIER_KEYS),  # M4.25
     "fp4": dict(kernel="attention_fp4"),
     "fp4_smooth512": dict(kernel="attention_fp4", SMOOTH_Q=512),
 }
@@ -54,7 +61,7 @@ KERNELS = {
 EMULATED = {
     "emu_fp4_both_smoothq512": FP4PV | dict(qk="nvfp4", smooth_q=512),
 }
-CSV_FIELDS = ["time", "node", "call", "step", "block", "batch", "tokens", "keys", "heads_measured", "unica_rel_l2", "unica_cos",
+CSV_FIELDS = ["time", "tag", "v_scale", "routes", "node", "call", "step", "block", "batch", "tokens", "keys", "heads_measured", "unica_rel_l2", "unica_cos",
               "sage2_rel_l2", "sage2_cos", "sage3_rel_l2", "sage3_cos",
               *(f"{name}_{e}" for name in KERNELS for e in ("rel_l2", "cos")),
               *(f"{name}_rel_l2" for name in EMULATED), "q_channel_spread", "k_channel_spread", "v_offset", "q_offset",
@@ -63,12 +70,20 @@ HEAD_DIM = 128
 log = logging.getLogger("UnicaAttention")
 
 
+# Build settings of the accurate mode's kernel, set by the native node's v_scale: per_token is V_TOKEN=1 (M4.23),
+# outliers V_OUTLIERS=OUTLIER_KEYS (M4.25: per channel, a head's largest keys added exactly), per_channel neither
+V_SCALES = {"per_token": {"V_TOKEN": 1}, "outliers": {"V_OUTLIERS": OUTLIER_KEYS}, "per_channel": {}}
+# The fast mode (M4.21): Q·Kᵀ and P·V in NVFP4, Q smoothed per 512 queries; real WAN 7.45 % vs SageAttention 3 8.65 %
+FAST = dict(kernel="attention_fp4", SMOOTH_Q=512)
+SETTINGS: dict = {}  # what unica.attention gets in the node: the accurate mode with one of V_SCALES, or FAST
+
+
 def unica_nhd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """unica.attention on the layout [batch, tokens, heads, 128] (WanVideoWrapper's and ComfyUI's), any float dtype in
     and out. No copy for bf16 (M4.17): the default kernel reads the tensors through a transpose and writes its output
     in the same layout, so out.transpose(1, 2) is already [batch, tokens, heads, 128] in memory. Other dtypes are
     converted once each way, keeping the layout."""
-    out = unica.attention(*(x.transpose(1, 2).to(torch.bfloat16) for x in (q, k, v)))
+    out = unica.attention(*(x.transpose(1, 2).to(torch.bfloat16) for x in (q, k, v)), **SETTINGS)
     return out.transpose(1, 2).to(q.dtype).contiguous()  # both no-ops for bf16
 
 
@@ -111,6 +126,17 @@ class Measurement:
     def __init__(self, node: str) -> None:
         self.node, self.every, self.heads, self.calls = node, 0, 0, 0
         self.sigma, self.step, self.block = None, 0, None
+        self.tag = ""
+        self.routes: collections.Counter = collections.Counter()  # "unica" or why a call went elsewhere
+        self.numbered = False  # whether the model's calls carry a block index
+
+    def route(self, reason: str | None, q: torch.Tensor, k: torch.Tensor) -> None:
+        """Counts where a call went; the first call passed on for each reason is logged with its shapes, so a run on a
+        new model shows what keeps it from unica."""
+        key = reason or "unica"
+        if reason is not None and not self.routes[key]:
+            log.info("%s [%s]: passed on (%s), q %s, k %s", self.node, self.tag, reason, tuple(q.shape), tuple(k.shape))
+        self.routes[key] += 1
 
     def due(self, options: dict | None = None) -> bool:
         """Advances the call count and says whether this call is measured. With ComfyUI's transformer_options the count
@@ -118,12 +144,18 @@ class Measurement:
         new run), so every run measures the same (step, block) pairs (M4.20 found the plain count running on across
         runs). Without them (WanVideoWrapper), a plain count."""
         block, sigmas = (options or {}).get("block_index"), (options or {}).get("sigmas")
-        if block is None or sigmas is None:
+        if sigmas is None:
             self.calls += 1
             self.step = self.block = None
+        elif block is None:
+            if self.numbered:  # a call outside the numbered blocks (Lumina's context refiners): not counted
+                return False
+            self.calls += 1  # a model that numbers no blocks at all (LTX): the plain count
+            self.step = self.block = None
         else:
+            self.numbered = True
             sigma = float(sigmas.max())
-            if self.sigma is None or sigma > self.sigma:
+            if self.sigma is None or self.step is None or sigma > self.sigma:
                 self.step = 0
             elif sigma < self.sigma:
                 self.step += 1
@@ -143,7 +175,10 @@ class Measurement:
         sub = [x[:, :, :h].contiguous() for x in (q, k, v)]
         bhnd = [x.transpose(1, 2).contiguous() for x in sub]
         ref = reference(*bhnd)  # FP32, [batch, heads, tokens, 128]
-        row = {"time": time.strftime("%H:%M:%S"), "node": self.node, "call": self.calls, "step": self.step,
+        row = {"time": time.strftime("%H:%M:%S"), "tag": self.tag,
+               "v_scale": "fast" if SETTINGS == FAST else next(n for n, s in V_SCALES.items() if s == SETTINGS),
+               "routes": " ".join(f"{key}={n}" for key, n in sorted(self.routes.items())),
+               "node": self.node, "call": self.calls, "step": self.step,
                "block": self.block, "batch": q.shape[0],
                "tokens": q.shape[1], "keys": k.shape[1], "heads_measured": h}
         mine, row["unica_ms"] = timed(unica_nhd, *sub)
@@ -160,6 +195,11 @@ class Measurement:
             row[f"{name}_rel_l2"] = errors(emulate(*bhnd, **config), ref)["rel_l2"]
         row["q_channel_spread"], row["k_channel_spread"] = channel_spread(bhnd[0]), channel_spread(bhnd[1])
         row["v_offset"], row["q_offset"] = v_offset(bhnd[2]), v_offset(bhnd[0])
+        if DUMP_FLAG.exists():  # the measured q, k, v themselves, to take an error apart offline
+            DUMP_FLAG.with_suffix("").mkdir(exist_ok=True)
+            name = f"{self.tag or self.node}_call{self.calls}_{time.monotonic_ns()}.pt"
+            torch.save({"q": bhnd[0].cpu(), "k": bhnd[1].cpu(), "v": bhnd[2].cpu(), "row": row},
+                       DUMP_FLAG.with_suffix("") / name)
         ERRORS_CSV.parent.mkdir(exist_ok=True)
         new = not ERRORS_CSV.exists()
         with ERRORS_CSV.open("a", newline="") as f:
@@ -234,6 +274,10 @@ class UnicaAttentionWanVideo:
         return (patched,)
 
 
+# the positional parameters of ComfyUI's attention functions after q, k, v (comfy/ldm/modules/attention.py)
+POSITIONAL = ("heads", "mask", "attn_precision", "skip_reshape", "skip_output_reshape")
+
+
 def native_override(previous):
     """An optimized_attention_override for ComfyUI's own models. ComfyUI calls it as (func, q, k, v, heads=, ...):
     q, k, v are [batch, tokens, heads · dim], or [batch, heads, tokens, dim] with skip_reshape. Self-attention
@@ -241,14 +285,23 @@ def native_override(previous):
     to `previous` (the override that was on the model), or to func."""
 
     def override(func, q, k, v, *args, **kwargs):
-        heads = kwargs.get("heads")
-        if args or heads is None or kwargs.get("mask") is not None or not q.is_cuda:  # anything unusual: as before
+        # WAN passes heads by name, most other models by position (Flux, LTX, Qwen-Image, Lumina...): read both
+        named = dict(zip(POSITIONAL, args)) | kwargs
+        heads = named.get("heads")
+        reason = ("positional arguments" if len(args) > len(POSITIONAL) else "no heads" if heads is None else
+                  "mask" if named.get("mask") is not None else "not on the GPU" if not q.is_cuda else None)
+        if reason is None:
+            skip_reshape = named.get("skip_reshape", False)
+            dim = q.shape[-1] if skip_reshape else q.shape[-1] // heads
+            tokens = (lambda x: x.shape[2]) if skip_reshape else (lambda x: x.shape[1])
+            reason = (f"head size {dim}" if dim != HEAD_DIM else
+                      "cross-attention" if tokens(k) != tokens(q) else
+                      "scale" if named.get("scale") not in (None, HEAD_DIM**-0.5) else None)
+        native_measurement.route(reason, q, k)
+        if reason is not None:  # anything unusual: as before
             return previous(func, q, k, v, *args, **kwargs) if previous else func(q, k, v, *args, **kwargs)
-        skip_reshape, skip_output_reshape = kwargs.get("skip_reshape", False), kwargs.get("skip_output_reshape", False)
-        dim = q.shape[-1] if skip_reshape else q.shape[-1] // heads
-        tokens = (lambda x: x.shape[2]) if skip_reshape else (lambda x: x.shape[1])
-        if dim != HEAD_DIM or tokens(k) != tokens(q) or kwargs.get("scale") not in (None, HEAD_DIM**-0.5):
-            return previous(func, q, k, v, **kwargs) if previous else func(q, k, v, **kwargs)
+        skip_reshape, skip_output_reshape = named.get("skip_reshape", False), named.get("skip_output_reshape", False)
+        kwargs = named
         # [batch, tokens, heads, 128], WanVideoWrapper's layout, as views
         nhd = [x.transpose(1, 2) if skip_reshape else x.view(x.shape[0], x.shape[1], heads, dim) for x in (q, k, v)]
         out = unica_nhd(*nhd)
@@ -278,7 +331,7 @@ def fused_rope_forward(module, original):
         if native_measurement.due(transformer_options):
             from comfy.ldm.flux.math import apply_rope1
             native_measurement.measure(apply_rope1(q, freqs), apply_rope1(k, freqs), v)
-        out = unica.attention(*(t.transpose(1, 2).to(torch.bfloat16) for t in (q, k, v)), rope=freqs)
+        out = unica.attention(*(t.transpose(1, 2).to(torch.bfloat16) for t in (q, k, v)), rope=freqs, **SETTINGS)
         return module.o(out.transpose(1, 2).reshape(b, s, n * d).to(x.dtype))
 
     forward.unica = True
@@ -318,6 +371,17 @@ class UnicaAttentionNative:
                 "fuse_rope": ("BOOLEAN", {"default": False,
                                           "tooltip": "WAN: RoPE inside unica's quantization instead of ComfyUI's own pass "
                                                      "(~2 ms less per call). Patches WanSelfAttention.forward"}),
+                "measure_tag": ("STRING", {"default": "",
+                                           "tooltip": "Written into the measurement CSV, e.g. the model's name"}),
+                "v_scale": (list(V_SCALES), {"default": "per_token",
+                                             "tooltip": "V's INT8 scale: per token (folded into P, the most accurate; "
+                                                        "~11 % slower kernel), outliers (experimental: per channel without each head's "
+                                                        "8 largest keys, added exactly: Z-Image's two extreme tokens; "
+                                                        "~1 ms more quantization) or per channel (the earlier path)"}),
+                "mode": (["accurate", "fast"], {"default": "accurate",
+                                                "tooltip": "accurate: INT8 Q·Kᵀ and P·V, below SageAttention 2's error. "
+                                                           "fast: NVFP4 (attention_fp4), SageAttention 3's error class "
+                                                           "and faster than it; v_scale does not apply"}),
             },
         }
 
@@ -328,10 +392,16 @@ class UnicaAttentionNative:
     DESCRIPTION = ("Self-attention on UnicaAttention through optimized_attention_override. Put it after "
                    "PathchSageAttentionKJ: other calls (cross-attention) go to the override before it.")
 
-    def patch(self, model, enabled, measure_every, measure_heads, fuse_rope=False):
+    def patch(self, model, enabled, measure_every, measure_heads, fuse_rope=False, measure_tag="",
+              v_scale="per_token", mode="accurate"):
         if not enabled:
             return (model,)
+        SETTINGS.clear()
+        SETTINGS.update(FAST if mode == "fast" else V_SCALES[v_scale])
         native_measurement.every, native_measurement.heads = measure_every, measure_heads
+        native_measurement.tag = measure_tag
+        native_measurement.routes.clear()
+        native_measurement.sigma, native_measurement.numbered = None, False  # a new model starts its own count
         patched = model.clone()
         options = patched.model_options["transformer_options"]
         previous = options.get("optimized_attention_override")

@@ -57,13 +57,17 @@ def test_native_override_takes_self_attention_and_passes_the_rest_on():
     # skip_reshape / skip_output_reshape: [b, h, s, 128] both ways
     out = override(None, *(x.half() for x in bhnd), heads=h, skip_reshape=True, skip_output_reshape=True)
     assert torch.equal(out, expected.half())
+    # heads (and the rest) by position, as Flux, LTX, Qwen-Image and Lumina call it: the same call
+    out = override(None, *(x.half() for x in bhnd), h, None, None, True, True)
+    assert torch.equal(out, expected.half())
     assert not calls
 
     text = torch.randn(b, 512, h * 128, device="cuda", dtype=torch.float16)
     assert override(None, q, text, text, heads=h) == "previous"  # cross-attention
     assert override(None, q, k, v, heads=h, mask=torch.ones(1, device="cuda")) == "previous"
-    assert override(None, q, k, v, h) == "previous"  # heads passed by position: not ours to guess
-    assert len(calls) == 3
+    assert override(None, q, k, v, h, torch.ones(1, device="cuda")) == "previous"  # a mask by position
+    assert override(None, q, k, v, h, None, None, False, False, "more") == "previous"  # more than ComfyUI's signature
+    assert len(calls) == 4
 
     class Patcher:  # the slice of ComfyUI's ModelPatcher the node uses
         def __init__(self, options):
@@ -78,8 +82,37 @@ def test_native_override_takes_self_attention_and_passes_the_rest_on():
     assert twice.model_options["transformer_options"]["optimized_attention_override"] is \
         once.model_options["transformer_options"]["optimized_attention_override"]  # not stacked on itself
 
+    # the fast mode: the same call on attention_fp4 with Q smoothed (M4.21); v_scale does not apply
+    node.patch(Patcher({}), True, 0, 2, v_scale="outliers", mode="fast")
+    out = override(None, q, k, v, heads=h)
+    fast = unica.attention(*bhnd, kernel="attention_fp4", SMOOTH_Q=512)
+    assert torch.equal(out, fast.transpose(1, 2).reshape(b, s, h * 128).half())
+    node.patch(Patcher({}), True, 0, 2)  # back to the default, per token, for the tests after this one
+
+
+def test_measurement_count_runs_per_step_and_block():
+    """The count is step · blocks + block + 1 within a run. Calls outside the numbered blocks (Lumina's context
+    refiners: sigmas, no block_index) are not counted and do not break it (Z-Image, Moss crashed on them)."""
+    m = comfyui.Measurement("test")
+    sigma = lambda s: {"sigmas": torch.tensor([s])}  # noqa: E731
+    seen = []
+    for s in (1.0, 0.5):  # two steps of a 3-block model, each preceded by a refiner call
+        m.due(sigma(s))
+        for block in range(3):
+            m.due(sigma(s) | {"block_index": block, "total_blocks": 3})
+            seen.append(m.calls)
+    assert seen == [1, 2, 3, 4, 5, 6], seen
+    m.due(sigma(1.0) | {"block_index": 0, "total_blocks": 3})  # sigma rises: a new run
+    assert m.calls == 1
+
+    # a model that numbers no blocks (LTX: sigmas, never a block index) is counted call by call (M4.23 lost it)
+    ltx = comfyui.Measurement("test")
+    ltx.every = 2
+    assert [ltx.due(sigma(1.0)) for _ in range(4)] == [False, True, False, True]
+
 
 if __name__ == "__main__":
     test_unica_mode_runs_unica_and_other_modes_pass_through()
     test_native_override_takes_self_attention_and_passes_the_rest_on()
+    test_measurement_count_runs_per_step_and_block()
     print("comfyui ok")

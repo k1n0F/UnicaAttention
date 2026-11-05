@@ -42,6 +42,10 @@ constexpr int MMA_K = 16;
 #ifndef UNICA_V_PAIRS
 #define UNICA_V_PAIRS 1
 #endif
+// M4.23: 1 gives attention_int8pv_tma V with one scale per token, folded into P (online_softmax_u8_token).
+#ifndef UNICA_V_TOKEN
+#define UNICA_V_TOKEN 0
+#endif
 // M3.15: 0 sums the float P before rounding for the softmax denominator, in the u8 kernels.
 #ifndef UNICA_SUM_ROUNDED
 #define UNICA_SUM_ROUNDED 1
@@ -1008,6 +1012,45 @@ __device__ __forceinline__ void add_row_sum_u8(float row_sum[2], const uint32_t 
         row_sum[half] = row_sum[half] * alpha[half] + __uint2float_rn(sum[half]) * beta[half];
 }
 
+// M4.23: online_softmax_u8 with V scaled per token (quantize_v's v_token). tok[b]: this lane's two keys of block b,
+// {log2 s, log2 s, 1 / s, 1 / s} of keys 8b + col and + 1. A score becomes x = s · scale_log2 + log2 s_j, and
+// 255 · 2^(x − tile max) is P' = p · s_j against the max of P' in the tile, so every key's V row keeps its own
+// 127 steps, outlier tokens or not. The denominator is Σ p = Σ P' / s_j, gathered here in float before rounding
+// (8-bit weights cannot span the s_j of outliers, ~250× apart in Z-Image); add_row_sum_u8 is not used.
+__device__ __forceinline__ void online_softmax_u8_token(float scores[KEY_BLOCKS][4], float row_max[2], float row_sum[2],
+                                                        float alpha[2], float beta[2], float scale_log2,
+                                                        const float4 tok[KEY_BLOCKS]) {
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        float tile_max = -CUDART_INF_F;
+#pragma unroll
+        for (int block = 0; block < KEY_BLOCKS; ++block) {
+            float& x0 = scores[block][2 * half];
+            float& x1 = scores[block][2 * half + 1];
+            x0 = fmaf(x0, scale_log2, tok[block].x);
+            x1 = fmaf(x1, scale_log2, tok[block].y);
+            tile_max = fmaxf(tile_max, fmaxf(x0, x1));
+        }
+        tile_max = quad_max(tile_max);
+        const float new_max = fmaxf(row_max[half], tile_max);
+        alpha[half] = exp2_ftz(row_max[half] - new_max);
+        beta[half] = exp2_ftz(tile_max - new_max);
+
+        const float offset = LOG2_255 - tile_max;
+        float tile_sum = 0.0f;
+#pragma unroll
+        for (int block = 0; block < KEY_BLOCKS; ++block) {
+            float& p0 = scores[block][2 * half];
+            float& p1 = scores[block][2 * half + 1];
+            p0 = exp2_ftz(p0 + offset);
+            p1 = exp2_ftz(p1 + offset);
+            tile_sum = fmaf(p0, tok[block].z, fmaf(p1, tok[block].w, tile_sum));
+        }
+        row_sum[half] = row_sum[half] * alpha[half] + tile_sum * beta[half];
+        row_max[half] = new_max;
+    }
+}
+
 // Four values in [0, 255] rounded half to even (torch.round) into one register, v0 in the lowest byte.
 // cvt.pack.sat.u8.s32.b32 d, a, b, c gives d = c << 16 | sat(a) << 8 | sat(b) (measured), so the pair packed
 // first ends up on top.
@@ -1133,15 +1176,46 @@ __device__ __forceinline__ size_t v8_offset(int layout, int chunk, int n_tokens)
 // to even, clamp to ±127. Grid: ceil(n_chunks / QUANTIZE_THREADS), n_chunks = heads · n_tokens · CHUNKS_PER_ROW.
 // layout (M3.17, see v8_offset): 0 [heads][n_tokens][HEAD_DIM]; 1 and 2 for TMA, [heads][v8_tokens][HEAD_DIM]
 // bytes each.
+//
+// v_token (M4.23, else null): V gets one scale per token instead, s_j = max |v_j| / 127 over its channels (v_scale is
+// then not read), and v_token [heads][v8_tokens / 2] float4 gets, for every pair of keys 2m, 2m + 1,
+// {log2 s_2m, log2 s_2m+1, 1 / s_2m, 1 / s_2m+1}: attention_int8pv_tma with UNICA_V_TOKEN adds log2 s_j to key j's
+// scores, so P' = p · s_j goes into the mma, and weighs the denominator back by 1 / s_j. Bit for bit
+// bench/emulate.py's v_token V. The 16 chunks of a token are 16 neighbouring lanes, whose max is one xor shuffle tree.
+// skip (M4.25, else null): uint8 [heads][n_tokens], 1 for the keys written as zeros (V_OUTLIERS).
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     quantize_v(const __nv_bfloat16* V, const float* v_scale, int8_t* V8, int n_tokens, int n_chunks, int layout,
-               TokenLayout in) {
+               TokenLayout in, float* v_token, const uint8_t* skip) {
     const int chunk = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
-    if (chunk >= n_chunks) return;
-    const float* scale = v_scale + chunk / (n_tokens * CHUNKS_PER_ROW) * HEAD_DIM + chunk % CHUNKS_PER_ROW * CHUNK;
+    if (chunk >= n_chunks) return;  // whole tokens: n_chunks is a multiple of CHUNKS_PER_ROW, the blocks too
+    const int head = chunk / (n_tokens * CHUNKS_PER_ROW), key = chunk / CHUNKS_PER_ROW % n_tokens;
     float values[CHUNK];
-    load_chunk(values, V + in.offset(chunk / (n_tokens * CHUNKS_PER_ROW), chunk / CHUNKS_PER_ROW % n_tokens) +
-                           chunk % CHUNKS_PER_ROW * CHUNK, nullptr);
+    load_chunk(values, V + in.offset(head, key) + chunk % CHUNKS_PER_ROW * CHUNK, nullptr);
+    if (skip && skip[size_t(head) * n_tokens + key]) {  // M4.25: an outlier key, added exactly after the loop
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) values[i] = 0.0f;
+    }
+    float scale[CHUNK];
+    if (v_token) {
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) amax = fmaxf(amax, fabsf(values[i]));
+        const unsigned group = 0xffffu << (threadIdx.x % WARP_SIZE / CHUNKS_PER_ROW * CHUNKS_PER_ROW);
+#pragma unroll
+        for (int lanes = CHUNKS_PER_ROW / 2; lanes > 0; lanes /= 2)
+            amax = fmaxf(amax, __shfl_xor_sync(group, amax, lanes));
+        const float s = fmaxf(amax / 127.0f, 1e-12f);  // as torch: amax / 127, then clamp_min
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) scale[i] = s;
+        if (chunk % CHUNKS_PER_ROW == 0) {
+            float* pair = v_token + (size_t(head) * v8_tokens(n_tokens) + key / 2 * 2) * 2;
+            pair[key % 2] = log2f(s);
+            pair[2 + key % 2] = 1.0f / s;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) scale[i] = v_scale[head * HEAD_DIM + chunk % CHUNKS_PER_ROW * CHUNK + i];
+    }
     uint32_t packed[2] = {0, 0};
 #pragma unroll
     for (int i = 0; i < CHUNK; ++i) {
@@ -1540,6 +1614,60 @@ __device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap& map, i
 constexpr int K_TILE_BYTES = KEYS_PER_TILE * K8_STRIDE;  // a box of 144 bytes × KEYS_PER_TILE rows
 constexpr int V_TILE_BYTES = UNICA_V_PAIRS ? KEYS_PER_TILE / 2 * V8_STRIDE : KEYS_PER_TILE * K8_STRIDE;
 
+// M4.25: the part of P·V of a head's V_OUTLIERS keys with the largest max |v|, which quantize_v left out of V8 (zero
+// rows; the channel scales come from the other keys). In the loop their P̂ went into the denominator as any key's; here,
+// once, their P against the final row max is added into out, exactly: P = 255 · 2^(x − m) with x their INT8 score as
+// the loop computes it, times their V row over the channel scale (out_v, float). out_idx: [heads][V_OUTLIERS] keys
+// (−1: none); out_v: [heads][V_OUTLIERS][HEAD_DIM]. Lane l scores row l % 16 against keys l / 16, + 2, ... with IDP4A
+// on Q8 in shared memory and K8 in global memory; the out update takes each row's P from there by shuffles.
+// In Z-Image two tokens (positions 1 and 2 of 4128, likely attention sinks) set every channel's scale (M4.24).
+#ifndef UNICA_V_OUTLIERS
+#define UNICA_V_OUTLIERS 0
+#endif
+__device__ __forceinline__ void add_v_outliers(float out[D_BLOCKS][4], const float row_max[2], const int8_t* q_tile,
+                                               const int8_t* K8, const int* out_idx, const float* out_v,
+                                               const float* k_scale, float q_scale_log2, int n_keys, int lane) {
+    constexpr int T = UNICA_V_OUTLIERS > 0 ? UNICA_V_OUTLIERS : 1;
+    constexpr int MINE = (T + 1) / 2;
+    const int row = lane % 16;
+    // the final max of `row`: lane 4 · (row % 8) holds it, in row_max[0] for rows 0..7 and row_max[1] for 8..15
+    const float max0 = __shfl_sync(0xffffffff, row_max[0], 4 * (row % 8));
+    const float max1 = __shfl_sync(0xffffffff, row_max[1], 4 * (row % 8));
+    const float m = row < 8 ? max0 : max1;
+    const int* keys = out_idx + size_t(blockIdx.y) * T;
+    float p[MINE];
+#pragma unroll
+    for (int i = 0; i < MINE; ++i) {
+        const int t = lane / 16 + 2 * i;
+        const int key = t < T ? keys[t] : -1;
+        p[i] = 0.0f;
+        if (key >= 0) {
+            const int* q_row = reinterpret_cast<const int*>(q_tile + row * K8_STRIDE);
+            const int* k_row = reinterpret_cast<const int*>(K8 + (size_t(blockIdx.y) * n_keys + key) * HEAD_DIM);
+            int dot = 0;
+#pragma unroll 8
+            for (int c = 0; c < HEAD_DIM / 4; ++c) dot = __dp4a(q_row[c], __ldg(k_row + c), dot);
+            const float x = __int2float_rn(dot) * q_scale_log2 * k_scale[key / K_SCALE_BLOCK];
+            p[i] = exp2f(x - m + LOG2_255);
+        }
+    }
+    const int g = lane / 4, col = 2 * (lane % 4);
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+        const float p_g = __shfl_sync(0xffffffff, p[t / 2], g + 16 * (t % 2));
+        const float p_g8 = __shfl_sync(0xffffffff, p[t / 2], g + 8 + 16 * (t % 2));
+        const float* v_row = out_v + (size_t(blockIdx.y) * T + t) * HEAD_DIM;
+#pragma unroll
+        for (int block = 0; block < D_BLOCKS; ++block) {
+            const float2 w = __ldg(reinterpret_cast<const float2*>(v_row + block * MMA_N + col));
+            out[block][0] = fmaf(p_g, w.x, out[block][0]);
+            out[block][1] = fmaf(p_g, w.y, out[block][1]);
+            out[block][2] = fmaf(p_g8, w.x, out[block][2]);
+            out[block][3] = fmaf(p_g8, w.y, out[block][3]);
+        }
+    }
+}
+
 // M3.17: attention_int8pv_pipe with its tiles copied by TMA. One thread issues each tile and announces its
 // bytes on an mbarrier; every thread waits on the barrier, none computes an address. The boxes are 16 bytes
 // wider than a row of K8 or V8, so the tiles land with the padded stride the ldmatrix addressing expects.
@@ -1550,6 +1678,7 @@ constexpr int V_TILE_BYTES = UNICA_V_PAIRS ? KEYS_PER_TILE / 2 * V8_STRIDE : KEY
 extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
     attention_int8pv_tma(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
                          const int8_t* Q8, const float* q_scale, const float* k_scale, const float* v_scale,
+                         const float4* v_token, const int8_t* K8, const int* out_idx, const float* out_v,
                          __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2, TokenLayout o_layout) {
     __shared__ __align__(128) int8_t k_tiles[2][K_TILE_BYTES];
     __shared__ __align__(128) int8_t v_tiles[2][KEYS_PER_TILE * K8_STRIDE];
@@ -1627,15 +1756,25 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
 
         TRACE_MARK(slot, lane, t, 0);
         float alpha[2], beta[2];
+        [[maybe_unused]] float4 tok[KEY_BLOCKS];
+        if constexpr (UNICA_V_TOKEN) {  // from L2: every block of the head reads the same; issued before Q·Kᵀ(t + 1)
+            const float4* pairs = v_token + (size_t(blockIdx.y) * v8_tokens(n_keys) + key0 + col) / 2;
+#pragma unroll
+            for (int block = 0; block < KEY_BLOCKS; ++block) tok[block] = __ldg(pairs + block * MMA_N / 2);
+        }
         qk_scores_int8_q_smem(scores[later], q_tiles[warp], k_tiles[later], lane);  // stale in the last iteration
-        online_softmax_u8(scores[now], row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
+        if constexpr (UNICA_V_TOKEN)
+            online_softmax_u8_token(scores[now], row_max, row_sum, alpha, beta,
+                                    q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], tok);
+        else
+            online_softmax_u8(scores[now], row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
         TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
         TRACE_MARK_AFTER(slot, lane, t, 2, __float_as_uint(beta[0]) ^ __float_as_uint(beta[1]));
         uint32_t p[PV8_STEPS][4];
 #pragma unroll
         for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
         TRACE_MARK_AFTER(slot, lane, t, 3, p[0][0] ^ p[0][1] ^ p[0][2] ^ p[0][3] ^ p[1][0] ^ p[1][1] ^ p[1][2] ^ p[1][3]);
-        add_row_sum_u8(row_sum, p, alpha, beta);
+        if constexpr (!UNICA_V_TOKEN) add_row_sum_u8(row_sum, p, alpha, beta);
         pv_int8<UNICA_V_PAIRS>(out, p, v_tiles[now], alpha, beta, lane);
 
         const int next_valid = n_keys - key0 - KEYS_PER_TILE;  // ≤ 0 in the last iteration: all masked
@@ -1649,6 +1788,8 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     }
     if (t < n_tiles) iteration(t, Parity<0>{});
 
+    if constexpr (UNICA_V_OUTLIERS > 0) add_v_outliers(out, row_max, q_tiles[warp], K8, out_idx, out_v, k_scale, q_scale_log2,
+                                                       n_keys, lane);
     store_out(O + o_layout.offset(blockIdx.y, row0), out, row_sum, row, col, n_rows, v_scale, o_layout.token);
 }
 

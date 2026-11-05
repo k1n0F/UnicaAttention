@@ -188,6 +188,9 @@ def emulate(
     v_outer=None,
     p_pow2=False,
     smooth_q=None,
+    v_token=None,
+    v_group=1,
+    v_outliers=0,
 ):
     """Tiled online-softmax attention, the way the kernel computes it.
 
@@ -220,6 +223,14 @@ def emulate(
     smooth_q  None | "head" | n: subtract the mean of Q over the head's queries ("head") or over each block of n
               queries before quantizing it, and add q̄ · k back to the scores, exactly (float, unquantized k): it
               varies along the keys, so softmax does not cancel it. With "head" it is one vector per key (M4.20)
+    v_token   None | "rounded" | "float": V (v_fmt) with one scale s_j per token over its channels instead of one per
+              channel, folded into P as log2 s_j added to key j's scores, so P' = p · s_j goes into the MMA; the
+              denominator weighs P' back by 1 / s_j, summing it rounded (as sum_rounded) or in float before rounding
+              (M4.22: V's outlier tokens in Z-Image)
+    v_group   with v_token: one scale per group of this many neighbouring keys instead of per key (M4.24)
+    v_outliers  T: the T keys of each head with the largest max |v| leave V before it is quantized (the channel
+              scales come from the others); in the loop their P̂ still goes into the denominator, and their part of
+              P·V is added once at the end, exactly, from their scores against the final max (M4.25)
     """
     q, k, v = q.float(), k.float(), v.float()
     if smooth_k:
@@ -253,11 +264,26 @@ def emulate(
         order = torch.arange(-(-n // 64) * 64, device=q.device).view(-1, 64)[:, FP4_SLOT_KEY.to(q.device)].flatten()
         k, sk, v, k_exact = (F.pad(x, (0, 0, 0, len(order) - n))[..., order, :] for x in (k, sk, v, k_exact))
         key_valid = order < n
+    outliers = None
+    if v_outliers:  # the top tokens of each head by max |v| leave V, before its channel scales are taken
+        picked = v.abs().amax(-1).topk(min(v_outliers, v.shape[-2]), -1).indices  # [..., T]
+        rows = picked[..., None].expand(*picked.shape, v.shape[-1])
+        outliers = (picked, v.gather(-2, rows))
+        v = v.scatter(-2, rows, 0.0)
     if v_fmt in FP4_BLOCK:  # scales per channel and block of keys, the axis P·V sums over
         v_parts, sv = [block_scaled(v, v_fmt, -2, v_outer)], 1.0
         if v_terms == 2:
             v_parts.append(block_scaled(v - v_parts[0], v_fmt, -2, v_outer))
         v = torch.stack(v_parts)  # [terms, ...]
+    elif v_fmt and v_token:  # one scale per token instead, folded into P: P' = p · s_j, as log2 s_j added to the scores
+        amax = v.abs().amax(-1, keepdim=True)  # [..., keys, 1]
+        if v_group > 1:  # one scale per group of v_group neighbouring keys
+            n = amax.shape[-2]
+            amax = F.pad(amax, (0, 0, 0, -n % v_group)).unflatten(-2, (-1, v_group)).amax(-2, keepdim=True)
+            amax = amax.expand(*amax.shape[:-2], v_group, 1).flatten(-3, -2)[..., :n, :]
+        s_tok = (amax / QMAX[v_fmt]).clamp_min(1e-12)
+        v, sv = to_fmt(v / s_tok, v_fmt), 1.0
+        log_s, inv_s = torch.log2(s_tok)[..., 0], 1.0 / s_tok[..., 0]  # [..., keys]
     elif v_fmt:
         sv = (v.abs().amax(-2, keepdim=True) / QMAX[v_fmt]).clamp_min(1e-12)
         v = to_fmt(v / sv, v_fmt)
@@ -280,6 +306,8 @@ def emulate(
         s = (q @ kt) * (sq * skt) * scale
         if q_mean is not None:
             s = s + (q_mean @ k_exact[..., j : j + bc, :].transpose(-1, -2)) * scale
+        if v_token:  # every P below is P'; the denominator weighs it back by 1 / s_j
+            s = s + log_s[..., None, j : j + bc]
         if key_valid is not None:
             s = s.masked_fill(~key_valid[j : j + bc], -torch.inf)
         m_new = torch.maximum(m, s.amax(-1, keepdim=True))
@@ -297,6 +325,8 @@ def emulate(
                 stats["pairs"] = stats.get("pairs", 0) + blocks.numel()
         p = torch.exp2(s - m_p)
         row_sum = p.sum(-1, keepdim=True)  # the kernel sums P in FP32, before quantizing it
+        if v_token:
+            row_sum = (p * inv_s[..., None, j : j + bc]).sum(-1, keepdim=True)
         p = p * p_mul
         p_parts = [p]
         if p_fmt in FP4_BLOCK:  # blocks of keys inside the tile
@@ -307,7 +337,9 @@ def emulate(
         elif p_fmt:
             p = p_parts[0] = to_fmt(p, p_fmt)
         if sum_rounded:
-            row_sum = p.sum(-1, keepdim=True) / p_mul
+            weights = inv_s[..., None, j : j + bc] if v_token == "rounded" else 1.0
+            if v_token != "float":
+                row_sum = (p * weights).sum(-1, keepdim=True) / p_mul
         l = l * alpha + row_sum * beta * keep
         vt = v[..., j : j + bc, :]
         if len(p_parts) > 1 or len(vt) > 1:
@@ -322,6 +354,11 @@ def emulate(
         else:
             inner = p @ vt[0]
         m, o = m_new, o * alpha + inner * beta * keep
+    if outliers is not None:  # their part of P·V, exactly, against the final max; their P̂ is already in l
+        picked, v_out = outliers
+        rows = picked[..., None].expand(*picked.shape, k.shape[-1])
+        s_out = (q @ k.gather(-2, rows).transpose(-1, -2)) * (sq * sk.gather(-2, picked[..., None]).transpose(-1, -2)) * scale
+        o = o + (torch.exp2(s_out - m) * p_mul) @ (v_out / sv)
     o = o * (sv / p_mul) / l + v_mean
     if overflow:
         print("  FP16 accumulator overflowed")

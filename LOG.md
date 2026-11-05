@@ -2479,6 +2479,327 @@ pairs, the prompt changed by one word against the cache; the kernels themselves,
 `BIAS_CHUNK=32`, bulk copies), with or without `fuse_rope`. 57.3 ms against SageAttention 3's 62.7 ms at 34 020
 (−8.6 %), real WAN 7.45 % against 8.65 %. The accurate mode's baseline stays baseline 1.
 
+## M4.22 — beyond WAN: four more models in ComfyUI
+
+**The question:** does the kernel carry over to other models? It needs head size 128, self-attention without a mask,
+and long sequences (it wins from ~4K tokens). Installed and fitting: LTX-2.3 22B (video + audio), Qwen-Image-Edit 2511,
+Z-Image Turbo, Moss (all DiTs with heads of 128, `comfy/model_detection.py`). The native node goes through
+`optimized_attention_override`, which every ComfyUI model uses, so no model-specific code.
+
+**The node, on the way** (each found by a run, `build/attention_errors_models.csv`, column `tag` per model):
+- It logs why it passes a call on (first time per reason, with the shapes) and counts the routes per run (`routes`).
+- **Run 1: no model reached the kernel**, all "positional arguments": these models pass `heads` (and `mask`, ...) by
+  position, WAN by name. The override now reads ComfyUI's signature (`heads, mask, attn_precision, skip_reshape,
+  skip_output_reshape`) either way.
+- **Run 2: Z-Image and Moss crashed** in the measurement count: Lumina's context refiners call attention with sigmas but
+  no block index, which reset the step to None. Such calls are no longer counted.
+- `build/dumps.flag`: while it exists, every measured call also saves its q, k, v, to take an error apart offline.
+
+**Hypothesis:** the accurate mode below SageAttention 2 and the fast mode (Q smoothed per 512) below SageAttention 3 in
+most blocks, as on WAN; the smoothing gains less on images with text and image tokens joined.
+
+**Result** (medians of rel L2 against FP32; the kernels themselves, which match the emulator to 0.001 points):
+
+| model | calls to the kernel | tokens | accurate / SA2 | below SA2 | fast / SA3 | below SA3 |
+|---|---|---|---|---|---|---|
+| LTX-2.3 | 520 of 3115 (cross-attention and the audio part's heads of 64 go on) | 3 520, 14 080 | **0.50 / 0.64 %** | 20 / 20 | **3.72 / 4.24 %** | 18 / 20 |
+| Qwen-Image-Edit | 240 of 240 | 8 393 | **1.50 / 1.81 %** | 19 / 20 | **11.05 / 12.41 %** | 20 / 20 |
+| Moss | 2640 of 2640 | 3 850, 3 874 | **1.31 / 2.08 %** | 40 / 40 | **11.70 / 13.24 %** | 40 / 40 |
+| **Z-Image** | 1626 of 1626 | 4 128 | **9.12 / 2.33 %** | **12 / 68** | 13.65 / 15.36 % | 62 / 68 |
+
+(Z-Image: two runs of 34 measured calls, the second with the dumps.)
+
+- Three models of four behave like WAN: the accurate mode 16–38 % below SageAttention 2, the fast mode 10–20 % below
+  SageAttention 3. The smoothing per 512 works on images too (hypothesis on joined text and image: refuted, it gains as
+  much). Without it FP4 both would beat SageAttention 3 in 8 / 20, 3 / 20 and 18 / 40 calls only.
+- LTX's two fast-mode losses (3.55 against 3.25 %, 3.49 against 3.23 %) sit in calls with outlier channels in Q
+  (channel spread 10.4 and 6.7 against the usual 2–3).
+- **Z-Image breaks the accurate mode**: 9.1 % median, up to 36.8 %, 4.75× SageAttention 2.
+
+**Z-Image taken apart** (the dumps, emulator, one part exact at a time; call 168, the worst):
+
+| variant | error |
+|---|---|
+| today (kernel = emulator) | 36.77 % |
+| exact Q·Kᵀ / exact P | 36.74 / 36.58 % |
+| **exact V** | **4.08 %** |
+| V in FP8 | 4.21 % |
+
+**V has outlier tokens**: a token's largest |v| is 65–249× the median token's in the bad blocks (2–4× in the good
+ones). INT8 V has one scale per channel over all keys, set by the outliers, and the other tokens get a few of its 127
+steps. SageAttention 2's FP8 V has relative precision and does not care. The FP4 path (V block-scaled per 16 keys in
+e4m3) holds too: the fast mode is still below SageAttention 3 there.
+
+**Options, emulated on Z-Image's 34 dumped calls** (SageAttention 2: median 2.33 %):
+
+| V | median | max | below SA2 |
+|---|---|---|---|
+| INT8, scale per channel (today) | 9.12 % | 36.77 % | 6 / 34 |
+| INT8, scale per channel and 1024 / 256 / 64 keys | 7.02 / 6.35 / 6.22 % | 21.3 / 19.8 / 19.4 % | 6 / 34 |
+| P and V in FP8 (SageAttention 2's formats) | 1.59 % | 3.63 % | 33 / 34 |
+| exact V, FP16 P·V (`attention_int8qk`) | 0.98 % | 2.74 % | 34 / 34 |
+| **INT8 per token, the scale folded into P (P' = p · s_j), P' u8 per tile of 64** | **0.44 %** | **0.76 %** | **34 / 34** |
+
+(The last row is a plain model with an exact Q·Kᵀ, so it misses INT8 Q·Kᵀ's share, ~0.2–0.3 points in the good blocks.)
+
+- Scales per block of keys do not help: the outliers are everywhere, not a few tokens.
+- **A scale per token, folded into P**, does: V8_j = v_j / s_j and P'_ij = p_ij · s_j give the same P·V, and P' is
+  already quantized per tile against its own max. Folding s_j into P is adding log2 s_j to key j's score before the
+  exponential: per key, the same for every query, which is what M4.21's accumulator start does. The open part is the
+  softmax denominator: Σ p_j is no longer Σ P̂'_j. To be designed.
+
+**The idea: a low v_offset itself says that V's centring and scaling do not suit these blocks** (Spearman between
+`v_offset` and unica / SA2: Z-Image −0.86, Qwen −0.43, Moss +0.35, LTX +0.30, WAN +0.15). Tested against the outlier
+explanation on the 34 dumps, with one plain model for every variant (Q·Kᵀ exact, P u8 per tile of 64 as the kernel,
+only V changes; today's accurate mode does not centre V at all):
+
+| V | median | max | below SA2 | ρ(v_offset, error / SA2) |
+|---|---|---|---|---|
+| a: int8 per channel (today) | 9.04 % | 36.8 % | 6 / 34 | −0.86 |
+| b: minus the channel mean, added back | 9.92 % | 42.3 % | 6 / 34 | −0.90 |
+| c: minus the mean per channel and 64 keys | 10.84 % | 44.0 % | 6 / 34 | −0.91 |
+| e: clamped to the 99.9th percentile | 8.29 % | 37.3 % | 6 / 34 | −0.40 |
+| **d: int8 per token, scale in P** | **0.44 %** | **0.76 %** | **34 / 34** | +0.75 |
+| d after b's centring | 0.36 % | 0.67 % | 34 / 34 | +0.85 |
+
+- v_offset and the outlier ratio go together almost perfectly (ρ = −0.96): v_offset is the channel means' RMS over
+  V's RMS, and outlier tokens inflate the denominator. **Held fixed against each other, v_offset keeps nothing**
+  (partial ρ +0.10), **the outliers keep it** (partial ρ +0.60).
+- Centring makes it worse (b, c), clamping barely helps (e: the outliers are signal, attended to); a scale per token
+  fixes it, and what is left grows with v_offset instead (+0.75: the good blocks keep their ~0.7 %).
+- Synthetic, on the best call (block 5, 0.88 %): the channel means removed (v_offset 0.34 → 0.00) leave 0.89 %; 1 % of
+  the tokens scaled ×100 around the mean (v_offset falls to 0.04 by itself) give 5.98 %, and d keeps 0.71 % on both.
+- The other models' lowest v_offset calls (0.17–0.23) sit at unica / SA2 0.56–0.94: a low v_offset alone does no harm.
+- So the idea pointed at the right blocks: a low v_offset is the symptom (cheap to compute, a usable detector), the
+  outlier tokens are the cause, and centring is not the cure.
+
+## M4.23 — V with one scale per token in the accurate mode (V_TOKEN=1)
+
+**Decision:** replace the per-channel V scale, with a way back (`TILE["V_TOKEN"]`, the native node's `v_scale`).
+
+**What it attacks:** the error from V's outlier tokens (M4.22), not speed. V8_j = round(v_j / s_j), s_j = max |v_j| / 127
+over the token's channels; s_j goes into P as log2 s_j added to key j's score, so P' = p · s_j is quantized against
+its own tile max and every V row keeps its 127 steps. The denominator Σ p = Σ P' / s_j cannot stay on IDP4A (8-bit
+weights 1 / s_j would span the outliers' ~250×): it is summed in float before rounding.
+
+**Emulator first** (`emulate(v_token=...)`, today's accurate kernel otherwise):
+
+| | Z-Image, median | max | below SA2 | random 4 × 4096 |
+|---|---|---|---|---|
+| per channel (today) | 9.12 % | 36.8 % | 6 / 34 | 1.697 % |
+| per token, Σ P̂' / s_j | 1.21 % | 2.83 % | 33 / 34 | 1.604 % |
+| **per token, Σ P' / s_j in float** | **1.10 %** | **2.80 %** | **34 / 34** | **1.604 %** |
+
+**Pieces:** `quantize_v(per_token=True)` (the 16 lanes of a token find its max by xor shuffles; per pair of keys a
+float4 {log2 s, log2 s, 1 / s, 1 / s}, zeros past the keys; the per-channel scale becomes ones and its `aminmax` pass
+goes); `online_softmax_u8_token` (x = s · scale + log2 s_j, the tile max over x, P' = 255 · 2^(x − max), the
+denominator FFMA'd with 1 / s_j); the 8 float4 per tile read straight from L2 (every block of a head reads the same, so
+no copy: M4.21's lesson). `tests/test_v_token.py`: the kernel is the emulator to the third decimal, random and with
+outlier tokens, and in the caller's layout. On Z-Image's 34 dumped calls, the kernel itself: **median 1.10 %, max
+2.80 %, below SageAttention 2 in 34 of 34** (per channel 9.12 / 36.8 %, 6 of 34).
+
+**Hypothesis (before measuring):** +~56 instructions per tile (a FFMA per element for log2 s_j, one for the
+denominator, IDP4A gone) and 8 LDG.128: kernel **+8…+12 %**; quantization **−~0.3 ms** (no `aminmax`); whole call at
+34 020 **+6…+9 ms**.
+
+**Machine code:** the loop 642 → 721 instructions per tile (+79: FADD +32, FFMA +32, LDG +8, IDP4A −8, the rest
+addressing); **registers 235 → 255 with 12 / 16 bytes of spills**.
+
+**Result** (one shape per process, 6 alternating rounds):
+
+| | 32 760 | 34 020 | hypothesis |
+|---|---|---|---|
+| SageAttention 2 | 67.66 ms | 74.06 ms | |
+| per channel | 71.60 ms (+5.8 % vs SA2) | 76.97 ms (+3.9 %) | |
+| **per token** | **79.79 ms (+17.9 %)** | **86.19 ms (+16.4 %)** | |
+| kernel | +7.78 ms (+11.1 %) | +7.85 ms (+10.3 %) | +8…+12 %: **held** |
+| quantization | −0.36 ms | −0.39 ms | −0.3 ms: **held** |
+| whole call | +8.19 ms | +9.21 ms | +6…+9 ms: at the top, 34 020 a little over |
+
+- Better everywhere on error (random 1.70 → 1.60 %, Z-Image 9.1 → 1.1 %), **11 % slower in the kernel**: by the accurate
+  mode's rule (speed against SageAttention 2 at the same error) not a win, so baseline 1 stays per channel and
+  `TILE["V_TOKEN"]` stays 0; the native node runs per token by default, as decided, and per channel with `v_scale`.
+- Where the time goes, for later: the FADD per element (x + offset before ex2), the denominator's FFMA, the 255
+  registers. A cheaper variant would keep the per-channel path and switch per call or per layer on a detector
+  (v_offset or the outlier ratio, M4.22).
+
+**On the five models in ComfyUI** (ComfyUI app's agent; `build/attention_errors_v_scale.csv` has both accurate
+kernels in every row; medians and the worst call):
+
+| model | per channel | **per token** | SageAttention 2 | per token below SA2 | below per channel |
+|---|---|---|---|---|---|
+| Z-Image | 7.95 % (35.86) | **1.05 % (2.99)** | 2.07 % (4.15) | 34 / 34 | 34 / 34 |
+| WAN 2.2 | 0.92 % (1.63) | **0.78 % (1.57)** | 1.51 % (2.33) | 22 / 22 | 22 / 22 |
+| Moss | 1.32 % (1.87) | **1.10 % (1.60)** | 2.08 % (2.56) | 40 / 40 | 32 / 40 |
+| Qwen-Image-Edit | 1.50 % (2.28) | **1.15 % (2.01)** | 1.81 % (2.63) | 20 / 20 | 20 / 20 |
+| LTX-2.3 | 0.50 % (1.42) | **0.47 % (1.36)** | 0.63 % (1.69) | 20 / 20 | 17 / 20 |
+
+A whole render (measure_every 0, one run each, warm model, ±1 s): WAN 47.9 → 49.7 s (+3.8 %), LTX 38.9 → 40.5 s
+(+4.1 %), Z-Image 11.2 → 11.1 s, Moss 10.0 → 10.1 s, Qwen 4.7 → 4.7 s.
+
+- Per token is below SageAttention 2 in **every** measured call of all five models (136 of 136), at 0.59–0.80 of its
+  error, and below the per-channel kernel in 125 of 136: the outliers are Z-Image's extreme, but every model has some.
+- The kernel's +11 % is +4 % of a whole render on the video models and within the noise on the image ones, whose
+  sequences (4–8K tokens) leave attention a smaller share.
+- **Another bug of the measurement, found by this run:** M4.22's fix for Lumina skipped every call without a block
+  index, and LTX numbers none: no LTX row at all. Calls without one are now skipped only in a model that numbers blocks
+  elsewhere (`Measurement.numbered`), and LTX is counted call by call again; tested.
+
+## M4.24 — "Adaptive V Scale Grouping", and where V's outliers sit
+
+**The idea:** the per-channel error comes mostly from a few tokens with extreme V, so neighbouring tokens could share a
+scale in small groups: most of per token's precision with fewer scaling operations.
+
+**Cost first, from the kernel's structure:** M4.23's +11 % are per element of P (log2 s_j added to a score, the
+denominator weighed by 1 / s_j), and a lane goes through each of its elements whatever the group size: a group below a
+tile (64 keys) saves nothing. A group of 64 is free (the scale folds into the tile's beta, IDP4A stays).
+
+**Accuracy against g** (emulator, `v_group`, Z-Image's 34 dumped calls; SageAttention 2 2.33 %):
+
+| g | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| median | 1.10 % | 2.05 % | 2.18 % | 4.01 % | 6.03 % | 10.16 % | 10.27 % |
+| below SA2 | 34 | 16 | 16 | 10 | 8 | 6 | 6 |
+
+Grouping breaks at g = 2 already, and the free g = 64 is as bad as per channel: the idea in this form is **refuted**.
+
+**Why, and what the idea pointed at:** the outliers are not ~1 % of the tokens. In Z-Image they are **two tokens,
+positions 1 and 2 of 4128**, the top of every head in 28 of 34 calls (the sequence starts with the caption: likely
+attention sinks); their neighbours are text that the queries look at, so sharing their scale costs much. The
+adaptive form of the idea: take the top-T tokens of a head by max |v| out of INT8 (the channel scales from the other
+tokens, their V8 rows zero) and add their part of P·V exactly, once, after the loop, with the final row max. The main
+loop stays today's per-channel one.
+
+| (emulator) | Z-Image | WAN | Moss | Qwen-Image-Edit | LTX-2.3 |
+|---|---|---|---|---|---|
+| a token's max / median \|v\| | 65–249 | 2.2–5.9 | 3.3–6.8 | 2.1–7.2 | 2.1–5.4 |
+| per channel | 9.12 % | 0.91 % | 1.32 % | 1.50 % | 0.50 % |
+| top 2 out | **1.14 %** | 0.90 % | 1.25 % | 1.50 % | 0.48 % |
+| top 8 out | **1.12 %** | 0.90 % | 1.21 % | 1.46 % | 0.46 % |
+| top 32 out | | 0.90 % | 1.19 % | 1.30 % | 0.43 % |
+| per token (M4.23) | 1.10 % | 0.76 % | 1.10 % | 1.15 % | 0.48 % |
+| SageAttention 2 | 2.33 % | 1.51 % | 2.08 % | 1.81 % | 0.63 % |
+
+(other models: the dumps of M4.23's runs, 22 / 40 / 20 / 20 calls; their top tokens move from call to call.)
+
+- **Two mechanisms.** Z-Image has a couple of extreme tokens: taking 2–8 out gives per token's accuracy for ~nothing in
+  the loop. The other models have no extreme tokens (2–7×), and per token's 15–23 % there come from the spread of all
+  tokens' sizes: taking tokens out barely moves them (WAN 0.91 → 0.90 %).
+- So the choice is between: per channel + top-T out (Z-Image fixed, the rest as today, below SageAttention 2 already;
+  cost: a tail after the loop, ~1 tile in ~530, and a top-T in the quantization), and per token (every model 15–23 %
+  better, +11 % kernel, +4 % of a video render).
+
+## M4.25 — V's largest keys out of INT8 (V_OUTLIERS=T)
+
+**Decision:** both mechanisms ("we have two modes anyway"): the native node's `v_scale` gets `outliers` next to
+`per_token` (still the default) and `per_channel` (the way back).
+
+**Pieces:**
+- `emulate(v_outliers=T)`, as the kernel does it: the T keys of a head with the largest max |v| are zeroed in V before
+  its channel scales are taken; in the loop their P̂ goes into the denominator like any key's; after the loop their part
+  of P·V is added, 255 · 2^(x − m) with x their INT8 score and m the final row max, times their V row over the scale.
+  Z-Image's dumps: 1.17 % median for T = 2 … 8 (34 / 34 below SageAttention 2).
+- `unica.v_outliers`: the keys by a per-token max (`aminmax` over the channels, no copy of V) and the channel scale of
+  the others, exact: `block_stats` (rope_stats' partials, per 256 keys) for every block, and the ≤ T blocks that hold an
+  outlier taken again from their own rows. `quantize_v(skip=...)` writes the outliers' rows as zeros.
+- `add_v_outliers`, after the loop: lane l scores row l % 16 against keys l / 16, + 2, ... with IDP4A on Q8 in shared
+  memory and K8 in global memory (the loop's score exactly), and adds P · v into its 32 columns, each row's P by shuffles.
+- `tests/test_v_token.py`: the scale bit for bit the emulator's; the kernel the emulator's to the third decimal (two
+  "sink" tokens ×200: 12.9 → 1.34 %).
+
+**Hypothesis (before measuring):** the loop not changed by one instruction, the tail ~1000 instructions once per warp
+against ~340 000 in the loop: kernel **+0.2…0.5 %**; one more pass over V and a few small ops: quantization
+**+0.4…0.6 ms**; whole call at 34 020 **+0.5…1 ms** (per token: +9 ms).
+
+**Machine code:** the loop 1284 instructions per two tiles either way (99 lines differ by register names); registers
+235 → 238, no spills; the tail +904 static instructions.
+
+**Result** (one shape per process, 6 alternating rounds):
+
+| | 32 760 | 34 020 | hypothesis |
+|---|---|---|---|
+| kernel | +0.14 ms (+0.2 %) | −1.10 ms (−1.4 %, noise) | +0.2…0.5 %: **held** |
+| quantization | +0.99 ms | +1.01 ms | +0.4…0.6 ms: **missed** (2×: the torch steps, topk, the blocks' gather, scatter, are ~5 more launches) |
+| whole call | +1.52 ms (+2.1 %) | +2.39 ms (+3.1 %) | +0.5…1 ms: missed, with the quantization |
+| per token, for comparison | +8.08 ms | +9.47 ms | |
+
+The kernel itself on Z-Image's 34 dumped calls: per channel 9.12 % (max 36.8), **outliers T = 2 / 8: 1.17 % (max
+3.23 / 2.98)**, per token 1.10 % (2.80); all three of the latter below SageAttention 2 in 34 of 34.
+
+- `outliers` costs ~1 ms per call, a fifth of per token's ~9 ms, and fixes the model with extreme tokens; per token stays
+  the more accurate one on every model. The quantization's extra 1 ms can come down by folding the per-token max into
+  block_stats' pass and the block recount into one small kernel.
+
+**On the five models in ComfyUI** (ComfyUI app's agent; `build/attention_errors_v_modes.csv`, the three accurate modes
+in every row; medians (max), and the calls below SageAttention 2):
+
+| model | per channel | outliers | per token | SageAttention 2 | below SA2: outliers / per token |
+|---|---|---|---|---|---|
+| Z-Image | 7.95 % (35.86) | 1.11 % (3.23) | **1.05 % (2.99)** | 2.07 % | 34 / 34, 34 / 34 |
+| WAN 2.2 | 0.92 % (1.63) | 0.92 % (1.62) | **0.78 % (1.57)** | 1.51 % | 20 / 22, 22 / 22 |
+| Moss | 1.32 % (1.87) | 1.23 % (1.65) | **1.10 % (1.60)** | 2.08 % | 40 / 40, 40 / 40 |
+| LTX-2.3 | 0.50 % (1.20) | 0.49 % (1.20) | **0.48 % (1.15)** | 0.63 % | 18 / 20, 20 / 20 |
+| Qwen-Image-Edit | 1.50 % (2.28) | 1.46 % (2.27) | **1.15 % (2.01)** | 1.81 % | 19 / 20, 20 / 20 |
+
+A whole render, two rounds, warm model (s): per channel / outliers / per token
+
+| | per channel | outliers | per token |
+|---|---|---|---|
+| WAN | 48.3 / 48.3 | 48.4 / 48.2 (+0.0) | 49.7 / 49.6 (+1.4, +2.9 %) |
+| Z-Image | 11.0 / 10.9 | 11.5 / 11.5 (+0.5, +5 %) | 11.0 / 11.0 (+0.0) |
+| Moss | 10.0 / 10.1 | 10.7 / 10.7 (+0.7, +7 %) | 10.1 / 10.1 (+0.0) |
+| Qwen-Image-Edit | 4.7 / 4.7 | 4.7 / 4.8 | 4.7 / 4.7 |
+| LTX-2.3 | 35.9 / 45.4 | 35.8 / 37.0 | 41.4 / 37.5 (±5 s of noise: no conclusion) |
+
+- **The costs run the other way round on images.** `outliers` adds a fixed ~0.3 ms per call (~12 small launches of its
+  quantization: top-k, the blocks' gather, the masks), which the image models' ~1 700–2 500 short calls (~4K tokens)
+  multiply into +5–7 %, while per token's +11 % of a short kernel disappears there. On WAN's long calls it is the other
+  way: `outliers` free, per token +2.9 %.
+- **Per token is the more accurate everywhere** and the only one below SageAttention 2 in every call (136 / 136,
+  `outliers` 131 / 136). `outliers` matches it only on Z-Image, an image model, where per token costs nothing.
+- So, on these five models, **per token is the default to keep**; `outliers` earns its place only on a long-sequence
+  model with extreme tokens (none among these), and only after its quantization is one or two kernels.
+
+## M4.26 — a reproducible bench on the five models
+
+Decision: no more work on `outliers` for now. First a release of what already works on the five models, with numbers
+anyone can reproduce. Until now the runs went through workflows that exist only on this machine. Now
+[bench/comfyui_models.py](bench/comfyui_models.py) runs five self-contained graphs from
+[bench/comfyui/](bench/comfyui/). The graphs fix seeds, prompts, sizes and steps; their models and where they come
+from are in [models.md](bench/comfyui/models.md).
+
+What the run does, per model:
+
+- free ComfyUI's memory;
+- one measured run, which gives the errors of the three V scales on the same calls;
+- three rounds of seven modes, in alternating order:
+  - `off`: ComfyUI's own attention, SDPA without flags;
+  - `sage2`, `sage3`: KJNodes' patch sends every attention call to SageAttention 2 (`auto`) or 3;
+  - `per_channel`, `per_token`, `outliers`: the accurate mode;
+  - `fast`: attention_fp4 with Q smoothed per 512. It is now a `mode` input of the native node, next to `v_scale`.
+
+The time is the median of the three renders, because one LTX render varies by ±5 s. Every CSV row carries the
+environment: the kernel's git version, ComfyUI, torch, CUDA, the driver, the GPU and its power limit.
+
+What was taken out of the studio workflows:
+
+- the SageAttention 3 patch under the node on WAN, so calls the node passes on go to SDPA, not to SA3;
+- Gemma's rewriting of the LTX prompt (time, and a text that could change between runs);
+- the switched-off RIFE and upscaler.
+
+**Trial run** (one round, so the times are single renders):
+
+- The errors match M4.25. Per token is below SageAttention 2 in 135 of 136 calls; the one other is a WAN call, 21/22,
+  with SA3 no longer under the node.
+- The image models are 16–18 % faster than `off` on Z-Image and Qwen. On Moss, the same as SDPA (9.9 vs 10.1 s): there
+  Unica wins on error against SageAttention 2, not on time.
+- WAN: 49.3 s vs 65.6 s.
+- LTX: per_channel +23 % and outliers +35 % against `off`, per token +1.6 %; M4.25 had no such gap. It may be ComfyUI
+  loading weights between renders rather than the kernel; three rounds will tell.
+- ComfyUI crashed once, in its dynamic VRAM (aimdo.dll, 0xc0000005), between LTX's second sampling stage and the
+  decode. It was the first such crash in 14 days, and the same graph passed again. The bench now waits for the
+  restart, loads the models again untimed and goes on, instead of stopping an hour-long run.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

@@ -1,0 +1,332 @@
+{
+ "h1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "wan2.2_i2v_high_noise_14B_nvfp4_mixed.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "H model"
+  }
+ },
+ "h2": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "h1",
+    0
+   ],
+   "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "H lightx2v 4 steps"
+  }
+ },
+ "h4": {
+  "class_type": "ModelSamplingSD3",
+  "inputs": {
+   "model": [
+    "unica0",
+    0
+   ],
+   "shift": 5.0
+  },
+  "_meta": {
+   "title": "H shift @adv @shift:shift"
+  }
+ },
+ "l1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "wan2.2_i2v_low_noise_14B_nvfp4_mixed.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "L model"
+  }
+ },
+ "l2": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "l1",
+    0
+   ],
+   "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "L lightx2v 4 steps"
+  }
+ },
+ "l4": {
+  "class_type": "ModelSamplingSD3",
+  "inputs": {
+   "model": [
+    "unica1",
+    0
+   ],
+   "shift": 5.0
+  },
+  "_meta": {
+   "title": "L shift @adv @shift:shift"
+  }
+ },
+ "1": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+   "type": "wan",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Text encoder"
+  }
+ },
+ "2": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "Wan2.1_VAE.pth"
+  },
+  "_meta": {
+   "title": "VAE"
+  }
+ },
+ "3": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "unica_bench.png"
+  },
+  "_meta": {
+   "title": "@image"
+  }
+ },
+ "4": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "text": "anime girl with long flowing blue hair sitting on a wooden bench by the sea on a sunny day, she smiles and waves at the viewer, hair and dress moving in the wind, waves rolling in",
+   "clip": [
+    "1",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Positive @prompt"
+  }
+ },
+ "5": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+   "clip": [
+    "1",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Negative @adv @negative"
+  }
+ },
+ "12": {
+  "class_type": "ImageScaleToTotalPixels",
+  "inputs": {
+   "image": [
+    "3",
+    0
+   ],
+   "upscale_method": "lanczos",
+   "megapixels": 0.4,
+   "resolution_steps": 16
+  },
+  "_meta": {
+   "title": "Resolution @mp:megapixels{0.25,0.4,0.5,0.8,1.0}"
+  }
+ },
+ "13": {
+  "class_type": "GetImageSize",
+  "inputs": {
+   "image": [
+    "12",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Size"
+  }
+ },
+ "6": {
+  "class_type": "WanImageToVideo",
+  "inputs": {
+   "positive": [
+    "4",
+    0
+   ],
+   "negative": [
+    "5",
+    0
+   ],
+   "vae": [
+    "2",
+    0
+   ],
+   "start_image": [
+    "12",
+    0
+   ],
+   "width": [
+    "13",
+    0
+   ],
+   "height": [
+    "13",
+    1
+   ],
+   "length": 81,
+   "batch_size": 1
+  },
+  "_meta": {
+   "title": "Video @frames:length"
+  }
+ },
+ "7": {
+  "class_type": "KSamplerAdvanced",
+  "inputs": {
+   "model": [
+    "h4",
+    0
+   ],
+   "add_noise": "enable",
+   "noise_seed": 42,
+   "steps": 4,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "6",
+    0
+   ],
+   "negative": [
+    "6",
+    1
+   ],
+   "latent_image": [
+    "6",
+    2
+   ],
+   "start_at_step": 0,
+   "end_at_step": 2,
+   "return_with_leftover_noise": "enable"
+  },
+  "_meta": {
+   "title": "High pass @seed:noise_seed @adv @steps:steps @cfg:cfg @split:end_at_step"
+  }
+ },
+ "8": {
+  "class_type": "KSamplerAdvanced",
+  "inputs": {
+   "model": [
+    "l4",
+    0
+   ],
+   "add_noise": "disable",
+   "noise_seed": 0,
+   "steps": 4,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "6",
+    0
+   ],
+   "negative": [
+    "6",
+    1
+   ],
+   "latent_image": [
+    "7",
+    0
+   ],
+   "start_at_step": 2,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable"
+  },
+  "_meta": {
+   "title": "Low pass @adv @steps:steps @cfg:cfg @split:start_at_step"
+  }
+ },
+ "9": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "8",
+    0
+   ],
+   "vae": [
+    "2",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "10": {
+  "class_type": "CreateVideo",
+  "inputs": {
+   "images": [
+    "9",
+    0
+   ],
+   "fps": 16.0
+  },
+  "_meta": {
+   "title": "Video"
+  }
+ },
+ "11": {
+  "class_type": "SaveVideo",
+  "inputs": {
+   "video": [
+    "10",
+    0
+   ],
+   "filename_prefix": "unica_bench/wan",
+   "format": "auto",
+   "codec": "auto"
+  },
+  "_meta": {
+   "title": "Save @output"
+  }
+ },
+ "unica0": {
+  "class_type": "UnicaAttentionNative",
+  "inputs": {
+   "model": [
+    "h2",
+    0
+   ],
+   "enabled": true,
+   "measure_every": 0,
+   "measure_heads": 2,
+   "fuse_rope": false,
+   "measure_tag": "wan",
+   "v_scale": "per_token"
+  }
+ },
+ "unica1": {
+  "class_type": "UnicaAttentionNative",
+  "inputs": {
+   "model": [
+    "l2",
+    0
+   ],
+   "enabled": true,
+   "measure_every": 0,
+   "measure_heads": 2,
+   "fuse_rope": false,
+   "measure_tag": "wan",
+   "v_scale": "per_token"
+  }
+ }
+}

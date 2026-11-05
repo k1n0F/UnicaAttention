@@ -1,0 +1,143 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "moss\\miaomiaoHaremMOSS_baseV10_int8.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Model @adv @model:unet_name=moss"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3.5_9b_w4a8_gptq.safetensors",
+   "type": "moss_image",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Text encoder"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "flux2-vae_small.safetensors"
+  },
+  "_meta": {
+   "title": "VAE"
+  }
+ },
+ "4": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "text": "masterpiece, best quality, 1girl, long blue hair, sitting on a bench by the sea, sunny day",
+   "clip": [
+    "2",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Positive @prompt"
+  }
+ },
+ "5": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "text": "",
+   "clip": [
+    "2",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Negative @negative"
+  }
+ },
+ "6": {
+  "class_type": "EmptyFlux2LatentImage",
+  "inputs": {
+   "width": 768,
+   "height": 1280,
+   "batch_size": 1
+  },
+  "_meta": {
+   "title": "Size @width:width @height:height @batch:batch_size{1,2,4}"
+  }
+ },
+ "7": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "unica0",
+    0
+   ],
+   "seed": 42,
+   "steps": 30,
+   "cfg": 3.5,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "4",
+    0
+   ],
+   "negative": [
+    "5",
+    0
+   ],
+   "latent_image": [
+    "6",
+    0
+   ],
+   "denoise": 1.0
+  },
+  "_meta": {
+   "title": "KSampler @seed:seed @adv @steps:steps @cfg:cfg @sampler:sampler_name @scheduler:scheduler"
+  }
+ },
+ "8": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "7",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "9": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "8",
+    0
+   ],
+   "filename_prefix": "unica_bench/moss"
+  },
+  "_meta": {
+   "title": "Save @output"
+  }
+ },
+ "unica0": {
+  "class_type": "UnicaAttentionNative",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "enabled": true,
+   "measure_every": 0,
+   "measure_heads": 2,
+   "fuse_rope": false,
+   "measure_tag": "moss",
+   "v_scale": "per_token"
+  }
+ }
+}

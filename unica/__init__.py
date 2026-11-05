@@ -38,9 +38,10 @@ DEFAULT_KERNEL = "attention_int8pv_tma"
 # before rounding (M3.15); V_PAIRS=0 V8 in P's order but unpaired for attention_int8pv_tma (M3.17); TRACE=1
 # records a timeline (bench/timeline.py). SMOOTH_Q=n (attention_fp4, a multiple of STATS_TOKENS) subtracts Q's mean
 # over each block of n queries before quantizing it and adds q̄ · k back exactly (M4.21); BIAS_CHUNK tiles of that q̄ · k
-# per copy.
+# per copy. V_TOKEN=1 (attention_int8pv_tma): V with one scale per token, folded into P (M4.23, V's outlier tokens).
+# V_OUTLIERS=T (attention_int8pv_tma, T ≤ 8): V per channel without each head's T largest keys, added exactly (M4.25).
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
-        "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0, "STAGES": 2, "BULK_COPY": 1, "SMOOTH_Q": 0, "BIAS_CHUNK": 32}
+        "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0, "STAGES": 2, "BULK_COPY": 1, "SMOOTH_Q": 0, "BIAS_CHUNK": 32, "V_TOKEN": 0, "V_OUTLIERS": 0}
 # M4.17: kernels that read q, k, v and write the output in the caller's layout (TokenLayout), e.g. ComfyUI's
 # [batch, tokens, heads, 128] seen as [batch, heads, tokens, 128] through a transpose. The others get contiguous copies.
 LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
@@ -173,13 +174,22 @@ def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str
     # TMA boxes 16 bytes wider than the rows: the tiles land padded, as the kernel's ldmatrix expects
     settings = TILE | tile
     keys, pairs = settings["KEYS_PER_TILE"], settings["V_PAIRS"]
-    v8, v_scale = quantize_v(v, 2 if pairs else 1)
+    null = ctypes.c_void_p(0)
+    v_token, outlier_args = null, (null, null, null)
+    if settings["V_TOKEN"]:  # M4.23: a scale per token, folded into P
+        v8, v_scale, v_token = quantize_v(v, 2 if pairs else 1, per_token=True)
+    elif settings["V_OUTLIERS"]:  # M4.25: per channel without the largest keys, which the kernel adds exactly
+        v8, v_scale, picked, out_v = quantize_v(v, 2 if pairs else 1, outliers=settings["V_OUTLIERS"])
+        outlier_args = (k8, picked, out_v)
+    else:
+        v8, v_scale = quantize_v(v, 2 if pairs else 1)
     k_map = tensor_map_2d(k8, UINT8, HEAD_DIM, k8.numel() // HEAD_DIM, HEAD_DIM, HEAD_DIM + 16, keys)
     if pairs:  # rows of 2 · HEAD_DIM bytes, as uint16 so the box (272 bytes) stays within 256 elements
         v_map = tensor_map_2d(v8, UINT16, HEAD_DIM, v8.numel() // (2 * HEAD_DIM), 2 * HEAD_DIM, HEAD_DIM + 8, keys // 2)
     else:
         v_map = tensor_map_2d(v8, UINT8, HEAD_DIM, v8.numel() // HEAD_DIM, HEAD_DIM, HEAD_DIM + 16, keys)
-    return k_map, v_map, q8, q_scale, k_scale, v_scale  # the maps first: they must be 64-byte aligned
+    # the maps first: they must be 64-byte aligned
+    return k_map, v_map, q8, q_scale, k_scale, v_scale, v_token, *outlier_args
 
 
 QUANTIZE_THREADS = 256  # must match csrc/flash.cu
@@ -207,21 +217,62 @@ def quantize_int8(x: torch.Tensor, mean: torch.Tensor | None, block: int,
 V8_PAD_KEYS = 64  # must match csrc/flash.cu
 
 
-def quantize_v(v: torch.Tensor, layout: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+def v_outliers(v: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """M4.25: the `count` keys of each head with the largest max |v| (int64 [batch, heads, count]), and the per-channel
+    scale of the other keys (float32 [batch, heads, 128]), bit for bit what bench/emulate.py's v_outliers gets after
+    zeroing them. Two passes: a max per token, and block_stats per channel; the ≤ count blocks of 256 keys that hold an
+    outlier are taken again from their own rows, the outliers left out."""
+    low, high = torch.aminmax(v, dim=-1)  # per token, no copy of v
+    keys = torch.maximum(high, -low).float().topk(min(count, v.shape[-2]), -1).indices
+    stats = block_stats(v)
+    amax = torch.maximum(stats[..., 2, :], -stats[..., 1, :])  # [b, h, blocks, 128]
+    blocks = keys // STATS_TOKENS  # [b, h, count]
+    tokens = (blocks[..., None] * STATS_TOKENS + torch.arange(STATS_TOKENS, device=v.device)).clamp_max(v.shape[-2] - 1)
+    rows = v.gather(-2, tokens.flatten(-2)[..., None].expand(-1, -1, -1, v.shape[-1])).unflatten(-2, tokens.shape[-2:])
+    left_out = (tokens[..., None] == keys[..., None, None, :]).any(-1)  # [b, h, count, 256]
+    again = rows.masked_fill(left_out[..., None], 0).float().abs().amax(-2)  # [b, h, count, 128]
+    amax = amax.scatter(-2, blocks[..., None].expand(-1, -1, -1, v.shape[-1]), again)
+    return keys, (amax.amax(-2) / 127).clamp_min(1e-12)
+
+
+def quantize_v(v: torch.Tensor, layout: int = 0, per_token: bool = False,
+               outliers: int = 0) -> tuple[torch.Tensor, ...]:
     """v ≈ v8 · scale with one scale per channel over all tokens of a head: int8 [batch, heads, N, 128] and
     float32 [batch, heads, 128]. d is the axis P·V does not sum over, so the kernel applies the scale once,
     at the end. Bit for bit bench/emulate.py's V quantization. layout 1 and 2 (for attention_int8pv_tma,
     csrc/flash.cu v8_offset) reorder the same bytes and pad each head to whole tiles: [batch, heads, N', 128]
-    with N' = N rounded up to V8_PAD_KEYS."""
+    with N' = N rounded up to V8_PAD_KEYS.
+
+    per_token (M4.23, layouts 1 and 2): one scale per token over its channels instead, for attention_int8pv_tma
+    with V_TOKEN=1, which folds it into P. Returns v8, a scale of ones (nothing left to apply per channel) and
+    float32 [batch, heads, N' / 2, 4]: {log2 s, log2 s, 1 / s, 1 / s} of each pair of keys, zeros past N.
+
+    outliers (M4.25): the per-channel scale without the `outliers` keys of each head with the largest max |v|, which
+    are written as zeros, for attention_int8pv_tma with V_OUTLIERS to add exactly. Returns v8, scale, those keys
+    (int32 [batch, heads, outliers]) and their rows over the scale (float32 [batch, heads, outliers, 128])."""
     v = readable(v)
-    low, high = torch.aminmax(v, dim=-2)  # one pass, and |v| needs no copy of v
-    scale = (torch.maximum(high, -low).float() / 127).clamp_min(1e-12)
     batch, heads, n, dim = v.shape
+    skip = ctypes.c_void_p(0)
+    if per_token:
+        scale = torch.ones(batch, heads, dim, device=v.device)
+    elif outliers:
+        keys, scale = v_outliers(v, outliers)
+        skip = torch.zeros(batch, heads, n, dtype=torch.uint8, device=v.device).scatter_(-1, keys, 1)
+    else:
+        low, high = torch.aminmax(v, dim=-2)  # one pass, and |v| needs no copy of v
+        scale = (torch.maximum(high, -low).float() / 127).clamp_min(1e-12)
     tokens = n if layout == 0 else math.ceil(n / V8_PAD_KEYS) * V8_PAD_KEYS
     v8 = torch.empty(batch, heads, tokens, dim, dtype=torch.int8, device=v.device)
+    token_scales = torch.zeros(batch, heads, tokens // 2, 4, device=v.device) if per_token else None
     n_chunks = v.numel() // CHUNK
     grid = math.ceil(n_chunks / QUANTIZE_THREADS)
-    module("flash")["quantize_v"](grid, QUANTIZE_THREADS, v, scale, v8, n, n_chunks, layout, token_layout(v))
+    module("flash")["quantize_v"](grid, QUANTIZE_THREADS, v, scale, v8, n, n_chunks, layout, token_layout(v),
+                                  token_scales if per_token else ctypes.c_void_p(0), skip)
+    if per_token:
+        return v8, scale, token_scales
+    if outliers:
+        out_v = v.gather(-2, keys[..., None].expand(-1, -1, -1, dim)).float() / scale[..., None, :]
+        return v8, scale, keys.int().contiguous(), out_v.contiguous()
     return v8, scale
 
 
@@ -358,6 +409,18 @@ def rope_args(rope: torch.Tensor | None) -> tuple:
     return compact, ctypes.c_longlong(compact.stride(0) if compact.shape[0] > 1 else 0)
 
 
+def block_stats(x: torch.Tensor, rope: torch.Tensor | None = None) -> torch.Tensor:
+    """Σ, min and max per channel over each block of STATS_TOKENS tokens of x (rotated by rope first, if given):
+    float32 [batch, heads, blocks, 3, 128]. One pass over x (csrc/flash.cu rope_stats)."""
+    x = readable(x)
+    batch, heads, n, dim = x.shape
+    blocks = math.ceil(n / STATS_TOKENS)
+    partial = torch.empty(batch * heads, blocks, 3, dim, device=x.device)
+    module("flash")["rope_stats"]((blocks, batch * heads), QUANTIZE_THREADS, x, *rope_args(rope), partial, n,
+                                  token_layout(x))
+    return partial.view(batch, heads, blocks, 3, dim)
+
+
 def rope_stats(x: torch.Tensor, rope: torch.Tensor | None,
                per: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per channel of each head, over all tokens of x rotated by rope (None: x as it is): mean, min and max, float32
@@ -365,12 +428,9 @@ def rope_stats(x: torch.Tensor, rope: torch.Tensor | None,
     STATS_TOKENS tokens are added in a fixed order, so the mean is the same from run to run. per (M4.21, a multiple of
     STATS_TOKENS): the same over each block of that many tokens instead, [batch, heads, blocks, 128]."""
     x = readable(x)
-    batch, heads, n, dim = x.shape
-    blocks = math.ceil(n / STATS_TOKENS)
-    partial = torch.empty(batch * heads, blocks, 3, dim, device=x.device)
-    module("flash")["rope_stats"]((blocks, batch * heads), QUANTIZE_THREADS, x, *rope_args(rope), partial, n,
-                                  token_layout(x))
-    partial = partial.view(batch, heads, blocks, 3, dim)
+    n = x.shape[2]
+    partial = block_stats(x, rope)
+    blocks = partial.shape[2]
     sums, low, high = partial[..., 0, :], partial[..., 1, :], partial[..., 2, :]
     if per is None:
         return sums.sum(-2) / n, low.amin(-2), high.amax(-2)

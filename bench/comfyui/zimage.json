@@ -1,0 +1,156 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "zimage\\z_image_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Model @adv @model:unet_name=zimage"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen_3_4b.safetensors",
+   "type": "lumina2",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Text encoder"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "ae.safetensors"
+  },
+  "_meta": {
+   "title": "VAE"
+  }
+ },
+ "4": {
+  "class_type": "ModelSamplingAuraFlow",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "shift": 3.0
+  },
+  "_meta": {
+   "title": "Shift @adv @shift:shift"
+  }
+ },
+ "5": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "text": "a red fox walking through fresh snow in a pine forest at dusk, snowflakes falling, soft warm light",
+   "clip": [
+    "2",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Positive @prompt"
+  }
+ },
+ "6": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "text": "",
+   "clip": [
+    "2",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Negative @negative"
+  }
+ },
+ "7": {
+  "class_type": "EmptySD3LatentImage",
+  "inputs": {
+   "width": 1024,
+   "height": 1024,
+   "batch_size": 1
+  },
+  "_meta": {
+   "title": "Size @width:width @height:height @batch:batch_size(1, 2, 4)"
+  }
+ },
+ "8": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "unica0",
+    0
+   ],
+   "seed": 42,
+   "steps": 25,
+   "cfg": 4.0,
+   "sampler_name": "res_multistep",
+   "scheduler": "simple",
+   "positive": [
+    "5",
+    0
+   ],
+   "negative": [
+    "6",
+    0
+   ],
+   "latent_image": [
+    "7",
+    0
+   ],
+   "denoise": 1.0
+  },
+  "_meta": {
+   "title": "KSampler @seed:seed @adv @steps:steps @cfg:cfg @sampler:sampler_name @scheduler:scheduler"
+  }
+ },
+ "9": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "8",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "10": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "9",
+    0
+   ],
+   "filename_prefix": "unica_bench/zimage"
+  },
+  "_meta": {
+   "title": "Save @output"
+  }
+ },
+ "unica0": {
+  "class_type": "UnicaAttentionNative",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "enabled": true,
+   "measure_every": 0,
+   "measure_heads": 2,
+   "fuse_rope": false,
+   "measure_tag": "zimage",
+   "v_scale": "per_token"
+  }
+ }
+}
