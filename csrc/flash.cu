@@ -725,6 +725,85 @@ __device__ __forceinline__ void load_chunk(float values[CHUNK], const __nv_bfloa
     }
 }
 
+// M4.18–M4.19: RoPE inside the quantization. freqs: (c, s) per pair of channels in fp16, [batch or 1][n_tokens]
+// [HEAD_DIM / 2][2] (unica.rope_table compacts ComfyUI's float [[c, −s], [s, c]] table to it: M4.18 read the float
+// table, 8 bytes per element of q, once per head, and lost to L2). out[2i] = c · x[2i] − s · x[2i + 1], out[2i + 1] =
+// s · x[2i] + c · x[2i + 1], in float: each product rounded, then the difference or sum (no FMA contraction), as
+// bench/emulate.py's rope() does it. freqs_batch: the table's batch stride in halves, 0 when one table serves every batch.
+constexpr int ROPE_HALVES_PER_TOKEN = HEAD_DIM;
+
+// The chunk of 8 channels at `dim` of one token, rotated; f: the table of that token (one 16-byte load).
+__device__ __forceinline__ void rope_chunk(float values[CHUNK], const __half* f, int dim) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(f + dim);
+    const __half2* cs = reinterpret_cast<const __half2*>(&raw);
+#pragma unroll
+    for (int j = 0; j < CHUNK / 2; ++j) {
+        const float2 rotation = __half22float2(cs[j]);  // (c, s)
+        const float x0 = values[2 * j], x1 = values[2 * j + 1];
+        values[2 * j] = __fsub_rn(__fmul_rn(rotation.x, x0), __fmul_rn(rotation.y, x1));
+        values[2 * j + 1] = __fadd_rn(__fmul_rn(rotation.y, x0), __fmul_rn(rotation.x, x1));
+    }
+}
+
+// load_chunk with RoPE first (f: the token's table, or null), then the mean subtracted (the mean of the rotated x)
+__device__ __forceinline__ void load_chunk_rope(float values[CHUNK], const __nv_bfloat16* src, const float* mean,
+                                                const __half* f, int dim) {
+    load_chunk(values, src, nullptr);
+    if (f) rope_chunk(values, f, dim);
+    if (mean) {
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) values[i] -= mean[i];
+    }
+}
+
+// Per channel of a head: Σ, min and max of x after RoPE over a block of STATS_TOKENS tokens. One pass gives the K mean
+// and the per-head max of the FP4 scale, on the rotated values, which exist nowhere in memory. partial: float
+// [heads][blocks][3][HEAD_DIM] (Σ, min, max); unica.rope_stats adds the blocks up in a fixed order. Grid: (blocks,
+// heads). Block: QUANTIZE_THREADS = 16 chunks of 8 channels × 16 tokens at a time.
+constexpr int STATS_TOKENS = 256;
+constexpr int STATS_LANES = QUANTIZE_THREADS / CHUNKS_PER_ROW;  // 16
+extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
+    rope_stats(const __nv_bfloat16* X, const __half* freqs, long long freqs_batch, float* partial, int n_tokens,
+               TokenLayout in) {
+    const int chunk = threadIdx.x % CHUNKS_PER_ROW, lane = threadIdx.x / CHUNKS_PER_ROW;
+    const int head = blockIdx.y, token0 = blockIdx.x * STATS_TOKENS;
+    const __half* table = freqs + size_t(head / in.heads) * freqs_batch;
+    float sum[CHUNK], low[CHUNK], high[CHUNK];
+#pragma unroll
+    for (int i = 0; i < CHUNK; ++i) sum[i] = 0.0f, low[i] = CUDART_INF_F, high[i] = -CUDART_INF_F;
+    for (int token = token0 + lane; token < min(token0 + STATS_TOKENS, n_tokens); token += STATS_LANES) {
+        float values[CHUNK];
+        load_chunk_rope(values, X + in.offset(head, token) + chunk * CHUNK, nullptr,
+                        table + size_t(token) * ROPE_HALVES_PER_TOKEN, chunk * CHUNK);
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) {
+            sum[i] += values[i];
+            low[i] = fminf(low[i], values[i]);
+            high[i] = fmaxf(high[i], values[i]);
+        }
+    }
+    __shared__ float stats[3][STATS_LANES][HEAD_DIM];
+#pragma unroll
+    for (int i = 0; i < CHUNK; ++i) {
+        stats[0][lane][chunk * CHUNK + i] = sum[i];
+        stats[1][lane][chunk * CHUNK + i] = low[i];
+        stats[2][lane][chunk * CHUNK + i] = high[i];
+    }
+    __syncthreads();
+    if (threadIdx.x < HEAD_DIM) {
+        float s = 0.0f, lo = CUDART_INF_F, hi = -CUDART_INF_F;
+        for (int l = 0; l < STATS_LANES; ++l) {
+            s += stats[0][l][threadIdx.x];
+            lo = fminf(lo, stats[1][l][threadIdx.x]);
+            hi = fmaxf(hi, stats[2][l][threadIdx.x]);
+        }
+        float* out = partial + (size_t(head) * gridDim.x + blockIdx.x) * 3 * HEAD_DIM + threadIdx.x;
+        out[0] = s;
+        out[HEAD_DIM] = lo;
+        out[2 * HEAD_DIM] = hi;
+    }
+}
+
 // Quantization for attention_int8qk. One block of threads per scale block: block_tokens tokens of one head,
 // x ≈ x8 · scale with x = X − mean (mean [heads][HEAD_DIM], or null). Bit for bit what bench/emulate.py's
 // quant() computes: the same max, the same IEEE division (nvcc's default), round half to even like
@@ -732,19 +811,22 @@ __device__ __forceinline__ void load_chunk(float values[CHUNK], const __nv_bfloa
 // Grid: (ceil(n_tokens / block_tokens), heads). Block: QUANTIZE_THREADS. X in any TokenLayout; X8 [heads][n_tokens][HEAD_DIM].
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     quantize_int8(const __nv_bfloat16* X, const float* mean, int8_t* X8, float* scale, int n_tokens, int block_tokens,
-                  TokenLayout in) {
+                  TokenLayout in, const __half* freqs, long long freqs_batch) {
     const int token0 = blockIdx.x * block_tokens;
     const int n_chunks = min(block_tokens, n_tokens - token0) * CHUNKS_PER_ROW;
     X8 += (size_t(blockIdx.y) * n_tokens + token0) * HEAD_DIM;
     // chunk c of the block: token token0 + c / CHUNKS_PER_ROW, dims c % CHUNKS_PER_ROW · CHUNK (X in its own layout)
     auto x_chunk = [&](int chunk) { return X + in.offset(blockIdx.y, token0 + chunk / CHUNKS_PER_ROW) + chunk % CHUNKS_PER_ROW * CHUNK; };
+    // M4.18: freqs (or null): RoPE on the way in, then the mean of the rotated x
+    const __half* table = freqs ? freqs + size_t(blockIdx.y / in.heads) * freqs_batch : nullptr;
+    auto rope_of = [&](int chunk) { return table ? table + size_t(token0 + chunk / CHUNKS_PER_ROW) * ROPE_HALVES_PER_TOKEN : nullptr; };
     if (mean) mean += blockIdx.y * HEAD_DIM;
 
     float local_max = 0.0f;
     for (int chunk = threadIdx.x; chunk < n_chunks; chunk += QUANTIZE_THREADS) {
         const int dim = chunk % CHUNKS_PER_ROW * CHUNK;
         float values[CHUNK];
-        load_chunk(values, x_chunk(chunk), mean ? mean + dim : nullptr);
+        load_chunk_rope(values, x_chunk(chunk), mean ? mean + dim : nullptr, rope_of(chunk), dim);
 #pragma unroll
         for (int i = 0; i < CHUNK; ++i) local_max = fmaxf(local_max, fabsf(values[i]));
     }
@@ -756,7 +838,7 @@ extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     for (int chunk = threadIdx.x; chunk < n_chunks; chunk += QUANTIZE_THREADS) {
         const int dim = chunk % CHUNKS_PER_ROW * CHUNK;
         float values[CHUNK];
-        load_chunk(values, x_chunk(chunk), mean ? mean + dim : nullptr);
+        load_chunk_rope(values, x_chunk(chunk), mean ? mean + dim : nullptr, rope_of(chunk), dim);
         uint32_t packed[2] = {0, 0};
 #pragma unroll
         for (int i = 0; i < CHUNK; ++i) {
@@ -1909,7 +1991,7 @@ constexpr int K4_TILE_BYTES = KEYS_PER_TILE * FP4_ROW_BYTES;
 // Grid: ceil(heads · n_tokens · 8 / QUANTIZE_THREADS).
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     quantize_fp4_rows(const __nv_bfloat16* X, const float* mean, const float* outer, uint8_t* X4, int n_tokens,
-                      int padded_tokens, int n_threads, TokenLayout in) {
+                      int padded_tokens, int n_threads, TokenLayout in, const __half* freqs, long long freqs_batch) {
     const int index = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
     if (index >= n_threads) return;
     const int block = index % D_BLOCKS_FP4;
@@ -1920,8 +2002,10 @@ extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
         float chunk[CHUNK];
-        load_chunk(chunk, X + in.offset(head, int(row % n_tokens)) + block * FP4_SCALE_BLOCK + half * CHUNK,
-                   mean ? mean + head * HEAD_DIM + block * FP4_SCALE_BLOCK + half * CHUNK : nullptr);
+        const int dim = block * FP4_SCALE_BLOCK + half * CHUNK;
+        load_chunk_rope(chunk, X + in.offset(head, int(row % n_tokens)) + dim, mean ? mean + head * HEAD_DIM + dim : nullptr,
+                        freqs ? freqs + size_t(head / in.heads) * freqs_batch + (row % n_tokens) * ROPE_HALVES_PER_TOKEN : nullptr,
+                        dim);
 #pragma unroll
         for (int i = 0; i < CHUNK; ++i) {
             values[half * CHUNK + i] = chunk[i];

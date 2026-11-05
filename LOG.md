@@ -2221,6 +2221,93 @@ of M4.16: baseline 87.3 → ~83.7 ms (−4.1 %), `attention_fp4` 57.6 → ~54.0 
 The quantizers read through the transpose as fast as from contiguous memory (a token's 128 channels are still one
 256-byte run). Next on this path: RoPE inside the quantization (1.9 ms), then RMSNorm (1.7 ms).
 
+## M4.18 — step 2: RoPE inside the quantization (prediction, before measuring)
+
+**Change.** `unica.attention(q, k, v, rope=freqs)`: q and k come before RoPE, `freqs` is ComfyUI's table (float32 [b or 1,
+s, 1, 64, 2, 2], every rope option of the model already in it). `quantize_int8` and `quantize_fp4_rows` rotate each
+8-channel chunk in float on the way in (`rope_chunk`: two rounded products, then the sum, as `apply_rope1`), then
+subtract the mean. The K mean and the FP4 per-head scales need the rotated values first: `rope_stats`, one pass that
+gives Σ, min and max per channel of the rotated x (block sums added in a fixed order, deterministic). It replaces
+`k.mean` (and, for `attention_fp4`, `aminmax`), so no pass is added. The rotated q and k are never written, nor rounded
+to bf16. `bench/emulate.py` got `rope()` (the same order of operations) and `wan_rope_table()`. tests/test_rope.py:
+`rope_stats`' min and max exact, its mean within 1e-6; `quantize_int8` and `quantize_fp4_rows` with `rope=` bit for bit
+the emulator's quantization of rope(x) − mean; the three fast kernels with `rope=` within 0.006 % of the emulator on the
+rotated q and k (189 tokens, batch 1 and 2).
+
+**Hypotheses** (real shape, ComfyUI's environment; before: `apply_rope1` on q and k, then the kernel in place; after:
+`rope=`): **−1.9 ms** per call for the baseline (the read and write of RoPE for q and k), **−2.3 ms** for `attention_fp4`
+(also `k.mean` and `aminmax` merged into one pass of statistics). Error against FP32 on the rotated q and k: equal or a
+little lower, the bf16 rounding of the rotated q and k being gone.
+
+**Result** (ComfyUI's `.venv-13`, real shape, 6 rounds taking turns): `wan_rope_table` equals ComfyUI's `EmbedND` table
+bit for bit; `rope()` differs from comfy_kitchen's `apply_rope1` by at most 2.6e-3 of the largest value, the size of
+its bf16 rounding (the pairing is right: a wrong one would differ by O(1)).
+
+| | `apply_rope1` + kernel | `rope=` | | predicted | rel L2 vs FP32 (4 heads) |
+|---|---|---|---|---|---|
+| baseline | 84.29 ms | 85.62 ms | **+1.32 ms** | −1.9 ms: **wrong** | 1.766 → 1.750 %: held |
+| `attention_fp4` | 55.28 ms | 55.86 ms | **+0.58 ms** | −2.3 ms: **wrong** | 19.468 → 19.474 % |
+
+**Why it lost:** the table holds a float 2 × 2 matrix per pair of channels, 8 bytes per element of q, four times q itself.
+It is the same for all 40 heads of a token, and every thread of every head reads it again: ~1.4 GB from L2 per pass,
+three passes with RoPE (q's quantization, k's statistics, k's quantization), ~4.2 GB, ~1.7 ms at the ~2.5 TB/s L2 rate
+of M3.17. That is the whole gain and more.
+
+## M4.19 — RoPE from a compact table (prediction, before measuring)
+
+**Change.** WAN's matrices are rotations, [[c, −s], [s, c]] (ComfyUI's `rope()` stacks cos, −sin, sin, cos). The kernels
+take (c, s) per pair in fp16 instead: 2 bytes per element of q, a quarter of the table, one 16-byte load per 8-channel
+chunk. `unica.rope_table` checks that the table is a rotation, converts it once and keeps it while the same table comes
+back (all 40 blocks of a step share it). fp16's error on c and s, ≤ 2⁻¹², is 8 times below the bf16 rounding of the
+rotated q and k that the fusion removes. The emulator rotates with the same fp16 (c, s) and the same order of
+operations, so the tests stay bit for bit.
+
+**Hypothesis:** L2 traffic for the table ~0.35 GB per pass, ~0.14 ms; three passes ~0.4 ms. Per call: baseline **−1.4 ms**
+(1.9 − 0.4 − the rest), `attention_fp4` **−1.8 ms**.
+
+**Result: held, a little better than predicted.** Same measurement as M4.18:
+
+| | `apply_rope1` + kernel | `rope=`, compact table | | predicted | rel L2 vs FP32 (4 heads) |
+|---|---|---|---|---|---|
+| baseline | 85.12 ms | **82.83 ms** | **−2.29 ms (−2.7 %)** | −1.4 ms | 1.766 → 1.750 % |
+| `attention_fp4` | 55.20 ms | **53.16 ms** | **−2.04 ms (−3.7 %)** | −1.8 ms | 19.468 → 19.471 % |
+
+tests/test_rope.py bit for bit again with the fp16 (c, s) in the emulator. The compact table is kept by a weak reference
+to ComfyUI's table, not by its address: ComfyUI builds a new table every step, and the allocator may hand it the
+old one's address. (The FP32 reference here rotates with the same fp16 (c, s); against ComfyUI's float table it differs
+by ≤ 2⁻¹² per rotation.) Still to do for step 2: the node, which has to take q and k before `apply_rope1`.
+
+**The node** (`Unica Attention (native)`, optional input `fuse_rope`, default off; optional so that saved workflows
+still validate): `fused_rope_forward` replaces `WanSelfAttention.forward` on each block, as an object patch of the
+model clone only (`add_object_patch`, nothing global). It is the original forward of ComfyUI 0.42 with q and k handed to
+unica before RoPE, together with the model's own table; an `attn1_patch` (it wants the rotated q and k), another head
+size or a table that does not fit go to the original forward. Checked with ComfyUI's real class (2 heads, 360 tokens,
+random weights, scratchpad fused_forward_check.py): fused against the original forward, both on unica, 0.24 % apart
+(the bf16 rounding of the rotated q and k, now gone); against ComfyUI's own SDPA 0.293 % (fused) and 0.295 % (original);
+with an `attn1_patch` it returns the original's output bit for bit. A video A/B is with the ComfyUI app's agent.
+
+**Found by the first video run:** `fuse_rope` crashed on the first call: `Inference tensors do not track version counter`
+in `compact_rope`. ComfyUI samples under `torch.inference_mode`, where the table has no `_version`; every test had run
+outside it. The cache now checks the version only for tensors that have one (the weak reference still tells a new
+table from the kept one), and `test_under_inference_mode` runs the path the way ComfyUI does.
+
+**Video A/B** (the Rigsy workflow, the baseline kernel, seed 42, same prompt, models kept loaded; runs taking turns, a
+warm-up with `fuse_rope` on not counted; both variants already without the layout copies of M4.17):
+
+| | run 1 | run 2 | mean |
+|---|---|---|---|
+| `fuse_rope` off | 47.2 s | 47.9 s | 47.55 s |
+| `fuse_rope` on | 46.4 s | 47.0 s | **46.70 s (−0.85 s, −1.8 %)** |
+
+- Predicted per video: 160 calls × 2.3 ms ≈ **−0.37 s**. Measured −0.85 s: both "on" runs below both "off" runs, but the
+  spread inside a variant (0.6–0.7 s) is as large as the difference. The direction holds; the size needs more rounds.
+- "fuse_rope: 40 self-attention blocks patched" twice per run (high- and low-noise models), no warning or error.
+- **The two videos are both clean and not the same**: from the middle on the motion takes another path (frame 40: a wave
+  in one, a hand in the hair in the other), PSNR 24.0 dB over the video. Each variant is deterministic (two runs of each
+  byte for byte equal). RoPE in float instead of bf16 changes the rounding of q and k, and 4 steps carry that into a
+  different trajectory, as with SageAttention 2 / 3 / unica in M5.5. A wrong rotation (axis or frequency) would break
+  the motion or the image; neither happens.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

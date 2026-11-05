@@ -119,6 +119,30 @@ def block_scaled(x, fmt, dim, outer=None, pow2=False):
 FP4_SLOT_KEY = torch.tensor([32 * (k // 32) + 8 * (k % 8 // 2) + 2 * (k % 32 // 8) + k % 2 for k in range(64)])
 
 
+def rope(x, freqs):
+    """ComfyUI's apply_rope1 in float, as the kernels compute it (M4.19): with (c, s) of each pair rounded to fp16,
+    out[2i] = c · x[2i] − s · x[2i + 1], out[2i + 1] = s · x[2i] + c · x[2i + 1], each product rounded, then the
+    difference or sum (no fused multiply-add). x float [b, h, s, d]; freqs float32 [b or 1, s, 1, d / 2, 2, 2], a
+    rotation per pair. Returns float, not rounded to bf16."""
+    f = freqs[:, None, :, 0]  # [b or 1, 1, s, d / 2, 2, 2]
+    c, s = f[..., 0, 0].half().float(), f[..., 1, 0].half().float()
+    x0, x1 = x[..., 0::2], x[..., 1::2]
+    return torch.stack([c * x0 - s * x1, s * x0 + c * x1], -1).flatten(-2)
+
+
+def wan_rope_table(t, h, w, dim=128, theta=10000.0, device="cuda"):
+    """WAN's RoPE table as ComfyUI builds it (EmbedND, axes [44, 42, 42] for d = 128) for a t × h × w latent: float32
+    [1, t · h · w, 1, 64, 2, 2]."""
+    axes = [dim - 4 * (dim // 6), 2 * (dim // 6), 2 * (dim // 6)]
+    ids = torch.stack(torch.meshgrid(torch.arange(t), torch.arange(h), torch.arange(w), indexing="ij"), -1).reshape(-1, 3)
+    tables = []
+    for axis, size in enumerate(axes):
+        omega = 1.0 / theta ** torch.linspace(0, (size - 2) / size, size // 2, dtype=torch.float64)
+        angle = ids[:, axis, None].double() * omega  # [s, size / 2]
+        tables.append(torch.stack([angle.cos(), -angle.sin(), angle.sin(), angle.cos()], -1).view(-1, size // 2, 2, 2))
+    return torch.cat(tables, 1).float()[None, :, None].to(device)
+
+
 def hadamard(n, device):
     """The n × n Hadamard matrix (Sylvester), scaled to be orthogonal: H · Hᵀ = I."""
     h = torch.ones(1, 1, device=device)

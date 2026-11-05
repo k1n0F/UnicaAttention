@@ -231,6 +231,51 @@ def native_override(previous):
     return override
 
 
+def fused_rope_forward(module, original):
+    """M4.18–M4.19: a forward for ComfyUI's WanSelfAttention (comfy/ldm/wan/model.py, ComfyUI 0.42) that hands q and k
+    to unica before RoPE, with the model's own table: the quantization rotates them on the way in, so apply_rope1's
+    pass over q and k (~1.9 ms per call) goes. Everything else as the original: q = norm_q(q(x)), k = norm_k(k(x)),
+    v = v(x), out = o(attention). An attn1_patch (it wants the rotated q and k), a head size other than 128 or a table
+    that does not fit go to the original forward."""
+
+    def forward(x, freqs, transformer_options={}):  # noqa: B006 (the original's signature)
+        b, s, n, d = *x.shape[:2], module.num_heads, module.head_dim
+        if (transformer_options.get("patches", {}).get("attn1_patch") or freqs is None or d != HEAD_DIM
+                or not x.is_cuda or freqs.dim() != 6 or freqs.shape[1] != s):
+            return original(x, freqs, transformer_options=transformer_options)
+        q = module.norm_q(module.q(x)).view(b, s, n, d)
+        k = module.norm_k(module.k(x)).view(b, s, n, d)
+        v = module.v(x).view(b, s, n, d)
+        # the measurement compares on the rotated q and k: rotate them only for a call it will measure
+        if native_measurement.every > 0 and (native_measurement.calls + 1) % native_measurement.every == 0:
+            from comfy.ldm.flux.math import apply_rope1
+            native_measurement(apply_rope1(q, freqs), apply_rope1(k, freqs), v)
+        else:
+            native_measurement.calls += 1
+        out = unica.attention(*(t.transpose(1, 2).to(torch.bfloat16) for t in (q, k, v)), rope=freqs)
+        return module.o(out.transpose(1, 2).reshape(b, s, n * d).to(x.dtype))
+
+    forward.unica = True
+    return forward
+
+
+def patch_self_attention_forward(patched) -> int:
+    """fused_rope_forward on every WanSelfAttention of the model, as object patches of this clone only. Returns how many."""
+    blocks = patched.get_model_object("diffusion_model.blocks")
+    count = 0
+    for i in range(len(blocks)):
+        name = f"diffusion_model.blocks.{i}.self_attn"
+        module = patched.get_model_object(name)
+        if type(module).__name__ != "WanSelfAttention":  # cross-attention classes derive from it: leave them
+            continue
+        original = patched.object_patches.get(f"{name}.forward", module.forward)
+        if getattr(original, "unica", False):
+            continue
+        patched.add_object_patch(f"{name}.forward", fused_rope_forward(module, original))
+        count += 1
+    return count
+
+
 class UnicaAttentionNative:
     @classmethod
     def INPUT_TYPES(cls):
@@ -242,7 +287,12 @@ class UnicaAttentionNative:
                                           "tooltip": "Compare with SageAttention 2/3 and FP32 every n-th self-attention call (0: off)"}),
                 "measure_heads": ("INT", {"default": 2, "min": 1, "max": 40,
                                           "tooltip": "Heads per measured call: the FP32 reference is slow"}),
-            }
+            },
+            "optional": {  # optional, so that workflows saved before it still validate
+                "fuse_rope": ("BOOLEAN", {"default": False,
+                                          "tooltip": "WAN: RoPE inside unica's quantization instead of ComfyUI's own pass "
+                                                     "(~2 ms less per call). Patches WanSelfAttention.forward"}),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -252,7 +302,7 @@ class UnicaAttentionNative:
     DESCRIPTION = ("Self-attention on UnicaAttention through optimized_attention_override. Put it after "
                    "PathchSageAttentionKJ: other calls (cross-attention) go to the override before it.")
 
-    def patch(self, model, enabled, measure_every, measure_heads):
+    def patch(self, model, enabled, measure_every, measure_heads, fuse_rope=False):
         if not enabled:
             return (model,)
         native_measurement.every, native_measurement.heads = measure_every, measure_heads
@@ -261,6 +311,8 @@ class UnicaAttentionNative:
         previous = options.get("optimized_attention_override")
         if not getattr(previous, "unica", False):
             options["optimized_attention_override"] = native_override(previous)
+        if fuse_rope:
+            log.info("fuse_rope: %d self-attention blocks patched", patch_self_attention_forward(patched))
         return (patched,)
 
 
