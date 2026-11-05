@@ -24,9 +24,9 @@ LOG2E = 1.4426950408889634
 # times them side by side. The quantized ones trade exactness for speed: their error is measured
 # against bench/emulate.py, which predicts it.
 KERNELS = ("attention", "attention_smem", "attention_int8qk", "attention_int8pv", "attention_int8pv_async",
-           "attention_int8pv_pipe", "attention_int8pv_tma")
+           "attention_int8pv_pipe", "attention_int8pv_tma", "attention_fp4pv")
 QUANTIZED = {"attention_int8qk", "attention_int8pv", "attention_int8pv_async", "attention_int8pv_pipe",
-             "attention_int8pv_tma"}
+             "attention_int8pv_tma", "attention_fp4pv"}
 # INT8 Q·Kᵀ, u8 × s8 P·V: rel L2 1.73 % against FP32 on random inputs (SageAttention 2: 3.9 %). The exact
 # path is attention_smem, at 0.17 %, the bf16 output floor.
 DEFAULT_KERNEL = "attention_int8pv_tma"
@@ -95,6 +95,12 @@ def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str
     k8, k_scale = quantize_int8(k, k.mean(-2, dtype=torch.float32), K_SCALE_BLOCK)  # softmax cancels the mean
     if kernel == "attention_int8qk":
         return q8, k8, q_scale, k_scale, v
+    if kernel == "attention_fp4pv":  # V4: one box of HEAD_DIM rows of V4_ROW_BYTES is one tile
+        keys = (TILE | tile)["KEYS_PER_TILE"]
+        v4, v_outer = quantize_v4(v)
+        k_map = tensor_map_2d(k8, UINT8, HEAD_DIM, k8.numel() // HEAD_DIM, HEAD_DIM, HEAD_DIM + 16, keys)
+        v_map = tensor_map_2d(v4, UINT8, V4_ROW_BYTES, v4.numel() // V4_ROW_BYTES, V4_ROW_BYTES, V4_ROW_BYTES, HEAD_DIM)
+        return k_map, v_map, q8, q_scale, k_scale, v_outer
     if kernel != "attention_int8pv_tma":
         return q8, k8, q_scale, k_scale, *quantize_v(v)
     # TMA boxes 16 bytes wider than the rows: the tiles land padded, as the kernel's ldmatrix expects
@@ -147,3 +153,25 @@ def quantize_v(v: torch.Tensor, layout: int = 0) -> tuple[torch.Tensor, torch.Te
     grid = math.ceil(n_chunks / QUANTIZE_THREADS)
     module("flash")["quantize_v"](grid, QUANTIZE_THREADS, v, scale, v8, n, n_chunks, layout)
     return v8, scale
+
+
+FP4_TILE = 64  # keys per tile of V4, the k of one m16n8k64 mma
+V4_ROW_BYTES = 48  # these two must match csrc/flash.cu
+E2M1_MAX, E4M3_MAX = 6.0, 448.0
+
+
+def quantize_v4(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """V for attention_fp4pv (M4.8): NVFP4 per channel, e2m1 with an e4m3 scale per 16 keys, under one float
+    scale per channel, max |v| / (6 · 448). Returns uint8 [batch, heads, tiles, 128, 48] (csrc/flash.cu V4: the
+    keys of each tile of 64 in the mma's slot order, and their scales) and float32 [batch, heads, 128]. Bit for
+    bit bench/emulate.py's block_scaled(..., "nvfp4", outer="channel") on V in that order."""
+    v = v.contiguous()
+    low, high = torch.aminmax(v, dim=-2)
+    outer = (torch.maximum(high, -low).float() / (E2M1_MAX * E4M3_MAX)).clamp_min(1e-30)
+    batch, heads, n, dim = v.shape
+    tiles = math.ceil(n / FP4_TILE)
+    v4 = torch.empty(batch, heads, tiles, dim, V4_ROW_BYTES, dtype=torch.uint8, device=v.device)
+    n_threads = batch * heads * tiles * (FP4_TILE // 16) * dim
+    module("flash")["quantize_v4"](math.ceil(n_threads / QUANTIZE_THREADS), QUANTIZE_THREADS, v, outer, v4, n,
+                                   n_threads)
+    return v4, outer

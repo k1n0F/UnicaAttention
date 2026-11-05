@@ -8,6 +8,7 @@ are made here, in numbers, before any CUDA is written.
 """
 
 import argparse
+import math
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +17,7 @@ E4M3 = torch.float8_e4m3fn
 E4M3_MAX = 448.0
 LOG2E = 1.4426950408889634
 MMA_K = 32  # tokens summed by one m16n8k32 P·V instruction
+SKIP_ROWS = 64  # query rows of one block of the kernel: 4 warps × 16, which pass each tile's barrier together
 
 torch.set_float32_matmul_precision("highest")  # no TF32: FP32 GEMMs stay exact enough to be a reference
 
@@ -72,12 +74,15 @@ def to_e2m1(x):
     return (torch.round(a / step) * step).clamp(max=E2M1_MAX).copysign(x)
 
 
-def block_scaled(x, fmt, dim):
+def block_scaled(x, fmt, dim, outer=None, pow2=False):
     """x as a block-scaled FP4 MMA sees it: e2m1 values times one scale per FP4_BLOCK[fmt] elements along
     `dim`, the axis the MMA sums over. Returns the dequantized x̂ · s: the MMA applies the scales itself, with
     an f32 accumulator, so the emulator can multiply them in before an FP32 GEMM.
 
-    nvfp4  scale = amax / 6 rounded to e4m3, under one FP32 scale per head that puts the largest block at 448
+    nvfp4  scale = amax / 6 rounded to e4m3, times an FP32 outer scale. outer: None, one per head that puts the
+           head's largest block at 448; "channel", the same per channel (every axis but `dim` kept); a number,
+           fixed (the kernel's P, whose largest value is known). pow2: the scale is instead 2^ceil(log2(amax / 6))
+           within ue4m3's 2^-9 .. 2^8, never saturating (M4.9)
     mxfp4  scale = 2^(floor(log2 amax) − 2), the OCP MX rule (6 = 1.5 · 2²); a block whose amax / scale lies in
            (6, 8) saturates at 6
     mxfp8  e4m3 values, scale = 2^(floor(log2 amax) − 8) (448 = 1.75 · 2⁸)
@@ -97,11 +102,21 @@ def block_scaled(x, fmt, dim):
     amax = blocks.abs().amax(-1, keepdim=True)
     if fmt == "mxfp4":
         s = torch.exp2(torch.floor(torch.log2(amax.clamp_min(2.0**-126))) - 2)
+    elif pow2:
+        s = torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-30) / E2M1_MAX / outer)).clamp(-9, 8)) * outer
     else:
-        per_head = (amax.amax((-3, -2, -1), keepdim=True) / (E2M1_MAX * E4M3_MAX)).clamp_min(1e-30)
-        s = (amax / E2M1_MAX / per_head).to(E4M3).float() * per_head  # a scale below e4m3's range becomes 0
+        if outer is None or outer == "channel":
+            over = (-3, -2, -1) if outer is None else (-2, -1)
+            outer = (amax.amax(over, keepdim=True) / (E2M1_MAX * E4M3_MAX)).clamp_min(1e-30)
+        s = (amax / E2M1_MAX / outer).clamp(max=E4M3_MAX).to(E4M3).float() * outer  # below e4m3's range: 0
     x_hat = to_e2m1(blocks / s.clamp_min(1e-30)) * s
     return x_hat.flatten(-2)[..., :n].movedim(-1, dim)
+
+
+# m16n8k64 FP4 (LOG M4.8, measured): lane l holds k = 8 · (l % 4) + 32 · h + j of P's rows in register 2h (+1),
+# j = 0..7, and gets the scores of keys 8 · b + 2 · (l % 4) + {0, 1}, b = 0..7, from Q·Kᵀ. Packing the scores of
+# blocks 4h .. 4h + 3 in order into register 2h puts key 32h + 8 · (j / 2) + 2t + j % 2 at slot k = 32h + 8t + j.
+FP4_SLOT_KEY = torch.tensor([32 * (k // 32) + 8 * (k % 8 // 2) + 2 * (k % 32 // 8) + k % 2 for k in range(64)])
 
 
 def hadamard(n, device):
@@ -142,6 +157,12 @@ def emulate(
     p_terms=1,
     v_terms=1,
     p1_v1=True,
+    skip_below=None,
+    stats=None,
+    fp4_slots=False,
+    p_outer=None,
+    v_outer=None,
+    p_pow2=False,
 ):
     """Tiled online-softmax attention, the way the kernel computes it.
 
@@ -163,6 +184,14 @@ def emulate(
               P·(V − μ) + μ = P·V
     p_terms, v_terms  1 or 2 block-scaled terms: x ≈ x₀ + x₁, x₁ the same format of the residual x − x₀.
               Each pair of terms is one more mma; p1_v1=False leaves out P₁·V₁
+    skip_below  None | τ: a block of the kernel (SKIP_ROWS query rows) skips the softmax and P·V of a KV tile in
+              which every row's P stays below τ · its running max, i.e. tile max − m < log2 τ in every row.
+              Its scores are still computed: the max has to be known to decide
+    stats     a dict that gets "skipped" and "pairs": skipped (block, tile) pairs and all of them
+    fp4_slots the keys of every tile of 64 in the order of the k slots of the FP4 mma, as the kernel lays out V
+              (FP4_SLOT_KEY), so that a block of 16 for a scale is the kernel's 16 keys. Needs bc = 64
+    p_outer, v_outer  the outer scale of block_scaled for P and V
+    p_pow2    P's block scales as powers of two (block_scaled's pow2)
     """
     q, k, v = q.float(), k.float(), v.float()
     if smooth_k:
@@ -177,10 +206,17 @@ def emulate(
         sq = sk = torch.ones_like(q[..., :1])
     else:
         (q, sq), (k, sk) = quant(q, qk, q_block), quant(k, qk, k_block)
+    key_valid = None
+    if fp4_slots:  # a permutation inside each tile: the scores and P follow the keys, the sums do not change
+        assert bc == 64, "the slot order is that of a 64-key tile"
+        n = k.shape[-2]
+        order = torch.arange(-(-n // 64) * 64, device=q.device).view(-1, 64)[:, FP4_SLOT_KEY.to(q.device)].flatten()
+        k, sk, v = (F.pad(x, (0, 0, 0, len(order) - n))[..., order, :] for x in (k, sk, v))
+        key_valid = order < n
     if v_fmt in FP4_BLOCK:  # scales per channel and block of keys, the axis P·V sums over
-        v_parts, sv = [block_scaled(v, v_fmt, -2)], 1.0
+        v_parts, sv = [block_scaled(v, v_fmt, -2, v_outer)], 1.0
         if v_terms == 2:
-            v_parts.append(block_scaled(v - v_parts[0], v_fmt, -2))
+            v_parts.append(block_scaled(v - v_parts[0], v_fmt, -2, v_outer))
         v = torch.stack(v_parts)  # [terms, ...]
     elif v_fmt:
         sv = (v.abs().amax(-2, keepdim=True) / QMAX[v_fmt]).clamp_min(1e-12)
@@ -202,23 +238,35 @@ def emulate(
         # For int8, q̂·k̂ is an integer with |q̂·k̂| ≤ 127²·128 < 2²⁴, so the FP32 GEMM gives exactly the INT32 MMA result
         kt, skt = k[..., j : j + bc, :].transpose(-1, -2), sk[..., j : j + bc, :].transpose(-1, -2)
         s = (q @ kt) * (sq * skt) * scale
+        if key_valid is not None:
+            s = s.masked_fill(~key_valid[j : j + bc], -torch.inf)
         m_new = torch.maximum(m, s.amax(-1, keepdim=True))
         m_p = s.amax(-1, keepdim=True) if p_local else m_new
         alpha, beta = torch.exp2(m - m_new), torch.exp2(m_p - m_new)
+        keep = 1.0
+        if skip_below:
+            negligible = (s.amax(-1) - m_new[..., 0]) < math.log2(skip_below)  # [..., rows]; never in the first tile
+            rows = negligible.shape[-1]
+            blocks = F.pad(negligible, (0, -rows % SKIP_ROWS), value=True).unflatten(-1, (-1, SKIP_ROWS)).all(-1)
+            skipped = blocks.repeat_interleave(SKIP_ROWS, -1)[..., :rows, None]
+            keep = (~skipped).float()  # a skipped tile leaves m, l and o as they were: its max is below m already
+            if stats is not None:
+                stats["skipped"] = stats.get("skipped", 0) + blocks.sum().item()
+                stats["pairs"] = stats.get("pairs", 0) + blocks.numel()
         p = torch.exp2(s - m_p)
         row_sum = p.sum(-1, keepdim=True)  # the kernel sums P in FP32, before quantizing it
         p = p * p_mul
         p_parts = [p]
         if p_fmt in FP4_BLOCK:  # blocks of keys inside the tile
-            p_parts = [block_scaled(p, p_fmt, -1)]
+            p_parts = [block_scaled(p, p_fmt, -1, p_outer, p_pow2)]
             if p_terms == 2:
-                p_parts.append(block_scaled(p - p_parts[0], p_fmt, -1))
+                p_parts.append(block_scaled(p - p_parts[0], p_fmt, -1, p_outer))
             p = sum(p_parts)
         elif p_fmt:
             p = p_parts[0] = to_fmt(p, p_fmt)
         if sum_rounded:
             row_sum = p.sum(-1, keepdim=True) / p_mul
-        l = l * alpha + row_sum * beta
+        l = l * alpha + row_sum * beta * keep
         vt = v[..., j : j + bc, :]
         if len(p_parts) > 1 or len(vt) > 1:
             inner = sum(pi @ vj for i, pi in enumerate(p_parts) for jv, vj in enumerate(vt) if p1_v1 or i + jv < 2)
@@ -231,11 +279,33 @@ def emulate(
             inner = inner.float()
         else:
             inner = p @ vt[0]
-        m, o = m_new, o * alpha + inner * beta
+        m, o = m_new, o * alpha + inner * beta * keep
     o = o * (sv / p_mul) / l + v_mean
     if overflow:
         print("  FP16 accumulator overflowed")
     return o.bfloat16().float() if out_bf16 else o
+
+
+def negligible_tiles(q, k, taus, rows_per_block=(SKIP_ROWS, 16), bc=64, chunk=1024):
+    """Share of (row block, KV tile) pairs whose tile could be skipped: every row's tile max lies below its
+    running max (this tile included) by more than log2 τ. From exact FP32 scores, rows in chunks, so it is cheap
+    next to emulate(). Returns {(rows, τ): share}."""
+    q, k = q.float(), k.float()
+    scale = q.shape[-1] ** -0.5 * LOG2E
+    n_keys = k.shape[-2]
+    counts = {(rows, tau): [0, 0] for rows in rows_per_block for tau in taus}
+    for i in range(0, q.shape[-2], chunk):
+        s = q[..., i : i + chunk, :] @ k.transpose(-1, -2) * scale
+        tile_max = F.pad(s, (0, -n_keys % bc), value=-torch.inf).unflatten(-1, (-1, bc)).amax(-1)  # [..., rows, tiles]
+        gap = tile_max - tile_max.cummax(-1).values
+        for rows in rows_per_block:
+            for tau in taus:
+                negligible = (gap < math.log2(tau)).transpose(-1, -2)  # [..., tiles, rows]
+                n = negligible.shape[-1]
+                blocks = F.pad(negligible, (0, -n % rows), value=True).unflatten(-1, (-1, rows)).all(-1)
+                counts[rows, tau][0] += blocks.sum().item()
+                counts[rows, tau][1] += blocks.numel()
+    return {key: skipped / total for key, (skipped, total) in counts.items()}
 
 
 def errors(o, ref):

@@ -861,7 +861,7 @@ Q_SMEM=1). All in one session; ncu 4 heads, compare.py 40 × 32760 kernel alone:
   quote.
 - The spills are the obvious next target: ~8.5 local loads per tile, and registers at 255.
 
-**Where the gain comes from** (the author's questions: register pressure, the place of the IMMA, shared
+**Where the gain comes from** (questions: register pressure, the place of the IMMA, shared
 memory, and whether it is ptxas scheduling rather than the Q loads themselves).
 
 nvdisasm (13.2 and 13.0) refuses life ranges for a kernel at 255 registers ("Invalid register count").
@@ -891,7 +891,7 @@ the alignment of register groups. The method is the same for all builds, so the 
    instructions for 32 IMMA, a similar mix inside).
 3. **What moved are the V loads.** With the registers freed, ptxas issues the V `ldmatrix` about twice as
    far ahead of the P·V IMMA that use them: 40 instructions on average instead of 20, up to 159. Short-
-   scoreboard and wait stalls fall with it. This matches the author's hypothesis: the gain is a different
+   scoreboard and wait stalls fall with it. This matches the hypothesis: the gain is a different
    schedule that the lower pressure allows, not the Q loads. Those are 4 more LDSM per tile and cost.
    Not proven causally; the data point the same way.
 4. **Shared memory:** 46.1 KB per block, 2 × 47.1 KB = 94.2 KB of the 100 KB per SM. **~2.9 KB per block
@@ -939,9 +939,9 @@ Two ways out, measured before any kernel change:
 
   Neutral on the benchmark's random data, **+0.01 … +0.05 % absolute on sharper attention**. The many P
   that round to 0 still count in Σ P, and that turns out to be the better denominator. A choice of
-  accuracy, the author's.
+  accuracy.
 
-**Decision (author): the rounded sum, via `IDP4A`.**
+**Decision: the rounded sum, via `IDP4A`.**
 
 ## M3.15 — row sum over the rounded P̂ (prediction, before implementation)
 
@@ -992,7 +992,7 @@ the highest so far.
 
 ## M3.16 — `attention_int8pv_pipe` becomes the default
 
-Author's decision: `unica.attention()` runs the u8 path by default. The exact path stays available as
+Decision: `unica.attention()` runs the u8 path by default. The exact path stays available as
 `kernel="attention_smem"` (0.17 %, the bf16 output floor). bench/harness.py, same run, 1 × 40 × 32760 × 128,
 bf16 random inputs, median of 10, whole call (quantization included):
 
@@ -1013,7 +1013,7 @@ and tile in `attention_int8pv_pipe` (ncu SourceCounters): 571.3, of them 8 `LDGS
 instructions of addresses and bounds checks around them, and 63.6 `MOV`, ~48 of which pair V fragments
 (M3.11).
 
-**Design (the author chose the full version):**
+**Design (the full version):**
 
 - **TMA** (`cp.async.bulk.tensor.2d`, SASS `UTMALDG.2D`; compiled and run on the card first): one thread
   issues a whole tile, an `mbarrier` with the expected byte count says when it has landed. The other 127
@@ -1081,7 +1081,7 @@ Not separated further.
 
 ## M3.17 — `attention_int8pv_tma` is the default
 
-Its output is identical bit for bit to `attention_int8pv_pipe`, the kernel the author made the default in
+Its output is identical bit for bit to `attention_int8pv_pipe`, the kernel made the default in
 M3.16, so the accuracy decision stands. bench/harness.py, 1 × 40 × 32760 × 128, whole call, three runs:
 
 | | run 1 | run 2 | run 3 | rel L2 |
@@ -1122,7 +1122,7 @@ By reason over everything: wait 26 %, math pipe 25 %, selected 18 %, **barrier 1
   separate `k.mean`, a separate `aminmax` over V: ~2.2 GB at 810 GB/s ≈ 2.7 ms). Fusing the mean and the
   aminmax into the quantize kernels saves at most ~0.8 ms, ~1 %.
 
-Order agreed with the author: the barrier, then the quantization, then (with an accuracy check) the flush
+Order agreed: the barrier, then the quantization, then (with an accuracy check) the flush
 every 128 keys.
 
 ## M3.19 — mbarriers instead of `__syncthreads` (prediction, before implementation)
@@ -1306,7 +1306,7 @@ Nothing changes in the code: 4 warps K64 stays.
 
 ## M5.1 — a ComfyUI node for ComfyUI-WanVideoWrapper
 
-The author's WAN 2.2 workflow (I2V A14B, high- and low-noise models, 832 × 480, 81 frames) runs on
+The WAN 2.2 workflow (I2V A14B, high- and low-noise models, 832 × 480, 81 frames) runs on
 ComfyUI-WanVideoWrapper, whose `WanVideoModelLoader` sets `attention_mode = "sageattn"`. WanVideoWrapper
 already has an override path: `transformer_options["attention_mode_override"]` is passed by the model down
 to the self-attention of each block, and from there to the `attention` function that `model.py` imports.
@@ -1333,7 +1333,7 @@ them.
 
 ## M5.2 — a node for ComfyUI's own WAN model
 
-The author's Rigsy workflow runs WAN on ComfyUI's own nodes (`MODEL`), with `PathchSageAttentionKJ`. The
+The Rigsy workflow runs WAN on ComfyUI's own nodes (`MODEL`), with `PathchSageAttentionKJ`. The
 WanVideoWrapper workflow of M5.1 ran the system out of RAM: both 14B models offloaded to RAM with block
 swap, and the text encoder on the CPU.
 
@@ -1381,7 +1381,7 @@ cos: unica ≥ 0.99992, SageAttention 2 ≥ 0.99985, SageAttention 3 ≥ 0.9939.
 
 ## M5.4 — tile settings at the real shape, 34 020 tokens (prediction, before measuring)
 
-The author's question: every tile choice was measured at 32 760 tokens, the real call has 34 020. What
+The question: every tile choice was measured at 32 760 tokens, the real call has 34 020. What
 changes:
 
 | | 32 760 | 34 020 |
@@ -1442,7 +1442,7 @@ warns about. After ComfyUI's `/free` (unload models), the sweep was run again:
 
 At 1–2K tokens the fixed cost of the separate quantization passes still weighs on so short a call.
 
-**Whole videos** (the author's Rigsy workflow: WAN 2.2 I2V 14B NVFP4, lightx2v 4 steps, 81 frames at
+**Whole videos** (the Rigsy workflow: WAN 2.2 I2V 14B NVFP4, lightx2v 4 steps, 81 frames at
 480 × 864, seed 42; Unica Attention (native) nodes after `PathchSageAttentionKJ` on both models, enabled or
 not; the KJ mode `sageattn_qk_int8_pv_fp8_cuda` for SageAttention 2, `sageattn3` otherwise). The variants
 alternated: an identical prompt is served from ComfyUI's cache (one SageAttention 2 rerun took 1.2 s), and
@@ -1462,7 +1462,7 @@ No ranking of quality follows from one seed.
 
 ## M4.1 — FP4 on sm_120a: which forms exist, and their rates
 
-The author's plan: FP4 in one half of the tile at a time, Q·Kᵀ first, then P·V, then the other way round.
+The plan: FP4 in one half of the tile at a time, Q·Kᵀ first, then P·V, then the other way round.
 Before any kernel, what the hardware offers (compiled with nvcc 13.2, `-arch=sm_120a`):
 
 | PTX | SASS |
@@ -1544,7 +1544,7 @@ half to start with, since P had been the most sensitive operand (M3.3).
 
 ## M4.3 — correcting V's FP4 residual (checked in the emulator, not built)
 
-**Idea** (brought by the author): V = V₁ + R, V₁ in NVFP4, so P·V = P·V₁ + P·R. Correct with all of R, or
+**Idea:** V = V₁ + R, V₁ in NVFP4, so P·V = P·V₁ + P·R. Correct with all of R, or
 only with its largest part. Random 4 × 4096, P in NVFP4 in every row of the table:
 
 | | q × 1 | q × 2 | q × 4 |
@@ -1568,7 +1568,7 @@ V alone: 9.50 % → 0.87 % with the second FP4 term.
 
 ## M4.4 — centred V, FP4 P × FP8 V, two FP4 terms (emulator)
 
-Three ideas of the author's. The price in tensor time of P·V, against today's u8 × s8 (1.0×): one OMMA k64 takes
+Three ideas. The price in tensor time of P·V, against today's u8 × s8 (1.0×): one OMMA k64 takes
 the time of one IMMA k32 and covers twice the keys, so each FP4 term costs 0.5×. e2m1 × e4m3 runs as QMMA k32:
 1.0×. Only `kind::mxf8f6f4` takes e2m1 × e4m3 with block scales, and its scales are ue8m0 per 32 (MXFP4 P,
 MXFP8 V). New in the emulator: `smooth_v`, `p_terms` / `v_terms` (x ≈ x₀ + x₁, x₁ the same format of the
@@ -1604,7 +1604,7 @@ them only within the block.
 
 ## M4.5 — rotating Q and K (Hadamard) before quantization (emulator)
 
-The author's idea: a transform of Q and K that keeps every q·k. An orthogonal H does: (q·H)·(k·H) = q·H·Hᵀ·kᵀ = q·k.
+The idea: a transform of Q and K that keeps every q·k. An orthogonal H does: (q·H)·(k·H) = q·H·Hᵀ·kᵀ = q·k.
 The Hadamard matrix (QuaRot, SpinQuant) mixes the channels of d, so an outlier is spread over all of them.
 `rotate_qk` in the emulator: H block-diagonal in blocks of 16 or 128 channels, applied after the K mean.
 
@@ -1697,7 +1697,7 @@ data.)
 
 ## Baselines — two modes, baseline 1 (2026-11-05)
 
-The author's rule: the baseline is the best result reached so far, and only something better replaces it. A
+The rule: the baseline is the best result reached so far, and only something better replaces it. A
 candidate runs against the current baseline of its mode in the same run, the baseline staying runnable behind
 flags. A win becomes the next baseline (git tag `baseline-N`); a loss stays here as an experiment.
 
@@ -1728,6 +1728,172 @@ A whole 4-step video (M5.5): SageAttention 2 48.7–49.0 s, unica 48.8–49.5 s,
 - The fast mode starts 26–36 % behind SageAttention 3 (75–83 against 58–62 ms), with 11× less error on random
   data and 9.6× less on real data.
 - From M1 (~770 ms): 10.2× at 32 760.
+
+## M4.7 — hypotheses for both modes (written before any of them is tested)
+
+The approach: many hypotheses, tried one after another. Each with the limit it attacks, a number, and the
+test that settles it.
+
+| # | mode | hypothesis | attacks | prediction | test |
+|---|---|---|---|---|---|
+| H1 | accurate | the 2–3 % gap to SageAttention 2 at 34 020 (Baselines) is mostly noise | — | in alternating rounds in one process, unica / SA2 at 34 020 within ±1 % of the ratio at 32 760. The shape costs only the partial last tile and the last wave, ≤ 0.3 % | harness kernels alternating, both shapes |
+| H2 | both | real attention has **negligible tiles**: a block's 64 rows × a 64-key tile in which every P < τ · (running max). Skipping their softmax and P·V changes the output by ≪ the error budget | tensor pipe and the softmax: work that rounds to 0 anyway | very uncertain: **20–40 %** of the (block, tile) pairs at τ = 2⁻¹², error change < 0.05 % abs; 0 % on random data | emulator with a skip threshold and a counter, on the real Q, K, V of a WAN run |
+| H3 | fast | FP4 Q·Kᵀ (variant a) on real data is no better than SageAttention 3 | — | real median ≥ 8 %: real attention is sharp, and a's error grows with sharpness (M4.2) | `emu_fp4qk` in the same WAN run |
+| H4 | accurate | the layout copies of the ComfyUI node ([b, s, h, d] ↔ [b, h, s, d], M5.1) cost ~2 % of a real call | VRAM traffic | ~1.7 ms of a ~83 ms call (4 × 348 MB at 810 GB/s) | quantize kernels and `store_out` read and write the node's layout; timed in the node |
+| H5 | accurate | quantization fused (the K mean and V's max in the same pass as the second read, through L2) and Q quantized inside the attention kernel | VRAM traffic | −1.0 … −1.5 ms of 2.9 ms (M3.20: ~0.8 for K and V, ~0.5 for Q) | compare.py whole call |
+| H6 | accurate | Hadamard rotation of Q and K in the quantize pass | Q·Kᵀ error on uneven channels | speed: a tie (< 0.3 ms, the pass is memory-bound); real median 0.90 → ~0.82 % (M4.6) | compare.py + a WAN run |
+| H7 | fast | the FP4 P·V kernel | tensor pipe (P·V on OMMA, 2×), FMA pipe (no flush: OMMA accumulates f32 into `out`) | kernel **−12 … −20 %**, 75 → 60–66 ms. The block scales of P come almost free: the max of each 16 keys is a node of the row-max tree already computed, so amax(P) of a block = exp2(block max − m) | the kernel, compare.py, a WAN run |
+| H8 | fast | FP4 P·V only in the layers that tolerate it (M4.6: 0.8 % at block 38, 8.3 % at block 1) | — | a per-layer choice keeps the real median near today's at a part of H7's gain | after H7, from the WAN data |
+
+Order: H1 now (local, minutes). H2 and H3 go into one WAN run through the ComfyUI agent. Then H7, the big one.
+
+**H1, result: held — the gap was the harness's order.** Unica and SageAttention 2 in one process, taking turns
+(6 rounds, the order flipped every round, median of 5 calls each):
+
+| | unica | SageAttention 2 | unica / SA2, median | per round |
+|---|---|---|---|---|
+| 32 760 | 76.15 ms | 75.78 ms | 0.996 | 0.970 … 1.017 |
+| 34 020 | 81.40 ms | 82.54 ms | **0.988** | 0.965 … 1.002 |
+
+At the real shape unica is level with SageAttention 2 or ~1 % ahead, not 2–3 % behind. bench/harness.py always
+runs the kernels in the same order, unica last, after SDPA's half-second calls and SageAttention 3, at the power
+limit (M3.22). Its single numbers are fine for a table; a comparison between two kernels needs alternating
+rounds. The per-round ratio spreads over ±2–3 %, so the accurate mode's +1–3 % has to be read from medians of
+several rounds.
+
+**H2, first look (synthetic):** on random data no tile is ever negligible for a whole block, even at q × 8, where
+68 % of single rows' tiles are. A block can skip only when all its 64 rows can, and random rows are independent.
+With rows made alike in blocks of 64 (q × 8), 30.5 % of the pairs could skip at τ = 2⁻¹², and the error does not
+move (4.059 % both ways). Real video tokens are neighbours in space and time; whether their rows are alike enough
+is what the WAN run measures.
+
+**H2 and H3 on real data** (the M4.6 setup again, `measure_every` 7, the same 22 blocks;
+`build/wan_attention_errors_m4.7.csv`). Shares of (block, tile) pairs that could skip, by rows deciding together
+and threshold τ; errors rel L2:
+
+| step, block | unica | FP4 Q·Kᵀ (a) | FP4 P·V (b) | SA3 | skip, 64 rows, τ = 2⁻¹² / 2⁻²⁰ | skip, 16 rows, τ = 2⁻¹² / 2⁻²⁰ |
+|---|---|---|---|---|---|---|
+| 1, 1 | 1.108 | 9.16 | 8.30 | 11.95 | 4.3 / 0.0 % | 29.9 / 13.0 % |
+| 1, 8 | 0.920 | 7.07 | 5.01 | 8.63 | 2.7 / 0.0 % | 8.3 / 0.0 % |
+| 2, 3 | 1.277 | 10.10 | 8.11 | 12.65 | **19.8** / 5.8 % | 37.9 / 12.5 % |
+| 3, 33 | 0.876 | 12.43 | 6.43 | 14.00 | **38.6** / 21.1 % | 41.8 / 26.3 % |
+| the other 18 blocks | 0.18–1.36 | 0.57–11.46 | 0.81–6.32 | 2.08–11.48 | ≤ 0.7 / 0.0 % | ≤ 4.0 / 0.0 % |
+| **median of 22** | **0.90 %** | **7.41 %** | **3.67 %** | **8.67 %** | **0.05** / 0.00 % | 0.86 / 0.00 % |
+| mean of 22 | | | | | 3.1 / 1.2 % | 6.1 / 2.4 % |
+
+- **H2: wrong.** Predicted 20–40 % of the pairs at τ = 2⁻¹²; the median block has 0.05 %. Negligible tiles exist
+  in 3 of 22 blocks only, the same blocks whose channels are very uneven (M4.6: 1, 3, 33), up to 39 % there.
+  Averaged over the blocks, a kernel that skips per block of 64 rows would drop ~3 % of the softmax and P·V work,
+  ~1.5 % of the time at best, and it would pay a block-wide vote in every tile. Below what M3.10 showed can be
+  read. Per warp (16 rows) there is twice as much, but the per-tile barrier keeps a warp that skips waiting for
+  the others. Not pursued.
+- The error cost of skipping at τ = 2⁻¹² does not show: `emu_skip12` is below the kernel in every row by
+  0.000–0.042 pp, also in the blocks with nothing skipped. That is the emulator's own small offset from the
+  kernel, not an effect of skipping (an emulator-to-emulator column would have been the clean comparison).
+- **H3: held, nearly.** FP4 Q·Kᵀ on real data: median 7.41 %, against SageAttention 3's 8.67 % (predicted ≥ 8 %).
+  FP4 P·V does twice as well (3.67 %) in 21 of 22 blocks; the exception is block 38, where all errors are at the
+  floor. Variant b stays the fast mode's path.
+
+## M4.8 — H7: the FP4 P·V kernel, `attention_fp4pv` (prediction, before measuring)
+
+**The m16n8k64 NVFP4 mma, measured on the card first** (a probe with every lane's registers given, against torch):
+lane l holds k = 8 · (l % 4) + 32 · (r / 2) + j of row l / 4 + 8 · (r % 2) in nibble j of A register r; k = 8 · (l % 4) +
+32 · r + j of column l / 4 in B register r; D as in every m16n8. Scale registers: byte i covers k 16i .. 16i + 15;
+with selector 0, lane 4g gives the scales of A's row g, lane 4g + 1 those of row g + 8, lane 4g those of B's column
+g, and the other lanes' registers are not read. Random values and scales: 1e-7 from torch (f32 summation order).
+
+**Design** (`attention_int8pv_tma` with the P·V half replaced; Q·Kᵀ, its pipelining, K tiles unchanged):
+
+- **P** against the running max, times 2¹⁰, so block scales of P stay inside e4m3 (≤ 1024 / 6 < 448). No tile-local
+  max and no beta: the block scales keep the range, and the mma adds straight into `out` in f32. **No flush.**
+- **Block scales of P from the row-max tree.** A lane's 8 scores of a row in one half of the tile and its neighbour's
+  (lane ^ 1) are one block of 16 in the mma's k order; lane ^ 2 has the other block. The first two shuffle steps of
+  the row max are the block maxes. scale = e4m3(max P / 6), and P̂ = P / scale comes out of the exponent itself:
+  2^(s · c + gain − max − lg2(scale)), the same FFMA as before with a per-block offset.
+- **V4** (`quantize_v4`): per head and tile, 128 rows of 48 bytes, one per channel: 64 e2m1 in slot order, then the
+  e4m3 scales of rows 0..31 placed for 4 LDS.128 per lane. One `ldmatrix.x4` (b16, not transposed) gives B for two
+  blocks of 8 channels. A scale per channel outside the mma (max / 2688), applied in `store_out`. Bit for bit the
+  emulator (tests/test_fp4.py), after one finding: · (1/6), not / 6, as torch does it (M3.2), or a scale on an e4m3 tie
+  (152 between 144 and 160) lands on the other side.
+- **Row sum by the tensor core:** a 17th mma per tile against a column of ones gives Σ P̂ · scale, rescaled with
+  `out`. No FADD, no IDP4A.
+- The emulator follows the kernel exactly (`fp4_slots`, `p_outer`, `v_outer`): kernel vs emulator 0.000–0.031 % on all
+  6 shapes of test_attention, cross-attention and a single token included. rel L2 on random data 13.7 % (b of M4.2:
+  13.67 %).
+
+Compiled (ptxas -v): **219 registers** (TMA kernel 235), no spills, **40.0 KB** shared memory (46.1).
+
+**Hypotheses** (per warp and tile, against `attention_int8pv_tma`'s 467 executed instructions):
+
+| | predicted |
+|---|---|
+| removed | 32 IMMA → 17 OMMA; 16 → 8 V `ldmatrix`; flush 64 I2FP + 64 FFMA; 16 F2IP; 8 IDP4A + row sum; beta |
+| added | block maxes (~+8), 4 block scales (EX2, cvt to e4m3 and back, LG2: ~24), 16 cvt to e2m1 + packing (~12), 4 LDS.128, shuffle and PRMT of the scale register |
+| executed per tile | **~340–360** (−23 … −27 %) |
+| tensor time per tile | 64 IMMA → 32 IMMA + 17 OMMA of the same issue time: **−23 %** |
+| tensor pipe (ncu) | about as busy as now (~75 %): both the work and the instructions around it shrink |
+| kernel time, 40 × 32 760 | **−15 … −22 %**: 73 → 57–62 ms. Under the power limit fewer instructions and half the V bytes per tile mean less energy per tile, so the clock should not drop |
+| whole call vs SageAttention 3 (58.5–59.2 ms) | **within ±5 %** |
+| error | random 13.7 %; real WAN median 3.7 % (M4.6), against SageAttention 3's 19.1 % and 8.7 % |
+
+## M4.8 — result
+
+ncu, 4 heads (both 1.97 warps per scheduler, 2 blocks per SM):
+
+| | `attention_int8pv_tma` | `attention_fp4pv` | predicted |
+|---|---|---|---|
+| executed per warp and tile | 467.2 | **369.3 (−21 %)** | 340–360: a little more |
+| active cycles | 16.96 M | **14.53 M (−14.3 %)** | |
+| tensor pipe | 75.5 % | **67.4 %** | ~75 %: **missed** |
+| SFU (xu) | 21.2 % | 28.9 % | |
+| FMA / ALU pipe | 10.1 / 12.0 % | 6.5 / 10.7 % | |
+| issue slots busy | 34.4 % | 31.5 % | |
+| stalls (per warp, K): wait / math pipe / MIO / short scoreboard / barrier | 348 / 344 / 37 / 99 / 136 | 293 / 224 / **70** / 71 / 63 | |
+| static SASS of the function (3 copies of the tile) | IMMA 192, F2FP 32, MUFU 114 | IMMA 96 + **OMMA 51**, **F2FP 104**, MUFU 132, SHFL 25 | |
+
+Wall time, whole call, one process, 6 rounds taking turns with the order flipped, ComfyUI's models unloaded:
+
+| | 32 760 | 34 020 |
+|---|---|---|
+| SageAttention 2 | 80.0 ms | 81.6 ms |
+| **SageAttention 3** | **60.6 ms** | **60.8 ms** |
+| baseline 1 (`attention_int8pv_tma`) | 78.0 ms | 79.6 ms |
+| **`attention_fp4pv`** | **68.6 ms (+13.3 % on SA3)** | **69.8 ms (+14.9 % on SA3)** |
+
+(compare.py in an earlier run, kernel alone: 75.1 → 66.0 ms at 32 760, 78.5 → 68.1 ms at 34 020: −12.1 / −13.2 %.)
+
+| | predicted | measured |
+|---|---|---|
+| kernel | −15 … −22 % | **−12 … −13 %: missed, below the range** |
+| whole call vs SageAttention 3 | within ±5 % | **+13 … +15 %: missed** |
+
+- **What held:** the instructions (−21 %), the registers (219), the error (= the emulator, 13.7 % on random data).
+- **What missed:** the tensor time fell by 23 %, the cycles by 14 %: the tensor pipe now idles a third of the time
+  (75 → 67 %). The new work sits on the SFU's pipe (F2FP: 16 conversions to e2m1 and 8 for the scales per tile, xu
+  21 → 29 %) and on MIO (shuffles for the block maxes and the scale register: MIO stalls ×1.9).
+- **Fast mode against SageAttention 3:** 13–15 % slower, with 1.4× less error on random data (13.7 against 19.1 %)
+  and 2.4× less on real data (3.7 against 8.7 %, M4.6). Not a win yet by the mode's rule. From baseline 1: −12 %.
+- **Under sustained load the gain is smaller.** build/scratch/clock_probe.py (6 s of calls each, kernel alone, two
+  pairs): `attention_int8pv_tma` 77.6 / 79.3 ms at 2655 / 2677 MHz, `attention_fp4pv` 71.9 / 72.7 ms at 2715 / 2707
+  MHz, all four at 360 W. The FP4 kernel spends less energy per cycle (+1–2 % clock at the same power), and yet
+  gains only **−7 … −8 %** here, against −12 … −13 % in rounds of 5 calls. Not explained yet; a 4-step video is
+  closer to the sustained case.
+
+## M4.9 — H7a: P's block scales as powers of two (prediction, then result)
+
+**What it attacks:** the chain from a block's max to P's exponents. With e4m3 scales it is EX2 → cvt to e4m3 → cvt
+back → LG2 → offset, before the 32 EX2 of P and the P·V mma can start. With 2^e scales e = ceil(s_max · c + 10 −
+log2 6 − m) comes from the scores with an F2I, and the scale byte with integer operations.
+
+**Accuracy first** (emulator, `p_pow2`): random 13.74 → **17.17 %**, q × 2 12.23 → 13.87 %, q × 4 10.25 → 10.60 %.
+
+**Hypothesis:** −3 … −6 % of the kernel, if the chain is on the critical path; 0 if ptxas already hides it under
+Q·Kᵀ(t + 1).
+
+**Result: 0.** Active cycles 14.51 M against 14.53 M; static MUFU −24 and F2FP −24 (xu 28.9 → 26.2 %), executed
+instructions +1.7 % (the integer encoding of the scale byte). Wall time, same run as above: 68.1 / 71.0 ms against
+68.6 / 69.8 ms, within the spread. The chain was not the limit: it runs under the next tile's Q·Kᵀ. 3.4 points of
+error for nothing; **not kept**, the kernel is back to e4m3 scales (the emulator keeps `p_pow2`).
 
 ## M2 — instruction budget, the input for M3
 

@@ -1539,3 +1539,301 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
 
     store_out(O + q_offset, out, row_sum, row, col, n_rows, v_scale);
 }
+
+// ---------------------------------------------------------------------------------------------------
+// M4.8: P·V in NVFP4 (e2m1 values, an e4m3 scale per 16 keys), mma.sync m16n8k64 kind::mxf4nvf4, which runs
+// at twice the 8-bit rate and accumulates in f32 itself (LOG.md M4.1).
+// ---------------------------------------------------------------------------------------------------
+
+constexpr int MMA_K4 = 64;          // keys in one m16n8k64: a whole tile
+constexpr int FP4_SCALE_BLOCK = 16;  // keys per e4m3 scale
+// attention_fp4pv takes a tile of 64 keys in one mma, so it exists only in builds with KEYS_PER_TILE = 64
+// Measured on the card (LOG.md M4.8): lane l holds k = 8 · (l % 4) + 32 · (r / 2) + j of row l / 4 + 8 · (r % 2)
+// in nibble j of A register r, and k = 8 · (l % 4) + 32 · r + j of column l / 4 in B register r. Q·Kᵀ leaves
+// lane l the scores of keys 8 · b + 2 · (l % 4) + {0, 1}, b = 0..7. Packed in order, blocks 4h .. 4h + 3 into
+// A register 2h (+1), they put key 32h + 8 · (j / 2) + 2 · (l % 4) + j % 2 at slot k = 32h + 8 · (l % 4) + j:
+__host__ __device__ constexpr int fp4_slot_key(int slot) {
+    return 32 * (slot / 32) + 8 * (slot % 8 / 2) + 2 * (slot % 32 / 8) + slot % 2;
+}
+
+// V4: per head and tile, HEAD_DIM rows of V4_ROW_BYTES, one per channel. Bytes 0..31 hold the channel's 64
+// keys as e2m1 in slot order, slot 2b in the low nibble of byte b: an 8 × 16-byte matrix of ldmatrix (non-
+// transposed) gives lane l word l % 4 of row l / 4, which is B register 0 of m16n8k64 (bytes 0..15) or 1
+// (bytes 16..31). Bytes 32..47 of rows 0..31 hold the e4m3 scales, 4 per channel (byte i = slots 16i ..
+// 16i + 15), placed so that lane l reads the 16 channels l / 4 + 8n it needs with 4 LDS.128: channel d at
+// row d % 8 + 8 · (d / 32), word d / 8 % 4. 48-byte rows: the 8 rows of an ldmatrix start in 8 different
+// groups of 4 banks.
+constexpr int V4_ROW_BYTES = 48;
+constexpr int V4_TILE_BYTES = HEAD_DIM * V4_ROW_BYTES;
+constexpr int V4_SCALE_OFFSET = 32;
+
+__device__ __forceinline__ int v4_scale_row(int dim) { return dim % 8 + 8 * (dim / 32); }
+
+// Eight floats as e2m1, nearest, ties to even, saturating at ±6: x[j] in nibble j.
+__device__ __forceinline__ uint32_t pack_e2m1x8(const float x[8]) {
+    uint32_t word;
+    asm("{ .reg .b8 b0, b1, b2, b3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n"
+        "mov.b32 %0, {b0, b1, b2, b3}; }"
+        : "=r"(word)
+        : "f"(x[0]), "f"(x[1]), "f"(x[2]), "f"(x[3]), "f"(x[4]), "f"(x[5]), "f"(x[6]), "f"(x[7]));
+    return word;
+}
+
+// x ≥ 0 as an e4m3 byte, nearest, saturating at 448; and the byte back as a float.
+__device__ __forceinline__ uint32_t to_e4m3(float x) {
+    uint16_t pair;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(pair) : "f"(x));
+    return pair & 0xff;
+}
+__device__ __forceinline__ float from_e4m3(uint32_t byte) {
+    uint32_t halves;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halves) : "h"(uint16_t(byte)));
+    return __half2float(__ushort_as_half(uint16_t(halves & 0xffff)));
+}
+
+// V for attention_fp4pv: per channel, v ≈ e2m1 · (e4m3 scale per 16 keys) · v_outer[channel], v_outer =
+// max |v| of the channel / (6 · 448), so the largest scale is 448. One thread per (head, tile, block of 16
+// slots, channel), channels fastest: a warp reads 32 neighbouring channels of the same keys. Keys past n_tokens
+// are zeros. Bit for bit bench/emulate.py's block_scaled(..., "nvfp4", outer="channel") on V in slot order
+// (tests/test_fp4.py). Grid: ceil(heads · tiles · 4 · HEAD_DIM / QUANTIZE_THREADS).
+extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
+    quantize_v4(const __nv_bfloat16* V, const float* v_outer, uint8_t* V4, int n_tokens, int n_threads) {
+    const int index = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
+    if (index >= n_threads) return;
+    const int dim = index % HEAD_DIM;
+    const int block = index / HEAD_DIM % (MMA_K4 / FP4_SCALE_BLOCK);
+    const int tile_of_head = index / (HEAD_DIM * MMA_K4 / FP4_SCALE_BLOCK);  // head · tiles + tile
+    const int tiles = (n_tokens + MMA_K4 - 1) / MMA_K4;
+    const int head = tile_of_head / tiles, tile = tile_of_head % tiles;
+    const float outer = v_outer[head * HEAD_DIM + dim];
+
+    float values[FP4_SCALE_BLOCK];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < FP4_SCALE_BLOCK; ++i) {
+        const int key = tile * MMA_K4 + fp4_slot_key(block * FP4_SCALE_BLOCK + i);
+        values[i] = key < n_tokens ? __bfloat162float(V[(size_t(head) * n_tokens + key) * HEAD_DIM + dim]) : 0.0f;
+        amax = fmaxf(amax, fabsf(values[i]));
+    }
+    // · (1/6), not / 6, as in quantize_int8: torch divides by a scalar through its reciprocal, and the two differ in
+    // the last bit, which moves a scale that lies on a tie of e4m3 (152 between 144 and 160) to the other side
+    const uint32_t scale_byte = to_e4m3(amax * (1.0f / 6.0f) / outer);
+    const float scale = from_e4m3(scale_byte) * outer;
+#pragma unroll
+    for (int i = 0; i < FP4_SCALE_BLOCK; ++i) values[i] = scale > 0.0f ? values[i] / scale : 0.0f;
+
+    uint8_t* row = V4 + size_t(tile_of_head) * V4_TILE_BYTES;
+    *reinterpret_cast<uint2*>(row + dim * V4_ROW_BYTES + block * 8) = make_uint2(pack_e2m1x8(values), pack_e2m1x8(values + 8));
+    row[v4_scale_row(dim) * V4_ROW_BYTES + V4_SCALE_OFFSET + 4 * (dim / 8 % 4) + block] = uint8_t(scale_byte);
+}
+
+#if UNICA_KEYS_PER_TILE == 64
+constexpr float P_LOG2_GAIN = 10.0f;  // P is taken times 2^10: block scales of P up to 1024 / 6 stay below 448
+constexpr uint32_t E2M1_ONES = 0x22222222, UE4M3_ONES = 0x38383838;  // 1.0 in every nibble, in every byte
+
+// out += A · Bᵀ, A e2m1 16 × 64 and B e2m1 8 × 64, each block of 16 k times its e4m3 scale, f32 accumulate.
+// scale_a: in lane 4g the 4 scales of row g, in lane 4g + 1 those of row g + 8; scale_b: in lane 4g those of
+// column g; byte i for k 16i .. 16i + 15 (LOG.md M4.8). The other lanes' scale registers are not read.
+__device__ __forceinline__ void mma_nvf4_16864(float acc[4], const uint32_t a[4], const uint32_t b[2], uint32_t scale_a,
+                                               uint32_t scale_b) {
+    asm("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};"
+        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(scale_a), "r"(scale_b));
+}
+
+__device__ __forceinline__ float lg2_approx(float x) {
+    float y;
+    asm("lg2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+// Online softmax for an NVFP4 P. P is taken against the running max (no beta: the block scales keep the range,
+// and the mma adds straight into out), times 2^P_LOG2_GAIN. Each block of 16 keys gets the scale
+// e4m3(max P / 6), and P̂ = P / scale comes out of the exponent itself: 2^(s · scale_log2 + offset) with
+// offset = gain − max − log2(scale). The block maxes are the first two steps of the row-max tree: a lane has 8
+// scores of a row in each half h of the tile, its neighbour (lane ^ 1) the other 8 of the same block, and lane ^ 2
+// the other block of that half. p gets the A fragment, scale_p the A scale register of lanes 4g and 4g + 1.
+__device__ __forceinline__ void online_softmax_fp4(const float scores[KEY_BLOCKS][4], float row_max[2], float alpha[2],
+                                                   uint32_t p[4], uint32_t& scale_p, float scale_log2, int lane) {
+    float block_max[2][2];  // [half][h]: this lane's block of row g + 8 · half in half h of the tile
+    float tile_max[2];
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            float m = -CUDART_INF_F;
+#pragma unroll
+            for (int block = 4 * h; block < 4 * h + 4; ++block)
+                m = fmaxf(m, fmaxf(scores[block][2 * half], scores[block][2 * half + 1]));
+            block_max[half][h] = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 1));
+        }
+        const float mine = fmaxf(block_max[half][0], block_max[half][1]);
+        tile_max[half] = fmaxf(mine, __shfl_xor_sync(0xffffffff, mine, 2)) * scale_log2;
+    }
+    uint32_t own_scales = 0;  // byte 2 · half + h
+    float offset[2][2];
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const float new_max = fmaxf(row_max[half], tile_max[half]);
+        alpha[half] = exp2_ftz(row_max[half] - new_max);
+        row_max[half] = new_max;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const float block_p = exp2_ftz(fmaf(block_max[half][h], scale_log2, P_LOG2_GAIN - new_max));
+            const uint32_t byte = to_e4m3(block_p * (1.0f / 6.0f));
+            // a scale of 0 (the block's P below 2^-10 · 6 / 1024) zeroes the block in the mma; FLT_MIN keeps the
+            // offset finite, so a masked score (−inf) still gives 0, not NaN
+            offset[half][h] = P_LOG2_GAIN - new_max - lg2_approx(fmaxf(from_e4m3(byte), 1.17549435e-38f));
+            own_scales |= byte << (8 * (2 * half + h));
+        }
+    }
+    // lane 4g needs row g's scales of blocks 0..3 = (h0, own pair), (h0, other), (h1, own), (h1, other); lane
+    // 4g + 1 the same of row g + 8. The other pair of keys is in lane ^ 2.
+    const uint32_t other_scales = __shfl_xor_sync(0xffffffff, own_scales, 2);
+    scale_p = __byte_perm(own_scales, other_scales, lane & 1 ? 0x7362 : 0x5140);
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int half = r % 2, h = r / 2;
+        float x[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) x[j] = exp2_ftz(fmaf(scores[4 * h + j / 2][2 * half + j % 2], scale_log2, offset[half][h]));
+        p[r] = pack_e2m1x8(x);
+    }
+}
+
+// out = out · alpha + P̂ · V̂ for one tile, V̂ in V4 rows in shared memory. One ldmatrix.x4 gives B for two blocks of 8
+// channels; lane l reads the scales of channels l / 4 + 8n with 4 LDS.128. A 17th mma against a column of ones
+// gathers Σ P̂ · scale into row_sum_acc (row g in lane 4g's [0], row g + 8 in its [2], 0 elsewhere): the
+// denominator over exactly the P the numerator used, rescaled with out.
+__device__ __forceinline__ void pv_fp4(float out[D_BLOCKS][4], float row_sum_acc[4], const uint32_t p[4], uint32_t scale_p,
+                                       const uint8_t* v_tile, const float alpha[2], int lane) {
+    if (!__all_sync(0xffffffff, alpha[0] == 1.0f && alpha[1] == 1.0f)) {
+        rescale_out(out, alpha);
+        row_sum_acc[0] *= alpha[0];
+        row_sum_acc[1] *= alpha[0];
+        row_sum_acc[2] *= alpha[1];
+        row_sum_acc[3] *= alpha[1];
+    }
+    uint32_t scale_v[D_BLOCKS];
+#pragma unroll
+    for (int n = 0; n < 4; ++n) {
+        const uint4 words = *reinterpret_cast<const uint4*>(v_tile + (lane / 4 + 8 * n) * V4_ROW_BYTES + V4_SCALE_OFFSET);
+        scale_v[4 * n] = words.x;
+        scale_v[4 * n + 1] = words.y;
+        scale_v[4 * n + 2] = words.z;
+        scale_v[4 * n + 3] = words.w;
+    }
+    // matrices: rows 16i .. 16i + 7 bytes 0..15 and 16..31, then rows 16i + 8 .. 16i + 15 likewise
+    const uint8_t* lane_row = v_tile + (lane % 8 + 8 * (lane / 16)) * V4_ROW_BYTES + 16 * (lane / 8 % 2);
+#pragma unroll
+    for (int pair = 0; pair < D_BLOCKS / 2; ++pair) {
+        uint32_t b[4];
+        ldmatrix_x4(b, lane_row + 16 * pair * V4_ROW_BYTES);
+        const uint32_t left[2] = {b[0], b[1]}, right[2] = {b[2], b[3]};
+        mma_nvf4_16864(out[2 * pair], p, left, scale_p, scale_v[2 * pair]);
+        mma_nvf4_16864(out[2 * pair + 1], p, right, scale_p, scale_v[2 * pair + 1]);
+    }
+    const uint32_t ones[2] = {lane < 4 ? E2M1_ONES : 0u, lane < 4 ? E2M1_ONES : 0u};  // column 0 only
+    mma_nvf4_16864(row_sum_acc, p, ones, scale_p, UE4M3_ONES);
+}
+
+// M4.8: attention_int8pv_tma with P·V in NVFP4. Q·Kᵀ, its pipelining and the K tiles are unchanged. v_map: V4
+// (quantize_v4) as rows of V4_ROW_BYTES, box V4_ROW_BYTES × HEAD_DIM: one tile. v_outer: the float scale per
+// channel, applied in store_out. Arguments, grid and block as attention_int8pv_tma.
+extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
+    attention_fp4pv(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
+                    const int8_t* Q8, const float* q_scale, const float* k_scale, const float* v_outer,
+                    __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2) {
+    __shared__ __align__(128) int8_t k_tiles[2][K_TILE_BYTES];
+    __shared__ __align__(128) uint8_t v_tiles[2][V4_TILE_BYTES];
+    __shared__ __align__(16) int8_t q_tiles[WARPS_PER_BLOCK][ROWS_PER_WARP * K8_STRIDE];
+    __shared__ __align__(8) uint64_t landed[3];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row = lane / 4;
+    const int col = 2 * (lane % 4);
+
+    const int row0 = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP;
+    const int n_rows = min(n_queries - row0, ROWS_PER_WARP);
+
+    const size_t q_offset = (size_t(blockIdx.y) * n_queries + row0) * HEAD_DIM;
+    v_outer += size_t(blockIdx.y) * HEAD_DIM;
+    k_scale += size_t(blockIdx.y) * ((n_keys + K_SCALE_BLOCK - 1) / K_SCALE_BLOCK);
+    const float q_scale_log2 =
+        q_scale[size_t(blockIdx.y) * ((n_queries + Q_SCALE_BLOCK - 1) / Q_SCALE_BLOCK) + row0 / Q_SCALE_BLOCK] *
+        scale_log2;
+    const int n_tiles = (n_keys + KEYS_PER_TILE - 1) / KEYS_PER_TILE;
+
+    const int k_row0 = blockIdx.y * n_keys;
+    const int v_row0 = blockIdx.y * n_tiles * HEAD_DIM;
+    auto load_k = [&](int buffer, int tile, uint64_t* barrier) {
+        tma_load_2d(k_tiles[buffer], k_map, 0, k_row0 + tile * KEYS_PER_TILE, barrier);
+    };
+    auto load_v = [&](int buffer, int tile, uint64_t* barrier) {
+        tma_load_2d(v_tiles[buffer], v_map, 0, v_row0 + tile * HEAD_DIM, barrier);
+    };
+
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 3; ++i) mbarrier_init(&landed[i], 1);
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        mbarrier_expect_bytes(&landed[2], (n_tiles > 1 ? 2 : 1) * K_TILE_BYTES + V4_TILE_BYTES);
+        load_k(0, 0, &landed[2]);
+        load_v(0, 0, &landed[2]);
+        if (n_tiles > 1) load_k(1, 1, &landed[2]);
+    }
+    load_q8_async(q_tiles[warp], Q8 + q_offset, Q8, n_rows, lane);
+    cp_async_commit();
+
+    float row_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
+    float row_sum_acc[4] = {};
+    float out[D_BLOCKS][4] = {};
+
+    cp_async_wait();
+    mbarrier_wait(&landed[2], 0);
+    __syncthreads();
+    float scores[2][KEY_BLOCKS][4];
+    qk_scores_int8_q_smem(scores[0], q_tiles[warp], k_tiles[0], lane);
+    if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
+
+    auto iteration = [&](int t, auto parity) {
+        constexpr int now = decltype(parity)::value, later = 1 - now;
+        const int key0 = t * KEYS_PER_TILE;
+        if (t > 0) mbarrier_wait(&landed[later], (t - 1) / 2 % 2);
+        __syncthreads();
+        if (threadIdx.x == 0 && t + 1 < n_tiles) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            mbarrier_expect_bytes(&landed[now], (t + 2 < n_tiles ? K_TILE_BYTES : 0) + V4_TILE_BYTES);
+            if (t + 2 < n_tiles) load_k(now, t + 2, &landed[now]);
+            load_v(later, t + 1, &landed[now]);
+        }
+
+        float alpha[2];
+        uint32_t p[4], scale_p;
+        qk_scores_int8_q_smem(scores[later], q_tiles[warp], k_tiles[later], lane);  // stale in the last iteration
+        online_softmax_fp4(scores[now], row_max, alpha, p, scale_p, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], lane);
+        pv_fp4(out, row_sum_acc, p, scale_p, v_tiles[now], alpha, lane);
+
+        const int next_valid = n_keys - key0 - KEYS_PER_TILE;
+        if (next_valid < KEYS_PER_TILE) mask_scores(scores[later], col, next_valid);
+    };
+
+    int t = 0;
+    for (; t + 1 < n_tiles; t += 2) {
+        iteration(t, Parity<0>{});
+        iteration(t + 1, Parity<1>{});
+    }
+    if (t < n_tiles) iteration(t, Parity<0>{});
+
+    const float row_sum[2] = {row_sum_acc[0], row_sum_acc[2]};  // 0 outside lane 4g: store_out's quad sum adds them
+    store_out(O + q_offset, out, row_sum, row, col, n_rows, v_outer);
+}
+#endif  // UNICA_KEYS_PER_TILE == 64
