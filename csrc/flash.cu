@@ -321,17 +321,18 @@ __device__ __forceinline__ void p_fragment(uint32_t p[4], const float scores[KEY
 // O = out / sum as bf16, two neighbouring values per 32-bit store. Rows at or past n_rows are not written.
 // v_scale (M3.3): one scale per channel of a quantized V, applied here once instead of in every tile.
 __device__ __forceinline__ void store_out(__nv_bfloat16* O, const float out[D_BLOCKS][4], const float row_sum[2],
-                                          int row, int col, int n_rows, const float* v_scale = nullptr) {
+                                          int row, int col, int n_rows, const float* v_scale = nullptr,
+                                          long long row_stride = HEAD_DIM) {
     const float inv_sum[2] = {1.0f / quad_sum(row_sum[0]), 1.0f / quad_sum(row_sum[1])};
 #pragma unroll
     for (int block = 0; block < D_BLOCKS; ++block) {
         const int dim = block * MMA_N + col;
         const float scale[2] = {v_scale ? v_scale[dim] : 1.0f, v_scale ? v_scale[dim + 1] : 1.0f};
         if (row < n_rows)
-            *reinterpret_cast<__nv_bfloat162*>(O + row * HEAD_DIM + dim) = __floats2bfloat162_rn(
+            *reinterpret_cast<__nv_bfloat162*>(O + row * row_stride + dim) = __floats2bfloat162_rn(
                 out[block][0] * inv_sum[0] * scale[0], out[block][1] * inv_sum[0] * scale[1]);
         if (row + 8 < n_rows)
-            *reinterpret_cast<__nv_bfloat162*>(O + (row + 8) * HEAD_DIM + dim) = __floats2bfloat162_rn(
+            *reinterpret_cast<__nv_bfloat162*>(O + (row + 8) * row_stride + dim) = __floats2bfloat162_rn(
                 out[block][2] * inv_sum[1] * scale[0], out[block][3] * inv_sum[1] * scale[1]);
     }
 }
@@ -702,6 +703,17 @@ __device__ __forceinline__ float block_max(float x) {
 }
 
 // 8 neighbouring values of one row as float, minus the mean of their dims if there is one.
+// M4.17: where a token of one head starts in a q, k, v or output tensor whose last dimension is contiguous: [b, h, s, d]
+// (contiguous) or [b, s, h, d] (ComfyUI's), or any other strides. head is batch · heads + head. Strides in elements.
+// Passed by value; unica.TokenLayout must match it field for field (32 bytes).
+struct TokenLayout {
+    long long batch, head, token;
+    int heads;
+    __device__ __forceinline__ size_t offset(int head_index, int token_index) const {
+        return size_t(head_index / heads) * batch + size_t(head_index % heads) * head + size_t(token_index) * token;
+    }
+};
+
 __device__ __forceinline__ void load_chunk(float values[CHUNK], const __nv_bfloat16* src, const float* mean) {
     const uint4 raw = *reinterpret_cast<const uint4*>(src);
     const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
@@ -717,21 +729,22 @@ __device__ __forceinline__ void load_chunk(float values[CHUNK], const __nv_bfloa
 // x ≈ x8 · scale with x = X − mean (mean [heads][HEAD_DIM], or null). Bit for bit what bench/emulate.py's
 // quant() computes: the same max, the same IEEE division (nvcc's default), round half to even like
 // torch.round. The block is read twice; the second read comes from L2, not from VRAM.
-// Grid: (ceil(n_tokens / block_tokens), heads). Block: QUANTIZE_THREADS.
+// Grid: (ceil(n_tokens / block_tokens), heads). Block: QUANTIZE_THREADS. X in any TokenLayout; X8 [heads][n_tokens][HEAD_DIM].
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
-    quantize_int8(const __nv_bfloat16* X, const float* mean, int8_t* X8, float* scale, int n_tokens, int block_tokens) {
+    quantize_int8(const __nv_bfloat16* X, const float* mean, int8_t* X8, float* scale, int n_tokens, int block_tokens,
+                  TokenLayout in) {
     const int token0 = blockIdx.x * block_tokens;
     const int n_chunks = min(block_tokens, n_tokens - token0) * CHUNKS_PER_ROW;
-    const size_t offset = (size_t(blockIdx.y) * n_tokens + token0) * HEAD_DIM;
-    X += offset;
-    X8 += offset;
+    X8 += (size_t(blockIdx.y) * n_tokens + token0) * HEAD_DIM;
+    // chunk c of the block: token token0 + c / CHUNKS_PER_ROW, dims c % CHUNKS_PER_ROW · CHUNK (X in its own layout)
+    auto x_chunk = [&](int chunk) { return X + in.offset(blockIdx.y, token0 + chunk / CHUNKS_PER_ROW) + chunk % CHUNKS_PER_ROW * CHUNK; };
     if (mean) mean += blockIdx.y * HEAD_DIM;
 
     float local_max = 0.0f;
     for (int chunk = threadIdx.x; chunk < n_chunks; chunk += QUANTIZE_THREADS) {
         const int dim = chunk % CHUNKS_PER_ROW * CHUNK;
         float values[CHUNK];
-        load_chunk(values, X + chunk * CHUNK, mean ? mean + dim : nullptr);
+        load_chunk(values, x_chunk(chunk), mean ? mean + dim : nullptr);
 #pragma unroll
         for (int i = 0; i < CHUNK; ++i) local_max = fmaxf(local_max, fabsf(values[i]));
     }
@@ -743,7 +756,7 @@ extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     for (int chunk = threadIdx.x; chunk < n_chunks; chunk += QUANTIZE_THREADS) {
         const int dim = chunk % CHUNKS_PER_ROW * CHUNK;
         float values[CHUNK];
-        load_chunk(values, X + chunk * CHUNK, mean ? mean + dim : nullptr);
+        load_chunk(values, x_chunk(chunk), mean ? mean + dim : nullptr);
         uint32_t packed[2] = {0, 0};
 #pragma unroll
         for (int i = 0; i < CHUNK; ++i) {
@@ -1039,12 +1052,14 @@ __device__ __forceinline__ size_t v8_offset(int layout, int chunk, int n_tokens)
 // layout (M3.17, see v8_offset): 0 [heads][n_tokens][HEAD_DIM]; 1 and 2 for TMA, [heads][v8_tokens][HEAD_DIM]
 // bytes each.
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
-    quantize_v(const __nv_bfloat16* V, const float* v_scale, int8_t* V8, int n_tokens, int n_chunks, int layout) {
+    quantize_v(const __nv_bfloat16* V, const float* v_scale, int8_t* V8, int n_tokens, int n_chunks, int layout,
+               TokenLayout in) {
     const int chunk = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
     if (chunk >= n_chunks) return;
     const float* scale = v_scale + chunk / (n_tokens * CHUNKS_PER_ROW) * HEAD_DIM + chunk % CHUNKS_PER_ROW * CHUNK;
     float values[CHUNK];
-    load_chunk(values, V + size_t(chunk) * CHUNK, nullptr);
+    load_chunk(values, V + in.offset(chunk / (n_tokens * CHUNKS_PER_ROW), chunk / CHUNKS_PER_ROW % n_tokens) +
+                           chunk % CHUNKS_PER_ROW * CHUNK, nullptr);
     uint32_t packed[2] = {0, 0};
 #pragma unroll
     for (int i = 0; i < CHUNK; ++i) {
@@ -1453,7 +1468,7 @@ constexpr int V_TILE_BYTES = UNICA_V_PAIRS ? KEYS_PER_TILE / 2 * V8_STRIDE : KEY
 extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
     attention_int8pv_tma(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
                          const int8_t* Q8, const float* q_scale, const float* k_scale, const float* v_scale,
-                         __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2) {
+                         __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2, TokenLayout o_layout) {
     __shared__ __align__(128) int8_t k_tiles[2][K_TILE_BYTES];
     __shared__ __align__(128) int8_t v_tiles[2][KEYS_PER_TILE * K8_STRIDE];
     __shared__ __align__(16) int8_t q_tiles[WARPS_PER_BLOCK][ROWS_PER_WARP * K8_STRIDE];
@@ -1552,7 +1567,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     }
     if (t < n_tiles) iteration(t, Parity<0>{});
 
-    store_out(O + q_offset, out, row_sum, row, col, n_rows, v_scale);
+    store_out(O + o_layout.offset(blockIdx.y, row0), out, row_sum, row, col, n_rows, v_scale, o_layout.token);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1616,7 +1631,7 @@ __device__ __forceinline__ float from_e4m3(uint32_t byte) {
 // are zeros. Bit for bit bench/emulate.py's block_scaled(..., "nvfp4", outer="channel") on V in slot order
 // (tests/test_fp4.py). Grid: ceil(heads · tiles · 4 · HEAD_DIM / QUANTIZE_THREADS).
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
-    quantize_v4(const __nv_bfloat16* V, const float* v_outer, uint8_t* V4, int n_tokens, int n_threads) {
+    quantize_v4(const __nv_bfloat16* V, const float* v_outer, uint8_t* V4, int n_tokens, int n_threads, TokenLayout in) {
     const int index = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
     if (index >= n_threads) return;
     const int dim = index % HEAD_DIM;
@@ -1631,7 +1646,7 @@ extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
 #pragma unroll
     for (int i = 0; i < FP4_SCALE_BLOCK; ++i) {
         const int key = tile * MMA_K4 + fp4_slot_key(block * FP4_SCALE_BLOCK + i);
-        values[i] = key < n_tokens ? __bfloat162float(V[(size_t(head) * n_tokens + key) * HEAD_DIM + dim]) : 0.0f;
+        values[i] = key < n_tokens ? __bfloat162float(V[in.offset(head, key) + dim]) : 0.0f;
         amax = fmaxf(amax, fabsf(values[i]));
     }
     // · (1/6), not / 6, as in quantize_int8: torch divides by a scalar through its reciprocal, and the two differ in
@@ -1775,7 +1790,7 @@ __device__ __forceinline__ void bulk_load(void* dst, const void* src, int bytes,
 extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
     attention_fp4pv(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
                     const uint8_t* V4, const int8_t* Q8, const float* q_scale, const float* k_scale, const float* v_outer,
-                    __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2) {
+                    __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2, TokenLayout o_layout) {
     __shared__ __align__(128) int8_t k_tiles[2][K_TILE_BYTES];
     __shared__ __align__(128) uint8_t v_tiles[2][V4_TILE_BYTES];
     __shared__ __align__(16) int8_t q_tiles[WARPS_PER_BLOCK][ROWS_PER_WARP * K8_STRIDE];
@@ -1869,7 +1884,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     if (t < n_tiles) iteration(t, Parity<0>{});
 
     const float row_sum[2] = {row_sum_acc[0], row_sum_acc[2]};  // 0 outside lane 4g: store_out's quad sum adds them
-    store_out(O + q_offset, out, row_sum, row, col, n_rows, v_outer);
+    store_out(O + o_layout.offset(blockIdx.y, row0), out, row_sum, row, col, n_rows, v_outer, o_layout.token);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1894,7 +1909,7 @@ constexpr int K4_TILE_BYTES = KEYS_PER_TILE * FP4_ROW_BYTES;
 // Grid: ceil(heads · n_tokens · 8 / QUANTIZE_THREADS).
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     quantize_fp4_rows(const __nv_bfloat16* X, const float* mean, const float* outer, uint8_t* X4, int n_tokens,
-                      int padded_tokens, int n_threads) {
+                      int padded_tokens, int n_threads, TokenLayout in) {
     const int index = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
     if (index >= n_threads) return;
     const int block = index % D_BLOCKS_FP4;
@@ -1905,7 +1920,7 @@ extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
         float chunk[CHUNK];
-        load_chunk(chunk, X + row * HEAD_DIM + block * FP4_SCALE_BLOCK + half * CHUNK,
+        load_chunk(chunk, X + in.offset(head, int(row % n_tokens)) + block * FP4_SCALE_BLOCK + half * CHUNK,
                    mean ? mean + head * HEAD_DIM + block * FP4_SCALE_BLOCK + half * CHUNK : nullptr);
 #pragma unroll
         for (int i = 0; i < CHUNK; ++i) {
@@ -1962,7 +1977,7 @@ constexpr int AHEAD = STAGES - 1;
 extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
     attention_fp4(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
                   const uint8_t* K4, const uint8_t* V4, const uint8_t* Q4, const float* qk_outer, const float* v_outer, __nv_bfloat16* O, int n_queries,
-                  int n_keys, float scale_log2) {
+                  int n_keys, float scale_log2, TokenLayout o_layout) {
     __shared__ __align__(128) uint8_t k_tiles[STAGES][K4_TILE_BYTES];
     __shared__ __align__(128) uint8_t v_tiles[STAGES][V4_TILE_BYTES];
     __shared__ __align__(8) uint64_t full[STAGES];
@@ -1975,7 +1990,6 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
 
     const int row0 = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP;
     const int n_rows = min(n_queries - row0, ROWS_PER_WARP);
-    const size_t q_offset = (size_t(blockIdx.y) * n_queries + row0) * HEAD_DIM;
     v_outer += size_t(blockIdx.y) * HEAD_DIM;
     const float score_scale = qk_outer[blockIdx.y] * scale_log2;
     const int n_tiles = (n_keys + KEYS_PER_TILE - 1) / KEYS_PER_TILE;
@@ -2077,6 +2091,6 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     if (t < n_tiles) iteration(t, Parity<0>{});
 
     const float row_sum[2] = {row_sum_acc[0], row_sum_acc[2]};
-    store_out(O + q_offset, out, row_sum, row, col, n_rows, v_outer);
+    store_out(O + o_layout.offset(blockIdx.y, row0), out, row_sum, row, col, n_rows, v_outer, o_layout.token);
 }
 #endif  // UNICA_KEYS_PER_TILE == 64

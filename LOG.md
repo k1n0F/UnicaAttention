@@ -2157,6 +2157,70 @@ at its error class (random 19.2 against 19.1 %, real WAN median 8.90 against 8.6
 By the fast mode's rule this is not yet a win: the speed is there, the lower error is not. Two ways from here: lower
 `attention_fp4`'s error at its speed, or mix it per layer with `attention_fp4pv` (3.8 % real, +14 % time).
 
+## M4.16 — what surrounds the kernel in a real WAN call (measured before any fusion)
+
+The question: can RoPE be fused into our quantization, and what would it save? ComfyUI 0.42's `WanSelfAttention`
+computes `q = norm_q(q(x))`, then `apply_rope1(q, freqs)` (comfy_kitchen, CUDA backend), the same for k, and hands q, k, v
+to `optimized_attention` in [b, s, heads, d]. Our node then copies them to [b, heads, s, d] and the output back.
+
+Measured in ComfyUI's own environment (`.venv-13`, torch 2.14), real shape 1 × 34 020 × 40 × 128 (one tensor 348 MB),
+real positions (21 × 30 × 54) and the model's `EmbedND` [44, 42, 42], median of 20 (scratchpad rope_overhead.py):
+
+| | per call |
+|---|---|
+| RMSNorm over 5120, one of q / k | 0.87 ms |
+| RoPE, `apply_rope1` (comfy_kitchen), one of q / k | 0.94 ms |
+| the node's layout copy in, one of q / k / v | 0.89 ms |
+| the node's layout copy out | 0.90 ms |
+| quantization: baseline / `attention_fp4pv` / `attention_fp4` | 3.06 / 3.12 / 3.97 ms |
+| kernel: baseline / `attention_fp4pv` / `attention_fp4` | 78.8 / 65.0 / 48.2 ms |
+
+- **Found on the way:** the node's `x.transpose(1, 2).to(torch.bfloat16, memory_format=torch.contiguous_format)` copies
+  nothing when the dtype already matches (`is_contiguous()` is False after it). The copy happens later, inside
+  `unica.attention`'s `.contiguous()`, so it was counted as quantization in a first version of this measurement
+  (5.7 instead of 3.1 ms). The cost is the same, its place is different.
+- **Removable without touching the model** (H4: quantize kernels that read [b, s, heads, d] directly, `store_out`
+  writing it): 3 × 0.89 + 0.90 = **3.56 ms** per call.
+- **Removable by fusing RoPE into the quantization** (needs q and k before `apply_rope1`, so a patch of
+  `WanSelfAttention.forward`): 2 × 0.94 = **1.88 ms**. RoPE in float inside our kernel also skips one rounding of the
+  rotated q and k to bf16.
+- **And RMSNorm** (the same patch; a reduction over all 40 heads of a token, before the per-head work): 2 × 0.87 =
+  **1.74 ms**.
+
+| per call, around and in the kernel | baseline | `attention_fp4pv` | `attention_fp4` |
+|---|---|---|---|
+| RoPE + copies + quantization + kernel | 87.3 ms | 73.5 ms | 57.6 ms |
+| copies (H4) | 4.1 % | 4.8 % | **6.2 %** |
+| + RoPE | 6.2 % | 7.4 % | **9.4 %** |
+| + RMSNorm | 8.2 % | 9.8 % | **12.4 %** |
+
+Over a 4-step video (160 self-attention calls) that is 0.57 s for the copies, 0.87 s with RoPE, 1.15 s with RMSNorm, of
+~45–49 s: 1–2.5 %. The attention call itself gets 6–12 % faster.
+
+## M4.17 — step 1: the caller's layout, no copies (prediction, before measuring)
+
+**Change:** `TokenLayout` (csrc/flash.cu, `unica.TokenLayout`): the strides of a [b, h, s, d] view and its heads, passed by
+value. The quantizers (`quantize_int8`, `quantize_v`, `quantize_v4`, `quantize_fp4_rows`) read q, k, v through it, and
+the three fast kernels (`attention_int8pv_tma`, `attention_fp4pv`, `attention_fp4`) write their output through it, so a
+[b, s, h, d] tensor seen through a transpose is read and written in place. `unica.attention` keeps such tensors as they
+are (`readable`: last dimension contiguous, tokens on 16-byte boundaries), and `empty_like` gives the output q's layout.
+The other kernels still get contiguous copies. The node's `unica_nhd` drops its copies. Bit for bit the same output as
+the contiguous inputs, all shapes and the three kernels (`test_callers_layout_changes_nothing_but_copies`); registers
+unchanged.
+
+**Hypothesis:** per real call (1 × 34 020 × 40 × 128, through `unica_nhd`) **−3.56 ms**, the three copies in and the one out
+of M4.16: baseline 87.3 → ~83.7 ms (−4.1 %), `attention_fp4` 57.6 → ~54.0 ms (−6.2 %).
+
+**Result: held.** Input in ComfyUI's layout, the node's path before and after, one process, 6 rounds taking turns:
+
+| | with the copies | in place | | predicted |
+|---|---|---|---|---|
+| baseline (`attention_int8pv_tma`) | 85.78 ms | **82.36 ms** | **−3.42 ms (−4.0 %)** | −3.56 ms (−4.1 %) |
+| `attention_fp4` | 56.95 ms | **53.02 ms** | **−3.93 ms (−6.9 %)** | −3.56 ms (−6.2 %) |
+
+The quantizers read through the transpose as fast as from contiguous memory (a token's 128 channels are still one
+256-byte run). Next on this path: RoPE inside the quantization (1.9 ms), then RMSNorm (1.7 ms).
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

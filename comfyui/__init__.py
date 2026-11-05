@@ -61,11 +61,12 @@ log = logging.getLogger("UnicaAttention")
 
 
 def unica_nhd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """unica.attention on WanVideoWrapper's layout [batch, tokens, heads, 128], any float dtype in and out.
-    One copy each way: to bf16 [batch, heads, tokens, 128] and back."""
-    as_bhnd = lambda x: x.transpose(1, 2).to(torch.bfloat16, memory_format=torch.contiguous_format)  # noqa: E731
-    out = unica.attention(as_bhnd(q), as_bhnd(k), as_bhnd(v))
-    return out.transpose(1, 2).to(q.dtype).contiguous()
+    """unica.attention on the layout [batch, tokens, heads, 128] (WanVideoWrapper's and ComfyUI's), any float dtype in
+    and out. No copy for bf16 (M4.17): the default kernel reads the tensors through a transpose and writes its output
+    in the same layout, so out.transpose(1, 2) is already [batch, tokens, heads, 128] in memory. Other dtypes are
+    converted once each way, keeping the layout."""
+    out = unica.attention(*(x.transpose(1, 2).to(torch.bfloat16) for x in (q, k, v)))
+    return out.transpose(1, 2).to(q.dtype).contiguous()  # both no-ops for bf16
 
 
 def timed(function, *args):

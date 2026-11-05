@@ -180,7 +180,22 @@ def test_rejects_what_the_kernel_cannot_take():
         raise AssertionError(f"accepted {bad.dtype} {tuple(bad.shape)}")
 
 
+def test_callers_layout_changes_nothing_but_copies():
+    """M4.17: q, k, v in ComfyUI's [batch, tokens, heads, 128], seen through a transpose, give bit for bit the output
+    of the same values made contiguous, and the output comes back in that layout."""
+    torch.manual_seed(2)
+    for batch, heads, n_queries, n_keys in SHAPES:
+        q = torch.randn(batch, n_queries, heads, 128, device="cuda").bfloat16()
+        k, v = (torch.randn(batch, n_keys, heads, 128, device="cuda").bfloat16() for _ in range(2))
+        for kernel in sorted(unica.LAYOUT_KERNELS):
+            strided = unica.attention(*(x.transpose(1, 2) for x in (q, k, v)), kernel)
+            dense = unica.attention(*(x.transpose(1, 2).contiguous() for x in (q, k, v)), kernel)
+            assert torch.equal(strided, dense), (kernel, batch, heads, n_queries, n_keys)
+            assert strided.transpose(1, 2).is_contiguous() or n_queries == 1, (kernel, strided.stride())
+
+
 if __name__ == "__main__":
+    test_callers_layout_changes_nothing_but_copies()
     test_every_kernel_matches_fp32_reference_on_all_shapes()
     test_async_loads_change_nothing_but_time()
     test_pipelined_qk_changes_nothing_but_time()

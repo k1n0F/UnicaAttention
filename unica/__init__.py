@@ -38,6 +38,29 @@ DEFAULT_KERNEL = "attention_int8pv_tma"
 # records a timeline (bench/timeline.py).
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
         "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0, "STAGES": 2, "BULK_COPY": 1}
+# M4.17: kernels that read q, k, v and write the output in the caller's layout (TokenLayout), e.g. ComfyUI's
+# [batch, tokens, heads, 128] seen as [batch, heads, tokens, 128] through a transpose. The others get contiguous copies.
+LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
+
+
+class TokenLayout(ctypes.Structure):
+    """csrc/flash.cu TokenLayout: strides in elements of a [batch, heads, tokens, 128] tensor, and its heads."""
+
+    _fields_ = [("batch", ctypes.c_longlong), ("head", ctypes.c_longlong), ("token", ctypes.c_longlong),
+                ("heads", ctypes.c_int)]
+
+
+def token_layout(x: torch.Tensor) -> TokenLayout:
+    return TokenLayout(x.stride(0), x.stride(1), x.stride(2), x.shape[1])
+
+
+def readable(x: torch.Tensor) -> torch.Tensor:
+    """x as it is if the kernels can read it in place (last dimension contiguous, every token on a 16-byte boundary,
+    as the 16-byte loads need), else a contiguous copy."""
+    in_place = (x.stride(-1) == 1 and x.data_ptr() % 16 == 0
+                and all(x.stride(i) % 8 == 0 or x.shape[i] == 1 for i in range(3)))
+    return x if in_place else x.contiguous()
+
 
 
 def attention(
@@ -72,22 +95,28 @@ def attention(
     if n_keys == 0:
         raise ValueError("k and v must hold at least one token")
 
-    # the kernel indexes plain [heads][tokens][128] arrays; for an already contiguous tensor this is free
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    out = torch.empty_like(q)
+    if kernel in LAYOUT_KERNELS:  # read in place, and write the output in q's layout (empty_like keeps its strides)
+        q, k, v = readable(q), readable(k), readable(v)
+        out = torch.empty_like(q)
+        layout_arg = (token_layout(out),)
+    else:  # these index plain [heads][tokens][128] arrays; for an already contiguous tensor this is free
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        out = torch.empty_like(q)
+        layout_arg = ()
     defines = {f"UNICA_{key}": value for key, value in tile.items() if TILE[key] != value}
     warps = tile.get("WARPS_PER_BLOCK", TILE["WARPS_PER_BLOCK"])
     grid = (math.ceil(n_queries / (warps * ROWS_PER_WARP)), batch * heads)
     scale_log2 = HEAD_DIM**-0.5 * LOG2E
     if inputs is None:
         inputs = kernel_inputs(q, k, v, kernel, **tile)
-    module("flash", **defines)[kernel](grid, warps * WARP_SIZE, *inputs, out, n_queries, n_keys, scale_log2)
+    module("flash", **defines)[kernel](grid, warps * WARP_SIZE, *inputs, out, n_queries, n_keys, scale_log2, *layout_arg)
     return out
 
 
 def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str, **tile: int) -> tuple:
-    """The arguments `kernel` takes before its output: q, k, v as they are, or quantized. q, k, v must be
-    contiguous. Apart from attention() so that a benchmark can time quantization and kernel separately. tile:
+    """The arguments `kernel` takes before its output: q, k, v as they are, or quantized. The quantizers read q, k, v
+    in any layout readable() accepts. Apart from attention() so that a benchmark can time quantization and kernel
+    separately. tile:
     the settings the kernel is built with (TILE), which decide the boxes and the V8 layout of the TMA kernel."""
     if kernel not in QUANTIZED:
         return q, k, v
@@ -133,12 +162,12 @@ def quantize_int8(x: torch.Tensor, mean: torch.Tensor | None, block: int) -> tup
     and float32 scales [batch, heads, ceil(N / block)]. The scale never varies along d, the axis Q·Kᵀ sums
     over, so the int32 mma result is scaled once at the end. Bit for bit bench/emulate.py's quant()."""
     batch, heads, n, _ = x.shape
-    x = x.contiguous()
+    x = readable(x)
     x8 = torch.empty(x.shape, dtype=torch.int8, device=x.device)
     scale = torch.empty(batch, heads, math.ceil(n / block), device=x.device)
     grid = (scale.shape[-1], batch * heads)
     mean_arg = mean.contiguous() if mean is not None else ctypes.c_void_p(0)
-    module("flash")["quantize_int8"](grid, QUANTIZE_THREADS, x, mean_arg, x8, scale, n, block)
+    module("flash")["quantize_int8"](grid, QUANTIZE_THREADS, x, mean_arg, x8, scale, n, block, token_layout(x))
     return x8, scale
 
 
@@ -151,7 +180,7 @@ def quantize_v(v: torch.Tensor, layout: int = 0) -> tuple[torch.Tensor, torch.Te
     at the end. Bit for bit bench/emulate.py's V quantization. layout 1 and 2 (for attention_int8pv_tma,
     csrc/flash.cu v8_offset) reorder the same bytes and pad each head to whole tiles: [batch, heads, N', 128]
     with N' = N rounded up to V8_PAD_KEYS."""
-    v = v.contiguous()
+    v = readable(v)
     low, high = torch.aminmax(v, dim=-2)  # one pass, and |v| needs no copy of v
     scale = (torch.maximum(high, -low).float() / 127).clamp_min(1e-12)
     batch, heads, n, dim = v.shape
@@ -159,7 +188,7 @@ def quantize_v(v: torch.Tensor, layout: int = 0) -> tuple[torch.Tensor, torch.Te
     v8 = torch.empty(batch, heads, tokens, dim, dtype=torch.int8, device=v.device)
     n_chunks = v.numel() // CHUNK
     grid = math.ceil(n_chunks / QUANTIZE_THREADS)
-    module("flash")["quantize_v"](grid, QUANTIZE_THREADS, v, scale, v8, n, n_chunks, layout)
+    module("flash")["quantize_v"](grid, QUANTIZE_THREADS, v, scale, v8, n, n_chunks, layout, token_layout(v))
     return v8, scale
 
 
@@ -173,7 +202,7 @@ def quantize_v4(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale per channel, max |v| / (6 · 448). Returns uint8 [batch, heads, tiles, 128, 48] (csrc/flash.cu V4: the
     keys of each tile of 64 in the mma's slot order, and their scales) and float32 [batch, heads, 128]. Bit for
     bit bench/emulate.py's block_scaled(..., "nvfp4", outer="channel") on V in that order."""
-    v = v.contiguous()
+    v = readable(v)
     low, high = torch.aminmax(v, dim=-2)
     outer = (torch.maximum(high, -low).float() / (E2M1_MAX * E4M3_MAX)).clamp_min(1e-30)
     batch, heads, n, dim = v.shape
@@ -181,7 +210,7 @@ def quantize_v4(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     v4 = torch.empty(batch, heads, tiles, dim, V4_ROW_BYTES, dtype=torch.uint8, device=v.device)
     n_threads = batch * heads * tiles * (FP4_TILE // 16) * dim
     module("flash")["quantize_v4"](math.ceil(n_threads / QUANTIZE_THREADS), QUANTIZE_THREADS, v, outer, v4, n,
-                                   n_threads)
+                                   n_threads, token_layout(v))
     return v4, outer
 
 
@@ -194,7 +223,7 @@ def quantize_fp4_rows(x: torch.Tensor, mean: torch.Tensor | None, pad_to: int = 
     e2m1 in channel order, then the 8 scales) and float32 [batch, heads]. Bit for bit bench/emulate.py's
     block_scaled(x − mean, "nvfp4", -1). pad_to: rows per head rounded up to a multiple of it, the extra rows zeros
     (K for attention_fp4: whole tiles, so that a tile is one contiguous block)."""
-    x = x.contiguous()
+    x = readable(x)
     batch, heads, n, dim = x.shape
     # max |x − mean| over the head from each channel's min and max (one pass, no float copy of x): the extreme
     # elements go through the same float subtraction as in the emulator, so the max is the same bit for bit
@@ -210,5 +239,5 @@ def quantize_fp4_rows(x: torch.Tensor, mean: torch.Tensor | None, pad_to: int = 
     n_threads = batch * heads * n * (dim // 16)
     mean_arg = mean.contiguous() if mean is not None else ctypes.c_void_p(0)
     module("flash")["quantize_fp4_rows"](math.ceil(n_threads / QUANTIZE_THREADS), QUANTIZE_THREADS, x, mean_arg, outer,
-                                         x4, n, tokens, n_threads)
+                                         x4, n, tokens, n_threads, token_layout(x))
     return x4, outer
