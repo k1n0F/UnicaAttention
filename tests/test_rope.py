@@ -72,6 +72,16 @@ def test_attention_with_rope_is_the_emulator():
                   f"emulator {errors(emulated, ref)['rel_l2']:.3%}, kernel vs emulator {errors(out, emulated)['rel_l2']:.3%}")
 
 
+def test_smoothing_with_rope_is_the_emulator():
+    """M4.21: Q smoothing on the rotated q (its block means and q̄ · k both from the values rotated in float)."""
+    q, k, v, table = inputs(batch=2, seed=3)
+    q = (q.float() + 2 * torch.randn(3, 1, 128, device="cuda")).bfloat16()
+    q_rot, k_rot = rope(q.float(), table), rope(k.float(), table)
+    out = unica.attention(q, k, v, "attention_fp4", rope=table, SMOOTH_Q=256).float()
+    emulated = emulate(q_rot, k_rot, v, **EMULATED["attention_fp4"], smooth_q=256)
+    assert errors(out, emulated)["rel_l2"] < 1e-3, errors(out, emulated)
+
+
 def test_under_inference_mode():
     """ComfyUI samples under torch.inference_mode, where tensors have no version counter: the compact table's cache
     must work there too, and a second call with the same table must reuse it (M4.19, found in the first video run)."""
@@ -88,4 +98,5 @@ if __name__ == "__main__":
     test_rope_stats()
     test_quantizers_rotate_like_the_emulator()
     test_attention_with_rope_is_the_emulator()
+    test_smoothing_with_rope_is_the_emulator()
     print("rope ok")

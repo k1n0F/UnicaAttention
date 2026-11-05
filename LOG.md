@@ -2388,6 +2388,97 @@ checked; medians, and the blocks below SageAttention 3 out of 22):
 - So the fast mode has two roads: FP4 both with q̄ per frame everywhere (if its correction is cheap in the kernel), or
   a fixed map mixing FP4 both and FP4 P·V (stable enough to fix in advance).
 
+## M4.21 — Q smoothing in attention_fp4 (SMOOTH_Q=512)
+
+**What it attacks:** the error of FP4 Q·Kᵀ, not speed. Q goes into the MMA as q − q̄_B (B: a block of 512 queries,
+8 kernel blocks), and q̄_B · (k − k̄) comes back as the **start value of the Q·Kᵀ accumulators** (q̄_B · k̄ is one number
+per row: softmax cancels it, and the correction stays small). On the tensor cores the start value is free; the cost
+is getting 256 bytes of correction per tile into the right registers.
+
+**Decision:** prototype first, the correction computed by its own pass (`smooth_bias`), then fold it into K's
+quantization. The own pass reads K like the quantizers do, with RoPE on the way in, so `fuse_rope` keeps working (the
+plain torch GEMM was out: it needs the rotated K in float, 0.7 GB).
+
+**Pieces:**
+- `rope_stats(x, rope=None, per=512)`: works without a table; per-block mean, min and max from its 256-token partials.
+- `quantize_fp4_rows(..., mean_tokens)`: one mean per block of tokens; the per-head scale from the per-block min/max.
+- `smooth_bias`: [n_blocks × 128] · [128 × keys] per head, float32 [heads][n_blocks][padded_keys] (365 MB at
+  34 020 × 40 heads). Tensor cores: q̄ and k − k̄ each as two bf16 (hi + lo), q̄·x ≈ hi·hi + hi·lo + lo·hi, error
+  ~2^-17 of Σ|q̄ᵢ kᵢ| (~10⁻⁴ of a logit: nothing next to FP4's).
+- `attention_fp4` with `UNICA_SMOOTH_Q`: the correction travels by bulk copy (`BIAS_CHUNK` tiles per copy) and two
+  LDS.64 per 8 keys fill the accumulator quad. Without smoothing the kernel is the same SASS (2152 instructions; only
+  parameter offsets moved).
+- Tests: the kernel is the emulator's `smooth_q=512` within 0.1 % (with and without RoPE, partial blocks of queries and
+  of copies); on Q with a drifting mean 13.0 % against 29.8 % without smoothing.
+
+**Hypothesis (before measuring):** +35–40 instructions per tile (SASS: 8 LDS + 27 MOV) on ~485 → kernel **+4…+8 %**;
+`smooth_bias` ~0.5–1 ms; whole call **+3…+5 ms**, still below SageAttention 3.
+
+**First measurement** (34 020, one process per shape: the first try ran at 14.7 of 16 GB VRAM and WDDM paged, SA3 at
+96 ms): kernel +4.3 ms (+8.7 %), quantization +3.7 ms, whole call +8.4 ms: **missed**, SA3 −1.7 % only.
+
+**Where it went, step by step** (each A/B in one process, alternating rounds):
+
+| step | result | hypothesis |
+|---|---|---|
+| `smooth_bias` on the FP32 pipe, means from L1 | 3.8 ms; ncu: 71 % of stalls on L1 | |
+| + `#pragma unroll 8` | 3.0 ms | |
+| + means in shared memory | 2.2 ms; shared memory 80 % busy (LDS.128 of 32 key rows: 4 wavefronts each) | |
+| keys in registers, read from global | **9.5 ms**: 16 rows per LDG, uncoalesced | wrong, reverted |
+| **tensor cores, hi/lo bf16** | 1.65 ms | memory floor ~0.9 ms |
+| + means pre-arranged as A fragments (one LDG.128) | **1.59 ms**: occupancy 16.7 % (34.8 KB shared per block) | |
+| kernel: one LDS.64 + 2 MOV → two LDS.64 | +4.9 → +4.3 ms | −1…−2 ms: missed |
+| diagnosis: copy without using it / using it without copy | +2.4 ms / −0.45 ms | |
+| L2 prefetch of the correction, 4 or 16 tiles ahead | +5.9…6.1 ms (worse) | DRAM latency: **refuted** |
+| STAGES=3 | +6.6 ms (worse) | |
+| issue the copy from warp 1, not warp 0 | +4.2 ms (same) | warp 0's issue path: refuted |
+| **one copy per 8 / 32 tiles** (2 buffers, 2n · 256 bytes) | **+3.2 / +2.3 ms** | ≤ +2 ms at 8: missed |
+
+- **A bulk copy has a cost of its own**, whatever its size and wherever its data: 256 bytes per tile cost ~2 ms, an
+  L2 prefetch (one more async operation) made it worse. Fewer, larger copies are the fix.
+- The "free" load without a copy read shared memory that was never written: likely zeros, the same computation as
+  without smoothing. With real values (the first chunk only, no further copies) it costs +2.3 ms. ncu (4 heads,
+  32 760): cycles +3.7 %, instructions +7.7 %, LSU instructions +44 %, **no more MIO throttle** (63 → 57 K), more
+  `wait` stalls: the 16 LDS sit in front of the first OMMA of each block, on the chain. Next lever: load the correction
+  one iteration earlier into registers (+16 registers on 225).
+- `smooth_bias`'s remaining 0.7 ms above the memory floor goes away when it is folded into K's quantization (step 2).
+
+**Result, whole call** (one process per shape, 6 alternating rounds; `BIAS_CHUNK=32` now the default):
+
+| | 32 760 | 34 020 | 34 020, fused RoPE |
+|---|---|---|---|
+| SageAttention 3 | 59.14 ms | 62.68 ms | |
+| `attention_fp4` | 49.31 ms (−16.6 %) | 53.31 ms (−15.0 %) | 53.19 ms |
+| **+ Q smoothing per 512** | **52.57 ms (−11.1 %)** | **57.28 ms (−8.6 %)** | **57.36 ms (−8.5 %)** |
+| of which kernel / quantization | +2.10 / +1.09 ms | +2.14 / +1.32 ms | +4.18 ms in all |
+
+The whole-call hypothesis (+3…+5 ms) **held after the fixes**, the kernel's share (+4.3 % against +4…+8 %) too; the
+first version missed both. Error on real WAN: the node now measures the kernels themselves (`fp4`, `fp4_smooth512`)
+next to the emulator, `build/wan_attention_errors_m4.21.csv`; expected 7.49 / 7.85 % against SageAttention 3's
+8.67 / 8.89 % (M4.20b).
+
+**Result on real WAN** (ComfyUI app's agent, the M4.20b setup: seed 42, `measure_every` 7, the same 22 (step, block)
+pairs, the prompt changed by one word against the cache; the kernels themselves, not the emulator):
+
+| | median rel L2 | below SageAttention 3 |
+|---|---|---|
+| baseline 1 (INT8) | 0.899 % | |
+| SageAttention 2 | 1.151 % | |
+| SageAttention 3 | 8.646 % | |
+| `attention_fp4` | 8.919 % | 12 of 22 |
+| **`attention_fp4`, SMOOTH_Q=512** | **7.452 %** | **22 of 22** |
+| emulator `smooth_q=512` | 7.463 % | |
+
+- Predicted 7.49 %: **held** (7.45). The kernel is the emulator within 0.025 points in every block.
+- Smoothing takes 10 % off FP4 both's error (median ratio 0.90), and puts it below SageAttention 3 in every block:
+  median 0.90 of SA3's error, worst block 0.97, best 0.41.
+- **By the fast mode's rule this is the first win:** 8.6 % faster than SageAttention 3 at the real 34 020 tokens, 10 %
+  less error on real data, in every measured block. It becomes the fast mode's baseline 2 (below).
+
+**Baseline 2, fast mode:** `attention_fp4` with `SMOOTH_Q=512` (NVFP4 Q·Kᵀ and P·V, Q smoothed per 512 queries,
+`BIAS_CHUNK=32`, bulk copies), with or without `fuse_rope`. 57.3 ms against SageAttention 3's 62.7 ms at 34 020
+(−8.6 %), real WAN 7.45 % against 8.65 %. The accurate mode's baseline stays baseline 1.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

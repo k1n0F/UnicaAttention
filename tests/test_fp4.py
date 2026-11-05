@@ -90,8 +90,51 @@ def test_kernel_is_the_emulator():
             assert abs(errors(out, ref)["rel_l2"] - errors(emulated, ref)["rel_l2"]) < 1e-4, (kernel, shape, sharpness)
 
 
+def smoothing_inputs(shape, seed=0):
+    """q with a mean that drifts along the tokens, as WAN's does (M4.20): the case Q smoothing is for."""
+    torch.manual_seed(seed)
+    q, k, v = (torch.randn(shape, device="cuda") for _ in range(3))
+    drift = torch.linspace(0, 1, shape[2], device="cuda")[:, None] * torch.randn(shape[1], 1, 128, device="cuda")
+    q = q + 3 * torch.randn(shape[1], 1, 128, device="cuda") + 4 * drift
+    return q.bfloat16(), k.bfloat16(), v.bfloat16()
+
+
+def test_smooth_bias():
+    q, k, _ = smoothing_inputs((2, 2, 1000, 128))
+    q_mean, _, _ = unica.rope_stats(q, None, 512)
+    k_mean = k.float().mean(-2)
+    outer = torch.rand(2, 2, device="cuda") + 0.5
+    bias = unica.smooth_bias(k, k_mean, q_mean, outer, 1024)
+    centred = k.float() - k_mean[..., None, :]
+    expected = q_mean @ centred.transpose(-1, -2) / outer[..., None, None]
+    # q̄ and k − k̄ go in as hi + lo bf16 each, the lo·lo term left out: each product is off by ~2^-17 of itself
+    bound = q_mean.abs() @ centred.abs().transpose(-1, -2) / outer[..., None, None] * 2**-16
+    assert ((bias[..., :1000] - expected).abs() <= bound).all(), ((bias[..., :1000] - expected).abs() / bound).max()
+    assert not bias[..., 1000:].any()
+    blocks = torch.nn.functional.pad(q.float(), (0, 0, 0, 24), value=torch.nan).unflatten(-2, (2, 512))
+    assert torch.allclose(q_mean, blocks.nanmean(-2), atol=1e-5)
+
+
+def test_smoothed_kernel_is_the_emulator():
+    """M4.21: attention_fp4 with SMOOTH_Q=512 is the emulator's smooth_q=512, and less wrong than without it."""
+    config = KERNEL_CONFIG | dict(qk="nvfp4")
+    # 2500: 40 tiles, so the second copy of the bias (BIAS_CHUNK = 32 tiles) is a partial one
+    for shape in ((1, 2, 1000, 128), (2, 2, 777, 128), (1, 4, 4096, 128), (1, 2, 2500, 128)):
+        q, k, v = smoothing_inputs(shape)
+        ref = reference(q, k, v)
+        out = unica.attention(q, k, v, "attention_fp4", SMOOTH_Q=512).float()
+        emulated = emulate(q, k, v, **config, smooth_q=512)
+        plain = errors(unica.attention(q, k, v, "attention_fp4").float(), ref)["rel_l2"]
+        assert errors(out, emulated)["rel_l2"] < 1e-3, (shape, errors(out, emulated))
+        assert errors(out, ref)["rel_l2"] < plain, (shape, errors(out, ref), plain)
+        print(f"{shape}: smoothed {errors(out, ref)['rel_l2']:.3%} (emulator {errors(emulated, ref)['rel_l2']:.3%}), "
+              f"plain {plain:.3%}")
+
+
 if __name__ == "__main__":
     test_quantize_v4_is_the_emulator()
     test_quantize_fp4_rows_is_the_emulator()
     test_kernel_is_the_emulator()
+    test_smooth_bias()
+    test_smoothed_kernel_is_the_emulator()
     print("fp4 ok")

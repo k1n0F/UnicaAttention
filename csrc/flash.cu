@@ -767,14 +767,14 @@ extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
                TokenLayout in) {
     const int chunk = threadIdx.x % CHUNKS_PER_ROW, lane = threadIdx.x / CHUNKS_PER_ROW;
     const int head = blockIdx.y, token0 = blockIdx.x * STATS_TOKENS;
-    const __half* table = freqs + size_t(head / in.heads) * freqs_batch;
+    const __half* table = freqs ? freqs + size_t(head / in.heads) * freqs_batch : nullptr;  // null: x as it is (M4.21)
     float sum[CHUNK], low[CHUNK], high[CHUNK];
 #pragma unroll
     for (int i = 0; i < CHUNK; ++i) sum[i] = 0.0f, low[i] = CUDART_INF_F, high[i] = -CUDART_INF_F;
     for (int token = token0 + lane; token < min(token0 + STATS_TOKENS, n_tokens); token += STATS_LANES) {
         float values[CHUNK];
         load_chunk_rope(values, X + in.offset(head, token) + chunk * CHUNK, nullptr,
-                        table + size_t(token) * ROPE_HALVES_PER_TOKEN, chunk * CHUNK);
+                        table ? table + size_t(token) * ROPE_HALVES_PER_TOKEN : nullptr, chunk * CHUNK);
 #pragma unroll
         for (int i = 0; i < CHUNK; ++i) {
             sum[i] += values[i];
@@ -1986,25 +1986,29 @@ constexpr int K4_TILE_BYTES = KEYS_PER_TILE * FP4_ROW_BYTES;
 
 // Q or K for attention_fp4: x − mean (K: softmax cancels the mean) ≈ e2m1 · (e4m3 scale per 16 channels) · outer[head],
 // outer = max |x − mean| over the head / (6 · 448). One thread per (token, block of 16 channels). Bit for bit
-// bench/emulate.py's block_scaled(x − mean, "nvfp4", -1) (tests/test_fp4.py). mean: float [heads][HEAD_DIM] or null.
+// bench/emulate.py's block_scaled(x − mean, "nvfp4", -1) (tests/test_fp4.py). mean: float [heads][mean rows][HEAD_DIM]
+// or null, one row per mean_tokens tokens (M4.21, Q smoothing; mean_tokens = n_tokens: one per head).
 // X4 has padded_tokens ≥ n_tokens rows per head; the rows past n_tokens are not written.
 // Grid: ceil(heads · n_tokens · 8 / QUANTIZE_THREADS).
 extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     quantize_fp4_rows(const __nv_bfloat16* X, const float* mean, const float* outer, uint8_t* X4, int n_tokens,
-                      int padded_tokens, int n_threads, TokenLayout in, const __half* freqs, long long freqs_batch) {
+                      int padded_tokens, int n_threads, TokenLayout in, const __half* freqs, long long freqs_batch,
+                      int mean_tokens) {
     const int index = blockIdx.x * QUANTIZE_THREADS + threadIdx.x;
     if (index >= n_threads) return;
     const int block = index % D_BLOCKS_FP4;
     const size_t row = index / D_BLOCKS_FP4;  // head · n_tokens + token
     const int head = int(row / n_tokens);
+    const int token = int(row % n_tokens);
+    if (mean) mean += (size_t(head) * ((n_tokens + mean_tokens - 1) / mean_tokens) + token / mean_tokens) * HEAD_DIM;
     float values[FP4_SCALE_BLOCK];
     float amax = 0.0f;
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
         float chunk[CHUNK];
         const int dim = block * FP4_SCALE_BLOCK + half * CHUNK;
-        load_chunk_rope(chunk, X + in.offset(head, int(row % n_tokens)) + dim, mean ? mean + head * HEAD_DIM + dim : nullptr,
-                        freqs ? freqs + size_t(head / in.heads) * freqs_batch + (row % n_tokens) * ROPE_HALVES_PER_TOKEN : nullptr,
+        load_chunk_rope(chunk, X + in.offset(head, token) + dim, mean ? mean + dim : nullptr,
+                        freqs ? freqs + size_t(head / in.heads) * freqs_batch + size_t(token) * ROPE_HALVES_PER_TOKEN : nullptr,
                         dim);
 #pragma unroll
         for (int i = 0; i < CHUNK; ++i) {
@@ -2016,16 +2020,123 @@ extern "C" __global__ void __launch_bounds__(QUANTIZE_THREADS)
     const float scale = from_e4m3(scale_byte) * outer[head];
 #pragma unroll
     for (int i = 0; i < FP4_SCALE_BLOCK; ++i) values[i] = scale > 0.0f ? values[i] / scale : 0.0f;
-    uint8_t* out = X4 + (size_t(head) * padded_tokens + row % n_tokens) * FP4_ROW_BYTES;  // rows of each head padded
+    uint8_t* out = X4 + (size_t(head) * padded_tokens + token) * FP4_ROW_BYTES;  // rows of each head padded
     *reinterpret_cast<uint2*>(out + block * 8) = make_uint2(pack_e2m1x8(values), pack_e2m1x8(values + 8));
     out[FP4_SCALES_AT + block] = uint8_t(scale_byte);
 }
 
+// M4.21: Q smoothing in attention_fp4. 0: off. n: Q4 holds q − q̄_B, q̄_B the mean of Q over its block B of n queries,
+// and since q·k = (q − q̄_B)·k + q̄_B·k, the scores get q̄_B·k back, exactly: smooth_bias writes it per (B, key), and a
+// tile's Q·Kᵀ accumulators start from it instead of 0. The FP4 values then only carry what varies within B, which is
+// smaller than q itself. A block of the kernel's queries lies within one B.
+#ifndef UNICA_SMOOTH_Q
+#define UNICA_SMOOTH_Q 0
+#endif
+constexpr int SMOOTH_Q = UNICA_SMOOTH_Q;
+static_assert(SMOOTH_Q % ROWS_PER_BLOCK == 0, "a block of the kernel must lie within one smoothing block");
+constexpr int BIAS_TILE_BYTES = SMOOTH_Q ? KEYS_PER_TILE * int(sizeof(float)) : 0;
+
+// The scores' share of Q's block means, q̄_B·(k − k̄) / qk_outer, in the units of attention_fp4's Q·Kᵀ accumulators
+// (k − k̄, not k: q̄_B·k̄ is one number per row, which softmax cancels, and the bias stays small). From the bf16 K
+// rotated on the way in like the quantizers (freqs, or null), not from the quantized K. k_mean: float
+// [heads][HEAD_DIM]; q_hi, q_lo: the means as two bf16, q̄ ≈ hi + lo, mean_rows ≥ n_blocks of them per head (a multiple
+// of 16, zero rows past n_blocks), already in the mma's A fragments: [heads][mean_rows / 16][8 k-steps][32 lanes] of
+// 4 registers, one coalesced LDG.128 per lane and k-step (unica.smooth_bias); bias: float [heads][n_blocks][padded_keys],
+// 0 past n_keys.
+//
+// A GEMM [n_blocks × 128] · [128 × keys] per head on the tensor cores, near float: (k − k̄) is split the same way,
+// and q̄·x ≈ hi·hi + hi·lo + lo·hi, three bf16 mma with an f32 accumulator (the lo·lo term left out is ~2^-18
+// relative). On the FP32 pipe it was 2.2 ms at best, bound by shared memory: every FMA needs an operand from there.
+// A block of threads splits BIAS_KEYS keys into shared memory (rows padded by 16 bytes, so ldmatrix's 8 rows hit
+// 8 different banks); each warp holds the B fragments of its 16 keys in registers and goes through the means 16 at a
+// time, their A fragments read from global memory (all blocks of a head read the same means: L1 and L2).
+// Grid: (ceil(padded_keys / BIAS_KEYS), heads). Block: BIAS_THREADS.
+constexpr int BIAS_THREADS = 128;
+constexpr int BIAS_KEYS = BIAS_THREADS / WARP_SIZE * 16;
+constexpr int BIAS_ROW = HEAD_DIM + 8;  // bf16
+__device__ __forceinline__ uint32_t split_bf16x2(float x0, float x1, uint32_t& low) {
+    const __nv_bfloat162 high = __floats2bfloat162_rn(x0, x1);
+    const float2 back = __bfloat1622float2(high);
+    const __nv_bfloat162 rest = __floats2bfloat162_rn(x0 - back.x, x1 - back.y);
+    low = *reinterpret_cast<const uint32_t*>(&rest);
+    return *reinterpret_cast<const uint32_t*>(&high);
+}
+extern "C" __global__ void __launch_bounds__(BIAS_THREADS)
+    smooth_bias(const __nv_bfloat16* K, const float* k_mean, const uint4* q_hi, const uint4* q_lo,
+                const float* qk_outer, float* bias, int n_keys, int padded_keys, int n_blocks, int mean_rows,
+                TokenLayout in, const __half* freqs, long long freqs_batch) {
+    __shared__ __align__(16) __nv_bfloat16 k_hi[BIAS_KEYS][BIAS_ROW], k_lo[BIAS_KEYS][BIAS_ROW];
+    const int head = blockIdx.y, key0 = blockIdx.x * BIAS_KEYS;
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const __half* table = freqs ? freqs + size_t(head / in.heads) * freqs_batch : nullptr;
+    for (int c = threadIdx.x; c < BIAS_KEYS * CHUNKS_PER_ROW; c += BIAS_THREADS) {
+        const int key = c / CHUNKS_PER_ROW, dim = c % CHUNKS_PER_ROW * CHUNK;
+        float values[CHUNK] = {};
+        if (key0 + key < n_keys)
+            load_chunk_rope(values, K + in.offset(head, key0 + key) + dim, k_mean + head * HEAD_DIM + dim,
+                            table ? table + size_t(key0 + key) * ROPE_HALVES_PER_TOKEN : nullptr, dim);
+        uint4 high, low;
+        high.x = split_bf16x2(values[0], values[1], low.x);
+        high.y = split_bf16x2(values[2], values[3], low.y);
+        high.z = split_bf16x2(values[4], values[5], low.z);
+        high.w = split_bf16x2(values[6], values[7], low.w);
+        *reinterpret_cast<uint4*>(&k_hi[key][dim]) = high;
+        *reinterpret_cast<uint4*>(&k_lo[key][dim]) = low;
+    }
+    __syncthreads();
+
+    // B fragments of the warp's 2 blocks of 8 keys, 8 k-steps of 16 channels: one ldmatrix.x4 gives 2 k-steps
+    uint32_t b_hi[2][8][2], b_lo[2][8][2];
+#pragma unroll
+    for (int n = 0; n < 2; ++n)
+#pragma unroll
+        for (int s = 0; s < 8; s += 2) {
+            const int row = warp * 16 + n * 8 + lane % 8, col = 16 * s + 8 * (lane / 8);
+            uint32_t r[4];
+            ldmatrix_x4(r, &k_hi[row][col]);
+            b_hi[n][s][0] = r[0], b_hi[n][s][1] = r[1], b_hi[n][s + 1][0] = r[2], b_hi[n][s + 1][1] = r[3];
+            ldmatrix_x4(r, &k_lo[row][col]);
+            b_lo[n][s][0] = r[0], b_lo[n][s][1] = r[1], b_lo[n][s + 1][0] = r[2], b_lo[n][s + 1][1] = r[3];
+        }
+
+    const int g = lane / 4, t = 2 * (lane % 4);
+    const float inverse_outer = 1.0f / qk_outer[head];
+    for (int m0 = 0; m0 < n_blocks; m0 += 16) {
+        float acc[2][4] = {};
+        const size_t fragments = (size_t(head) * mean_rows + m0) / 16 * 8 * WARP_SIZE;
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            uint32_t a_hi[4], a_lo[4];
+            *reinterpret_cast<uint4*>(a_hi) = __ldg(q_hi + fragments + s * WARP_SIZE + lane);
+            *reinterpret_cast<uint4*>(a_lo) = __ldg(q_lo + fragments + s * WARP_SIZE + lane);
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                mma_bf16_16816(acc[n], a_hi, b_hi[n][s]);
+                mma_bf16_16816(acc[n], a_hi, b_lo[n][s]);
+                mma_bf16_16816(acc[n], a_lo, b_hi[n][s]);
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            const int key = key0 + warp * 16 + n * 8 + t;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {  // rows g and g + 8
+                const int block = m0 + g + 8 * h;
+                if (block >= n_blocks || key >= padded_keys) continue;
+                const float2 out = make_float2(key < n_keys ? acc[n][2 * h] * inverse_outer : 0.0f,
+                                               key + 1 < n_keys ? acc[n][2 * h + 1] * inverse_outer : 0.0f);
+                *reinterpret_cast<float2*>(&bias[(size_t(head) * n_blocks + block) * padded_keys + key]) = out;
+            }
+        }
+    }
+}
+
 // Scores of one tile: 8 blocks of 8 keys, each 2 k-steps of 64 channels. q: Q's A fragments of both steps, held in
 // registers for the whole kernel; q_scale: their scale registers. One ldmatrix.x4 gives a block's B registers of
-// both steps; one LDS.64 its two scale registers (lane 4g: key 8b + g).
+// both steps; one LDS.64 its two scale registers (lane 4g: key 8b + g). bias_tile: the tile's smooth_bias values, which
+// the accumulators start from (SMOOTH_Q; lane l holds keys 8b + 2 · (l % 4) and + 1 in both of its rows).
 __device__ __forceinline__ void qk_scores_fp4(float scores[KEY_BLOCKS][4], const uint32_t q[2][4], const uint32_t q_scale[2],
-                                              const uint8_t* k_tile, int lane) {
+                                              const uint8_t* k_tile, const float* bias_tile, int lane) {
     const uint8_t* lane_row = k_tile + (lane % 8) * FP4_ROW_BYTES + 16 * (lane / 8);
 #pragma unroll
     for (int block = 0; block < KEY_BLOCKS; ++block) {
@@ -2034,6 +2145,13 @@ __device__ __forceinline__ void qk_scores_fp4(float scores[KEY_BLOCKS][4], const
         const uint2 k_scale = *reinterpret_cast<const uint2*>(k_tile + (block * MMA_N + lane / 4) * FP4_ROW_BYTES + FP4_SCALES_AT);
         const uint32_t low[2] = {b[0], b[1]}, high[2] = {b[2], b[3]};
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if constexpr (SMOOTH_Q > 0) {
+            // the same pair into both halves of the accumulator quad: two LDS.64 (ld.volatile, which ptxas may not
+            // merge into one). One LDS.64 and two MOV into the quad: +0.5 ms (M4.21)
+            const uint32_t at = smem_address(bias_tile + block * MMA_N + 2 * (lane % 4));
+            asm volatile("ld.volatile.shared.v2.f32 {%0, %1}, [%2];" : "=f"(acc[0]), "=f"(acc[1]) : "r"(at));
+            asm volatile("ld.volatile.shared.v2.f32 {%0, %1}, [%2];" : "=f"(acc[2]), "=f"(acc[3]) : "r"(at));
+        }
         mma_nvf4_16864(acc, q[0], low, q_scale[0], k_scale.x);
         mma_nvf4_16864(acc, q[1], high, q_scale[1], k_scale.y);
 #pragma unroll
@@ -2049,6 +2167,17 @@ __device__ __forceinline__ void qk_scores_fp4(float scores[KEY_BLOCKS][4], const
 constexpr int STAGES = UNICA_STAGES;
 constexpr int AHEAD = STAGES - 1;
 
+// M4.21: tiles of smooth_bias per copy. 1: a tile's 256 bytes travel in K's group, one more bulk copy per tile, and
+// that copy, not its bytes, cost ~2 ms of the +4.5 (neither an L2 prefetch nor a deeper pipeline helped, nor issuing it
+// from another warp). n: one copy every n tiles into one of two buffers (2n · 256 bytes), issued n tiles ahead;
+// 8: +3.2 ms, 32: +2.3 ms, the rest is the 16 LDS a tile (ncu: +24 instructions a tile, no MIO throttle).
+#ifndef UNICA_BIAS_CHUNK
+#define UNICA_BIAS_CHUNK 32
+#endif
+constexpr int BIAS_CHUNK_TILES = UNICA_BIAS_CHUNK;
+constexpr int BIAS_SMEM_FLOATS = !SMOOTH_Q ? 1 : (BIAS_CHUNK_TILES == 1 ? STAGES : 2 * BIAS_CHUNK_TILES) * KEYS_PER_TILE;
+constexpr int BIAS_GROUP_BYTES = BIAS_CHUNK_TILES == 1 ? BIAS_TILE_BYTES : 0;  // bias bytes in a K/V group
+
 // M4.12: attention_fp4pv with Q·Kᵀ in NVFP4. k_map: K4 (quantize_fp4_rows on K − mean) as rows of FP4_ROW_BYTES, box
 // FP4_ROW_BYTES × KEYS_PER_TILE. Q4 as rows of FP4_ROW_BYTES, read once into registers. qk_outer[head]: the product of
 // Q's and K's float scales, folded into scale_log2. v_map and v_outer as attention_fp4pv.
@@ -2058,14 +2187,23 @@ constexpr int AHEAD = STAGES - 1;
 // t + AHEAD: its K slot is t % STAGES, which held K(t), read by iteration t − 1; its V slot is (t − 1) % STAGES, which
 // held V(t − 1), read by iteration t − 1; its barrier was last waited on in iteration t − 1. All of that is behind the
 // __syncthreads at the top of iteration t. K(0), for the Q·Kᵀ before the loop, lands on first_k.
+//
+// q_bias (SMOOTH_Q, else null): smooth_bias's [heads][query blocks][n_tiles · KEYS_PER_TILE]. With BIAS_CHUNK_TILES = 1
+// a tile's 256 bytes travel with the K tile, in the same group. With n: chunk c (tiles nc .. nc + n − 1) lands in
+// buffer c % 2 on bias_full[c % 2]. Iteration t scores tile t + 1; when that starts chunk c, it issues chunk c + 1,
+// into the buffer of chunk c − 1, whose last tile iteration t − 1 scored (behind the __syncthreads), and waits for
+// chunk c, issued n iterations before.
 extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
     attention_fp4(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
-                  const uint8_t* K4, const uint8_t* V4, const uint8_t* Q4, const float* qk_outer, const float* v_outer, __nv_bfloat16* O, int n_queries,
-                  int n_keys, float scale_log2, TokenLayout o_layout) {
+                  const uint8_t* K4, const uint8_t* V4, const uint8_t* Q4, const float* qk_outer, const float* v_outer,
+                  const float* q_bias, __nv_bfloat16* O, int n_queries, int n_keys, float scale_log2,
+                  TokenLayout o_layout) {
     __shared__ __align__(128) uint8_t k_tiles[STAGES][K4_TILE_BYTES];
     __shared__ __align__(128) uint8_t v_tiles[STAGES][V4_TILE_BYTES];
+    __shared__ __align__(16) float bias_smem[BIAS_SMEM_FLOATS];
     __shared__ __align__(8) uint64_t full[STAGES];
     __shared__ __align__(8) uint64_t first_k;
+    __shared__ __align__(8) uint64_t bias_full[2];
 
     const int warp = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -2102,12 +2240,34 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     // K4 is padded to whole tiles per head (its padding rows are zeros), like V4
     const int k_row0 = blockIdx.y * n_tiles * KEYS_PER_TILE;
     const int v_row0 = blockIdx.y * n_tiles * HEAD_DIM;
+    constexpr int smooth_q = SMOOTH_Q > 0 ? SMOOTH_Q : 1;  // as a divisor, for the build without smoothing
+    const float* bias_row = nullptr;                       // this block's row of q_bias
+    if constexpr (SMOOTH_Q > 0)
+        bias_row = q_bias + (size_t(blockIdx.y) * ((n_queries + smooth_q - 1) / smooth_q) +
+                             blockIdx.x * ROWS_PER_BLOCK / smooth_q) * n_tiles * KEYS_PER_TILE;
+    // where a tile's bias lies in shared memory
+    auto bias_tile = [&](int tile) -> const float* {
+        if constexpr (BIAS_CHUNK_TILES == 1) return bias_smem + tile % STAGES * KEYS_PER_TILE;
+        return bias_smem + (tile / BIAS_CHUNK_TILES % 2 * BIAS_CHUNK_TILES + tile % BIAS_CHUNK_TILES) * KEYS_PER_TILE;
+    };
     auto load_k = [&](int buffer, int tile, uint64_t* barrier) {
         if (UNICA_BULK_COPY)
             bulk_load(k_tiles[buffer], K4 + (size_t(blockIdx.y) * n_tiles + tile) * K4_TILE_BYTES, K4_TILE_BYTES, barrier);
         else
             tma_load_2d(k_tiles[buffer], k_map, 0, k_row0 + tile * KEYS_PER_TILE, barrier);
+        if constexpr (SMOOTH_Q > 0 && BIAS_CHUNK_TILES == 1)
+            bulk_load(bias_smem + buffer * KEYS_PER_TILE, bias_row + size_t(tile) * KEYS_PER_TILE, BIAS_TILE_BYTES, barrier);
     };
+    // chunk c of the bias, if there is one; thread 0 only
+    auto issue_bias = [&](int c) {
+        const int tile0 = c * BIAS_CHUNK_TILES;
+        if (tile0 >= n_tiles) return;
+        const int bytes = min(BIAS_CHUNK_TILES, n_tiles - tile0) * BIAS_TILE_BYTES;
+        mbarrier_expect_bytes(&bias_full[c % 2], bytes);
+        bulk_load(bias_smem + c % 2 * BIAS_CHUNK_TILES * KEYS_PER_TILE, bias_row + size_t(tile0) * KEYS_PER_TILE, bytes,
+                  &bias_full[c % 2]);
+    };
+    constexpr bool CHUNKED = SMOOTH_Q > 0 && BIAS_CHUNK_TILES > 1;
     auto load_v = [&](int buffer, int tile, uint64_t* barrier) {
         if (UNICA_BULK_COPY)
             bulk_load(v_tiles[buffer], V4 + (size_t(blockIdx.y) * n_tiles + tile) * V4_TILE_BYTES, V4_TILE_BYTES, barrier);
@@ -2117,19 +2277,21 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
 
     // group j: K(j + 1), if there is one, and V(j); thread 0 only
     auto issue_group = [&](int j) {
-        mbarrier_expect_bytes(&full[j % STAGES], (j + 1 < n_tiles ? K4_TILE_BYTES : 0) + V4_TILE_BYTES);
+        mbarrier_expect_bytes(&full[j % STAGES], (j + 1 < n_tiles ? K4_TILE_BYTES + BIAS_GROUP_BYTES : 0) + V4_TILE_BYTES);
         if (j + 1 < n_tiles) load_k((j + 1) % STAGES, j + 1, &full[j % STAGES]);
         load_v(j % STAGES, j, &full[j % STAGES]);
     };
     if (threadIdx.x == 0) {
         for (int i = 0; i < STAGES; ++i) mbarrier_init(&full[i], 1);
         mbarrier_init(&first_k, 1);
+        if constexpr (CHUNKED) mbarrier_init(&bias_full[0], 1), mbarrier_init(&bias_full[1], 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        mbarrier_expect_bytes(&first_k, K4_TILE_BYTES);
+        mbarrier_expect_bytes(&first_k, K4_TILE_BYTES + BIAS_GROUP_BYTES);
         load_k(0, 0, &first_k);
+        if constexpr (CHUNKED) issue_bias(0), issue_bias(1);
         for (int j = 0; j < AHEAD && j < n_tiles; ++j) issue_group(j);
     }
 
@@ -2138,8 +2300,9 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     float out[D_BLOCKS][4] = {};
 
     mbarrier_wait(&first_k, 0);
+    if constexpr (CHUNKED) mbarrier_wait(&bias_full[0], 0);
     float scores[2][KEY_BLOCKS][4];
-    qk_scores_fp4(scores[0], q, q_scale, k_tiles[0], lane);
+    qk_scores_fp4(scores[0], q, q_scale, k_tiles[0], bias_tile(0), lane);
     if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
     [[maybe_unused]] const int slot = TRACE_SLOT(lane);
 
@@ -2152,11 +2315,21 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             issue_group(t + AHEAD);
         }
+        if constexpr (CHUNKED)
+            if ((t + 1) % BIAS_CHUNK_TILES == 0 && t + 1 < n_tiles) {  // tile t + 1 starts chunk c
+                const int c = (t + 1) / BIAS_CHUNK_TILES;
+                if (threadIdx.x == 0) {
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    issue_bias(c + 1);
+                }
+                mbarrier_wait(&bias_full[c % 2], c / 2 % 2);
+            }
 
         float alpha[2];
         uint32_t p[4], scale_p;
         TRACE_MARK(slot, lane, t, 0);
-        qk_scores_fp4(scores[later], q, q_scale, k_tiles[(t + 1) % STAGES], lane);  // stale in the last iteration
+        qk_scores_fp4(scores[later], q, q_scale, k_tiles[(t + 1) % STAGES], bias_tile(t + 1),
+                      lane);  // stale in the last iteration
         online_softmax_fp4(scores[now], row_max, alpha, p, scale_p, score_scale, lane);
         TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
         TRACE_MARK_AFTER(slot, lane, t, 2, scale_p);

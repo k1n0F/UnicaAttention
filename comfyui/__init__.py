@@ -40,25 +40,23 @@ import unica  # noqa: E402
 from emulate import TODAY, emulate, errors, reference  # noqa: E402
 
 MODE = "unica"
-ERRORS_CSV = REPO / "build" / "wan_attention_errors_m4.20b.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
+ERRORS_CSV = REPO / "build" / "wan_attention_errors_m4.21.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
 # attention_fp4pv as the emulator computes it (LOG M4.8, tests/test_fp4.py)
 FP4PV = TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4", p_local=False, p_mul=1024.0, p_outer=1.0, v_outer="channel",
                      fp4_slots=True)
-# Candidates, emulated on the same real Q, K, V (today's kernel is measured itself, as "unica"). M4.20: Q's mean
-# subtracted before quantization, q̄ · k added back (per head: one vector per key; per 64 queries: SageAttention 3's way),
-# and which layers tolerate FP4 in Q·Kᵀ (the per-layer map of the fast mode)
+# The fast mode's kernels, measured themselves on the same real Q, K, V (M4.21): attention_fp4, and with Q smoothed per
+# 512 queries (M4.20 emulated it below SageAttention 3 in 22 of 22 blocks)
+KERNELS = {
+    "fp4": dict(kernel="attention_fp4"),
+    "fp4_smooth512": dict(kernel="attention_fp4", SMOOTH_Q=512),
+}
+# Emulated next to them, so that the kernel can be checked against the emulator on real data
 EMULATED = {
-    "emu_fp4pv": FP4PV,
-    "emu_fp4_both": FP4PV | dict(qk="nvfp4"),
-    "emu_fp4_both_smoothq": FP4PV | dict(qk="nvfp4", smooth_q="head"),
-    "emu_fp4_both_smoothq64": FP4PV | dict(qk="nvfp4", smooth_q=64),
-    "emu_fp4_both_smoothq128": FP4PV | dict(qk="nvfp4", smooth_q=128),  # SageAttention 3's block
     "emu_fp4_both_smoothq512": FP4PV | dict(qk="nvfp4", smooth_q=512),
-    "emu_fp4_both_smoothq_frame": FP4PV | dict(qk="nvfp4", smooth_q=1620),  # one 30 × 54 frame of the 81-frame video
-    "emu_today_smoothq": TODAY | dict(smooth_q="head"),
 }
 CSV_FIELDS = ["time", "node", "call", "step", "block", "batch", "tokens", "keys", "heads_measured", "unica_rel_l2", "unica_cos",
               "sage2_rel_l2", "sage2_cos", "sage3_rel_l2", "sage3_cos",
+              *(f"{name}_{e}" for name in KERNELS for e in ("rel_l2", "cos")),
               *(f"{name}_rel_l2" for name in EMULATED), "q_channel_spread", "k_channel_spread", "v_offset", "q_offset",
               "unica_ms", "sage2_ms", "sage3_ms"]
 HEAD_DIM = 128
@@ -153,6 +151,8 @@ class Measurement:
         results = {"unica": mine.transpose(1, 2), "sage2": sage2.transpose(1, 2)}
         if (sage3 := sage3_bhnd()) is not None:
             results["sage3"], row["sage3_ms"] = timed(sage3, *bhnd)
+        for name, settings in KERNELS.items():
+            results[name] = unica.attention(*(x.bfloat16() for x in bhnd), **settings)
         for name, out in results.items():
             e = errors(out.float(), ref)
             row[f"{name}_rel_l2"], row[f"{name}_cos"] = e["rel_l2"], e["cos"]
@@ -167,10 +167,11 @@ class Measurement:
             if new:
                 writer.writeheader()
             writer.writerow(row)
-        log.info("%s call %d, %d tokens: rel L2 unica %.3f %%, SageAttention 2 %.3f %%%s; emulated %s; "
+        log.info("%s call %d, %d tokens: rel L2 unica %.3f %%, SageAttention 2 %.3f %%%s; %s; emulated %s; "
                  "channel spread q %.2f k %.2f, v offset %.3f", self.node, self.calls,
                  q.shape[1], 100 * row["unica_rel_l2"], 100 * row["sage2_rel_l2"],
                  f", SageAttention 3 {100 * row['sage3_rel_l2']:.3f} %" if "sage3_rel_l2" in row else "",
+                 ", ".join(f"{name} {100 * row[f'{name}_rel_l2']:.3f} %" for name in KERNELS),
                  ", ".join(f"{name[4:]} {100 * row[f'{name}_rel_l2']:.3f} %" for name in EMULATED),
                  row["q_channel_spread"], row["k_channel_spread"], row["v_offset"])
 
