@@ -3314,3 +3314,101 @@ Fast's per-query error is not larger at hires (6.1 % against 6.4 % at 34 k), and
 each frame. So the fine row ripple of M4.32's fast render does not come from any position pattern of the kernel's
 error. It is the size of FP4's error, carried through 10 denoising steps, as the drift of fast's render in the story
 (mouth, tilt) shows. Fast stays below SageAttention 3 at every length measured.
+
+## M4.35 — the tail of "wan stable work": Nomos ×2 and RIFE ×5, microbenchmarks
+
+The idea: about 250 s of the ~640 s render lie outside the three sampling passes (M4.32), more than any gain left in
+attention (accurate against SageAttention 2 on the hires pass is ~15 s). The tail:
+1. VAE decode of the hires pass: 113 frames of 768 × 1360.
+2. Nomos ×2 (`2xNomosUni_span_multijpg_ldl`, SPAN: a CNN with no softmax attention, so nothing for our kernel). ComfyUI
+   runs it in fp32, in tiles of 512 with an overlap of 32.
+3. RIFE ×5 (`rife49`, ComfyUI-Frame-Interpolation, `fast_mode` on, `ensemble` off) on 1536 × 2720 frames: 112 pairs,
+   561 frames out.
+4. VideoCombine at 60 fps.
+
+The RIFE node's loop (`vfi_utils._generic_frame_loop`), per pair and per middle frame:
+- it uploads both frames again in fp32, 50 MB each: 8 uploads per pair instead of 2;
+- `.detach().cpu()`, a sync, after every middle frame;
+- `gc.collect()` after every pair;
+- its output is float32 on the CPU: 561 × 50 MB ≈ 28 GB of RAM.
+
+A quirk: it calls `model(f0, f1, t, scale_list, fast_mode, ensemble)`. The fifth positional parameter of
+`IFNet.forward` is `training`, so `fast_mode` lands there and `fastmode` gets `ensemble`. A faster loop must call it the
+same way to give the same frames.
+
+Hypotheses, written before measuring (the hires render's first frames; the per-pair times scale to 112 pairs):
+
+| | what | prediction |
+|---|---|---|
+| H1 | Nomos as ComfyUI runs it | ≤ 0.3 s per frame, ≤ 35 s for 113 frames (≤ 15 % of the 250 s) |
+| H2 | RIFE as the node runs it | the largest part: ≥ 1.3 s per pair, ≥ 150 s for 112 pairs (≥ 60 % of the 250 s) |
+| H3 | the same fp32 model, each frame uploaded once, the 4 middle frames of a pair in one batch, copied back to pinned memory without a sync, no gc.collect | ≥ 1.5× faster than the node, frames equal to it (largest difference ≤ 1e-5) |
+| H4 | H3 with fp16 autocast | ≥ 3× faster than the node, PSNR ≥ 40 dB against its frames |
+
+First run ([bench/rife_loop.py](bench/rife_loop.py), 13 frames of the hires render, 12 pairs, extrapolated to the
+render's 113 frames):
+
+| | per frame / pair | for the render | hypothesis |
+|---|---|---|---|
+| Nomos, as the node (fp32, tiles of 512) | 0.127 s | 14.3 s | ≤ 35 s: held |
+| Nomos, whole frames, fp32 | 0.093 s | 10.5 s | PSNR 80.2 dB against the node |
+| Nomos, whole frames, fp16 | 0.053 s | 6.0 s | PSNR 70.5 dB |
+| RIFE ×5, as the node | 0.362 s | **40.5 s** | ≥ 150 s: **missed, by 3.7×** |
+| RIFE, batched, fp32 | 0.255 s | 28.6 s | 1.42×, ≥ 1.5×: missed; largest difference 5.3e-3 (PSNR 95.4 dB), not ≤ 1e-5 |
+| RIFE, batched, fp16 autocast | 0.219 s | 24.5 s | 1.65×, ≥ 3×: missed; PSNR 56.0 dB, held, but one pixel off by 0.34 |
+
+- RIFE is not where the 250 s go: with Nomos it is ~55 s, and a better loop would save ~12–16 s of it.
+- The batched fp32 frames differ from the node's in the last bits. Convolutions run in TF32 by default, and cuDNN picks
+  other algorithms for a batch of 4 than for 1.
+- One gc.collect() takes 105 ms even in this small process, so ~12 s of the node's 40 s. In ComfyUI's larger heap it
+  is probably longer.
+
+H5, written before measuring: VideoCombine encodes 561 frames of 1536 × 2720 at 60 fps with libx264 (VHS h264-mp4: its
+default preset, CRF 19, yuv420p, a bt709 scale filter) on the CPU, and converts each float32 frame to bytes in Python
+first. Prediction: ≤ 10 frames per second, so ≥ 55 s for the render.
+
+| | per frame | for the render | hypothesis |
+|---|---|---|---|
+| VideoCombine: float32 → bytes (numpy, one thread) | 0.037 s | 20.8 s | |
+| VideoCombine: bytes and x264 together, as VHS does | 0.046 s (21.6 fps) | **26.0 s** for 561 frames | ≥ 55 s: **missed** |
+
+x264 runs alongside the Python conversion and mostly waits for it: 37 of the 46 ms per frame are numpy.
+
+**The tail measured so far is ~80 s, not 250:** Nomos 15 s, RIFE 39 s, VideoCombine 26 s. A second run gave RIFE
+0.344 s per pair (38.6 s), so it varies by ~5 %. The other ~170 s are in what these benchmarks do not cover:
+- loading the two 14B models with LoRA and block swap;
+- the text encoder;
+- four VAE decodes (965 and 972, the high and Lightning previews, still decoded with save_output off; 981, the hires
+  pass; 1064);
+- gc.collect in ComfyUI's larger heap.
+Fixing RIFE's loop would save ~10–15 s of a 640 s render. A render timed per node has to come first.
+
+**ComfyUI's environment.** ComfyUI always runs with `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and
+`NUMEXPR_NUM_THREADS` set to 8. The CPU is a Ryzen 9 9950X3D: 16 cores, 32 threads, and the 3D V-cache sits on one of
+its two 8-core chiplets. torch takes 8 threads with these variables and 16 without. The runs above had none of them.
+Rerun with all four (the second run, so the ~5 % spread applies): Nomos 14.0 s, RIFE 38.7 s, batched fp32 1.36×,
+batched fp16 1.53×, VideoCombine 24.9 s. The tail does not change: it waits on the GPU and on single-threaded numpy.
+Every CPU benchmark from now on runs with these variables.
+
+**Where the other ~170 s may go.** Theories, each with a number, to be checked:
+
+| | theory | prediction |
+|---|---|---|
+| T1 | the text encoder: umt5-xxl, fp16, on the CPU (`CLIPLoader device: cpu`), 8 threads. Zen 5 has no fp16 arithmetic, so torch takes a slow path | ≥ 20 s per render for both prompts; 16 threads ≤ 1.6× faster (V-cache on one chiplet); bf16 ≥ 2× faster than fp16. ComfyUI caches the node while the prompt is unchanged, so only a render after a restart or with a new prompt pays it |
+| T2 | loading the two 14B fp8 models from disk after every `/free`, and pinning them for block swap (40 blocks, non_blocking) | 30–60 s per render: 2 × ~14 GB from the disk, plus a pinned copy |
+| T3 | VAE: WanVideoEncode (1065) of all 113 frames at 1 MP before the hires pass, and the hires decode (981), both untiled, bf16 | 40–80 s together |
+| T4 | the decodes 965 and 972: the high and Lightning passes, decoded for preview videos with save_output off | 10–20 s for frames nobody keeps |
+| T5 | gc.collect in ComfyUI's heap: the RIFE node calls it 112 times | ≥ 0.2 s per call in ComfyUI against 0.1 s here, so ≥ 20 s |
+
+**Plan for the next session:**
+1. Microbenchmark of the text encoder on the CPU (T1), no GPU needed: 8 and 16 threads, fp16 and bf16, the render's
+   prompt and negative.
+2. One render timed per node by the ComfyUI agent (websocket `executing` events), launched as ComfyUI always is, with
+   the four variables. It checks T2–T5 at once and shows whether the text encoder ran or was cached.
+3. Fix what the timings rank first. Likely candidates, cheapest first:
+   - drop the decodes 965 and 972, or keep them only when the previews are wanted (T4);
+   - the text encoder in bf16, or on the GPU before the models load (T1);
+   - RIFE's loop: one upload per frame, batched middle frames, no gc.collect per pair. 10–15 s, frames equal to
+     PSNR 95 dB in fp32;
+   - VideoCombine's float32 → bytes on the GPU (37 of its 46 ms per frame are numpy).
+4. Then the full cycle with the changes, against the same render without them, in the same session.
