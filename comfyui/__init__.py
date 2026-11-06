@@ -81,11 +81,12 @@ SETTINGS: dict = {}  # what unica.attention gets in the node: the accurate mode 
 
 def unica_nhd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """unica.attention on the layout [batch, tokens, heads, 128] (WanVideoWrapper's and ComfyUI's), any float dtype in
-    and out. No copy for bf16 (M4.17): the default kernel reads the tensors through a transpose and writes its output
-    in the same layout, so out.transpose(1, 2) is already [batch, tokens, heads, 128] in memory. Other dtypes are
-    converted once each way, keeping the layout."""
-    out = unica.attention(*(x.transpose(1, 2).to(torch.bfloat16) for x in (q, k, v)), **SETTINGS)
-    return out.transpose(1, 2).to(q.dtype).contiguous()  # both no-ops for bf16
+    and out. No copy for bf16 and fp16: the kernels read the tensors through a transpose and write their output in the
+    same layout (M4.17), and unica.attention converts fp16 to bf16 a few heads at a time (M4.31). Float32 is converted
+    once each way, keeping the layout."""
+    half = q.dtype if q.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16  # float32: once each way
+    out = unica.attention(*(x.transpose(1, 2).to(half) for x in (q, k, v)), **SETTINGS)
+    return out.transpose(1, 2).to(q.dtype).contiguous()  # no-ops for bf16 and fp16
 
 
 def timed(function, *args):
@@ -254,6 +255,11 @@ KERNEL_INPUTS = {
                                             "kernel), outliers (experimental: per channel without each head's 8 largest "
                                             "keys, added exactly: Z-Image's two extreme tokens; ~1 ms more quantization) "
                                             "or per channel (the earlier path)"}),
+    "vram_reserve_mb": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 64,
+                                "tooltip": "VRAM left free for the desktop and other programs; 0: auto, the larger of "
+                                           "1 GiB and a tenth of the card. A call that would reach it runs a few heads "
+                                           "at a time, at most a few % slower. Past the VRAM, Windows moves memory to "
+                                           "system RAM and a render slows down many times over"}),
     "mode": (["accurate", "fast"], {"default": "accurate",
                                     "tooltip": "accurate: INT8 Q·Kᵀ and P·V, below SageAttention 2's error. fast: NVFP4 "
                                                "(attention_fp4), SageAttention 3's error class and faster than it; "
@@ -261,9 +267,10 @@ KERNEL_INPUTS = {
 }
 
 
-def choose_kernel(v_scale: str, mode: str) -> None:
+def choose_kernel(v_scale: str, mode: str, vram_reserve_mb: int) -> None:
     SETTINGS.clear()
     SETTINGS.update(FAST if mode == "fast" else V_SCALES[v_scale])
+    unica.VRAM_RESERVE = vram_reserve_mb * 2**20 if vram_reserve_mb else None
 
 
 class UnicaAttentionWanVideo:
@@ -287,10 +294,11 @@ class UnicaAttentionWanVideo:
     CATEGORY = "UnicaAttention"
     DESCRIPTION = "Self-attention of the WAN model on UnicaAttention (INT8 Q·Kᵀ, u8 × s8 P·V, sm_120)"
 
-    def patch(self, model, enabled, measure_every, measure_heads, v_scale="per_token", mode="accurate"):
+    def patch(self, model, enabled, measure_every, measure_heads, v_scale="per_token", mode="accurate",
+              vram_reserve_mb=0):
         if not enabled or checked().status == unica.check.UNSUPPORTED:
             return (model,)
-        choose_kernel(v_scale, mode)
+        choose_kernel(v_scale, mode, vram_reserve_mb)
         if not wrap_attention() and not any(getattr(getattr(m, "attention", None), "unica", False)
                                             for n, m in sys.modules.items() if n.endswith("wanvideo.modules.model")):
             raise RuntimeError("ComfyUI-WanVideoWrapper's wanvideo.modules.model is not loaded")
@@ -433,10 +441,10 @@ class UnicaAttentionNative:
                    "PathchSageAttentionKJ: other calls (cross-attention) go to the override before it.")
 
     def patch(self, model, enabled, measure_every, measure_heads, fuse_rope=False, measure_tag="",
-              v_scale="per_token", mode="accurate"):
+              v_scale="per_token", mode="accurate", vram_reserve_mb=0):
         if not enabled or checked().status == unica.check.UNSUPPORTED:
             return (model,)
-        choose_kernel(v_scale, mode)
+        choose_kernel(v_scale, mode, vram_reserve_mb)
         native_measurement.every, native_measurement.heads = measure_every, measure_heads
         native_measurement.tag = measure_tag
         native_measurement.routes.clear()

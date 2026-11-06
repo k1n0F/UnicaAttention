@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import os
 import warnings
 import weakref
 
@@ -50,6 +51,11 @@ TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST
 # M4.17: kernels that read q, k, v and write the output in the caller's layout (TokenLayout), e.g. ComfyUI's
 # [batch, tokens, heads, 128] seen as [batch, heads, tokens, 128] through a transpose. The others get contiguous copies.
 LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
+# M4.31: VRAM left free when a call's temporary buffers are sized, for the desktop and other programs on the same GPU.
+# None: the larger of 1 GiB and a tenth of the card (1.6 GiB on 16 GB). 512 MB was measured too little on Windows: a
+# call sized to it filled the VRAM to the last megabyte. UNICA_VRAM_RESERVE_MB sets it at import; the nodes have an input.
+VRAM_RESERVE: int | None = (int(os.environ["UNICA_VRAM_RESERVE_MB"]) * 2**20
+                             if "UNICA_VRAM_RESERVE_MB" in os.environ else None)
 # The settings the ComfyUI node runs, and so the only ones an installed package ships cubins for (build_wheel.py):
 # the accurate mode with each of its V scales (M4.23, M4.25) and the fast mode (M4.21). Others need the repository.
 PRESETS = {"per_token": dict(V_TOKEN=1), "per_channel": {}, "outliers": dict(V_OUTLIERS=8),
@@ -99,8 +105,10 @@ def attention(
         raise ValueError(f"unknown kernel {kernel!r}, expected one of {KERNELS}")
     if unknown := tile.keys() - TILE.keys():
         raise ValueError(f"unknown tile settings {sorted(unknown)}, expected some of {sorted(TILE)}")
-    if not (q.dtype == k.dtype == v.dtype == torch.bfloat16):
-        raise TypeError(f"q, k, v must be bfloat16, got {q.dtype}, {k.dtype}, {v.dtype}")
+    if not (q.dtype == k.dtype == v.dtype and q.dtype in (torch.bfloat16, torch.float16)):
+        raise TypeError(f"q, k, v must all be bfloat16 or all float16, got {q.dtype}, {k.dtype}, {v.dtype}")
+    if inputs is not None and q.dtype != torch.bfloat16:
+        raise TypeError("with inputs=, q, k, v must be bfloat16")
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("q, k, v must be on the GPU")
     if q.dim() != 4 or q.shape[-1] != HEAD_DIM:
@@ -112,9 +120,11 @@ def attention(
     n_keys = k.shape[2]
     if n_keys == 0:
         raise ValueError("k and v must hold at least one token")
+    if rope is not None and kernel not in LAYOUT_KERNELS:
+        raise ValueError(f"rope= needs one of {sorted(LAYOUT_KERNELS)}, got {kernel!r}")
+    if inputs is None and (q.dtype != torch.bfloat16 or heads_per_call(q, k, kernel, tile) < heads):
+        return in_pieces(q, k, v, kernel, rope, tile)
     if rope is not None:
-        if kernel not in LAYOUT_KERNELS:
-            raise ValueError(f"rope= needs one of {sorted(LAYOUT_KERNELS)}, got {kernel!r}")
         rope = rope_table(rope, batch, n_queries, n_keys)
 
     if kernel in LAYOUT_KERNELS:  # read in place, and write the output in q's layout (empty_like keeps its strides)
@@ -132,6 +142,47 @@ def attention(
     if inputs is None:
         inputs = kernel_inputs(q, k, v, kernel, rope, **tile)
     module("flash", **defines)[kernel](grid, warps * WARP_SIZE, *inputs, out, n_queries, n_keys, scale_log2, *layout_arg)
+    return out
+
+
+def free_vram(device: torch.device) -> int:
+    """Bytes a new allocation can take: what the driver has free, and what torch holds unused. Neither waits for the
+    GPU (M4.31 checked it: a sync here would idle the GPU on every call, as M4.28's did)."""
+    free, _ = torch.cuda.mem_get_info(device)
+    return free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+
+
+def vram_reserve(device: torch.device) -> int:
+    if VRAM_RESERVE is not None:
+        return VRAM_RESERVE
+    return max(2**30, torch.cuda.get_device_properties(device).total_memory // 10)
+
+
+def heads_per_call(q: torch.Tensor, k: torch.Tensor, kernel: str, tile: dict) -> int:
+    """How many heads one call can take without its temporary buffers reaching VRAM_RESERVE (M4.31). Past the VRAM,
+    Windows does not fail: it moves memory to system RAM over PCIe, one launch takes seconds, and the driver may reset
+    the GPU. Per head: the quantized q, k, v and the bf16 output, at most 2 bytes per element of q, k, v; bf16 copies
+    of float16 inputs, 2 more; the fast mode's q̄ · k table, 4 bytes per block of SMOOTH_Q queries and key."""
+    batch, heads, n_queries, _ = q.shape
+    n_keys = k.shape[2]
+    elements = batch * HEAD_DIM * (n_queries + 2 * n_keys)
+    per_head = elements * (2 + (2 if q.dtype != torch.bfloat16 else 0))
+    settings = TILE | tile
+    if kernel == "attention_fp4" and settings["SMOOTH_Q"]:
+        padded_keys = math.ceil(n_keys / settings["KEYS_PER_TILE"]) * settings["KEYS_PER_TILE"]
+        per_head += batch * math.ceil(n_queries / settings["SMOOTH_Q"]) * padded_keys * 4
+    return max(1, min(heads, (free_vram(q.device) - vram_reserve(q.device)) // per_head))
+
+
+def in_pieces(q, k, v, kernel: str, rope, tile: dict) -> torch.Tensor:
+    """attention() a few heads at a time, each piece converted to bfloat16 on its own, into one output in q's dtype
+    and layout. Every head is computed alone anyway (its scales, its outliers), so the result is bit for bit the
+    same as in one call."""
+    out = torch.empty_like(q)
+    step = heads_per_call(q, k, kernel, tile)  # after allocating out, so the free VRAM counts it
+    for first in range(0, q.shape[1], step):
+        piece = slice(first, first + step)
+        out[:, piece] = attention(*(x[:, piece].to(torch.bfloat16) for x in (q, k, v)), kernel, None, rope, **tile)
     return out
 
 

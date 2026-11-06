@@ -3034,3 +3034,72 @@ What follows:
 - reading fp16 directly in the quantizers and writing fp16 out of the kernel goes from an optimization to a necessity;
 - huge calls get split by heads, so that one launch stays well under a second;
 - the LoRA comes back with `merge_loras = false` in WanVideoWrapper: applied on the fly, with no merge at load.
+
+## M4.31 — a call split by heads to stay in the VRAM, with a reserve for the desktop
+
+The decision: before anything else, no mode may overflow the VRAM again, at any length (M4.30: a reset driver and a
+broken desktop until reboot).
+
+**Step 1: the peaks.** [bench/wan_call.py](bench/wan_call.py) `--memory 118320`: one self-attention call of the hires
+pass, fp16, memory above q, k, v (1.13 GiB each). Hypotheses written before:
+
+| path | hypothesis | measured | time |
+|---|---|---|---|
+| SDPA | — | 1.13 GiB | 2.80 s |
+| SageAttention 2 | ~3 GB | 3.95 GiB | 1.00 s |
+| SageAttention 3 | ~5 GB | **27.9 GiB** | 2.81 s |
+| Unica per channel | ~7.9 GB | 6.21 GiB | 1.19 s |
+| Unica per token | ~7.9 GB | 6.24 GiB | 1.15 s |
+| Unica fast | ~7.0 GB | 9.75 GiB | **38.7 s** |
+
+- **Fast overflowed** on an empty 16 GB card: 3.4 GiB of inputs, 9.75 GiB of its own and the desktop's 2.5 GB. One call
+  took 38.7 s over PCIe. That is the render that reset the driver (M4.30).
+- **The hypothesis missed fast's q̄ · k table (M4.21):** float32 per head, per block of 512 queries, per key. It grows as
+  the square of the length: 0.36 GB at 34,020 tokens, 4.4 GB at 118,320.
+- **SageAttention 3 needs 27.9 GiB** for this call, so on a 16 GB card it overflows too. That is why it was twice as
+  slow as SageAttention 2 on the hires pass.
+
+**Step 2: split by heads.** Every head is computed on its own (its scales, its outliers), so a call can run a few heads
+at a time. `unica.attention` now:
+- sizes the pieces from the free VRAM: the driver's free memory, plus what torch holds unused, minus a reserve;
+- takes fp16 and converts each piece to bf16 on its own, instead of the node copying all of q, k, v;
+- writes one output in the caller's dtype and layout.
+
+Before the change, a check that the free-memory query does not wait for the GPU, after M4.28. With ~204 ms of matmuls
+queued, `torch.cuda.mem_get_info` returned in 0.32 ms of host time and left the 204 ms queued. A real sync, `float()` of
+a GPU tensor, waited the whole 205 ms.
+
+Tests ([tests/test_pieces.py](tests/test_pieces.py)): for every preset, pieces of 3, 3 and 2 heads, and fp16 converted
+piece by piece, are bit for bit one bf16 call. The output keeps ComfyUI's [batch, tokens, heads, 128] layout.
+
+**Step 3: what splitting costs** ([bench/pieces_cost.py](bench/pieces_cost.py), WAN's 34,020 tokens, forced pieces).
+Hypothesis: within 3 % down to 8 heads per call.
+
+| preset | 20 heads | 10 heads | 8 heads | 5 heads |
+|---|---|---|---|---|
+| per token | −0.1 % | 0.0 % | −1.0 % | +0.5 % |
+| per channel | −0.3 % | −1.2 % | −0.9 % | +0.1 % |
+| outliers | −0.2 % | −1.1 % | −1.1 % | −0.1 % |
+| fast | +1.1 % | +3.3 % | +3.4 % | +4.6 % |
+
+It held for the accurate modes, which stay within noise. Fast pays slightly more: smooth_bias and Q's statistics have a
+fixed cost per piece.
+
+**Step 4: the reserve.** The first reserve was 512 MB. In a fresh process, fast was sized to 35 heads: the driver
+reported 10.12 GiB free, which leaves a 9.6 GiB budget, and the peak was 9.66 GiB. The estimate per head was right
+(296 MB measured, 291 estimated), but the call used the VRAM to its last megabyte. After SageAttention 3 had run in the
+same process, it overflowed again (27 s). On Windows, the desktop needs more room than that.
+
+Since small pieces cost next to nothing, the reserve is now the larger of 1 GiB and a tenth of the card: 1.6 GiB on
+16 GB. `UNICA_VRAM_RESERVE_MB` or the nodes' `vram_reserve_mb` (0 means automatic) set it by hand. The same call at
+118,320 tokens, right after SageAttention 3:
+
+| path | peak above the inputs | time |
+|---|---|---|
+| SageAttention 2 | 3.95 GiB | 0.91 s |
+| Unica per channel | 7.18 GiB | 0.98 s |
+| Unica per token | 7.22 GiB | 1.08 s |
+| Unica fast | 6.98 GiB | **0.64 s** (38.7 s before) |
+
+Next: fp16 read directly by the quantizers and written by the kernel, which removes the bf16 copies and the second
+output. The q̄ · k table for fast is computed inside the kernel instead (decision pending).

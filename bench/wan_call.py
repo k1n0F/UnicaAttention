@@ -1,6 +1,7 @@
 """M4.28: one WAN attention call as ComfyUI makes it, by each path the bench compares, and its parts.
 
-usage: uv run python bench/wan_call.py
+usage: uv run python bench/wan_call.py                    times every path at the bench's 34020 tokens
+       uv run python bench/wan_call.py --memory 118320   peak memory of one self-attention call per path (M4.31)
 
 WAN 2.2 at the bench's 0.4 MP and 81 frames: self-attention q, k, v [1, 34020, 40 · 128], cross-attention to 512 text
 tokens; fp16, as ComfyUI's WAN hands them over. Paths:
@@ -54,7 +55,8 @@ def node(mode):  # the native node's override with its kernel chosen, as a rende
     override = comfyui.native_override(None)
 
     def call(q, k, v):
-        comfyui.choose_kernel("per_token" if mode == "fast" else mode, "fast" if mode == "fast" else "accurate")
+        comfyui.choose_kernel("per_token" if mode == "fast" else mode, "fast" if mode == "fast" else "accurate",
+                              (unica.VRAM_RESERVE or 0) // 2**20)
         return override(None, q, k, v, heads=HEADS)
     return call
 
@@ -69,7 +71,33 @@ def kernel_bf16(mode):  # the same kernel on bf16 views in the same layout: no c
     return call
 
 
+def memory(tokens: int) -> None:
+    """One self-attention call per path: its peak memory above what was allocated before it (q, k, v themselves), and
+    its time. At "wan stable work"'s hires pass (118320 tokens) one copy of q, k or v is 1.21 GB."""
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, tokens, HEADS * DIM, device="cuda", dtype=torch.float16) for _ in range(3))
+    paths = {"sdpa": sdpa, "sage2": sage2, "sage3": sage3,
+             **{f"unica {m}": node(m) for m in ("per_channel", "per_token", "fast")}}
+    print(f"one self-attention call, {tokens} tokens, {HEADS} heads, fp16; one input {q.nbytes / 2**30:.2f} GiB")
+    for name, call in paths.items():
+        call(q, k, v)  # cubins, autotuning, the allocator's first growth
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        out = call(q, k, v)
+        end.record()
+        end.synchronize()
+        peak = torch.cuda.max_memory_allocated() - before
+        print(f"  {name:20} peak {peak / 2**30:5.2f} GiB above the inputs   {start.elapsed_time(end):8.1f} ms")
+        del out
+
+
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--memory":
+        return memory(int(sys.argv[2]))
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, TOKENS, HEADS * DIM, device="cuda", dtype=torch.float16) for _ in range(3))
     text_k, text_v = (torch.randn(1, TEXT, HEADS * DIM, device="cuda", dtype=torch.float16) for _ in range(2))
