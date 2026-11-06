@@ -25,6 +25,7 @@ already be built (run the tests once): ComfyUI's shell has no nvcc.
 from __future__ import annotations
 
 import collections
+import functools
 import csv
 import logging
 import sys
@@ -44,7 +45,7 @@ MODE = "unica"
 ERRORS_CSV = REPO / "build" / "attention_errors_v_modes.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
 # while this file exists, every measured call also saves its q, k, v (the measured heads) to build/dumps/
 DUMP_FLAG = REPO / "build" / "dumps.flag"
-OUTLIER_KEYS = 8  # M4.25: keys per head the accurate mode's v_scale "outliers" takes out of INT8
+OUTLIER_KEYS = unica.PRESETS["outliers"]["V_OUTLIERS"]  # M4.25: keys per head v_scale "outliers" takes out of INT8
 # attention_fp4pv as the emulator computes it (LOG M4.8, tests/test_fp4.py)
 FP4PV = TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4", p_local=False, p_mul=1024.0, p_outer=1.0, v_outer="channel",
                      fp4_slots=True)
@@ -72,9 +73,9 @@ log = logging.getLogger("UnicaAttention")
 
 # Build settings of the accurate mode's kernel, set by the native node's v_scale: per_token is V_TOKEN=1 (M4.23),
 # outliers V_OUTLIERS=OUTLIER_KEYS (M4.25: per channel, a head's largest keys added exactly), per_channel neither
-V_SCALES = {"per_token": {"V_TOKEN": 1}, "outliers": {"V_OUTLIERS": OUTLIER_KEYS}, "per_channel": {}}
+V_SCALES = {name: unica.PRESETS[name] for name in ("per_token", "outliers", "per_channel")}
 # The fast mode (M4.21): Q·Kᵀ and P·V in NVFP4, Q smoothed per 512 queries; real WAN 7.45 % vs SageAttention 3 8.65 %
-FAST = dict(kernel="attention_fp4", SMOOTH_Q=512)
+FAST = unica.PRESETS["fast"]
 SETTINGS: dict = {}  # what unica.attention gets in the node: the accurate mode with one of V_SCALES, or FAST
 
 
@@ -241,6 +242,26 @@ def wrap_attention() -> int:
     return wrapped
 
 
+# The kernel both nodes run, chosen by these optional inputs. Both set the one SETTINGS: in a workflow with both
+# nodes, the one that ran last decides.
+KERNEL_INPUTS = {
+    "v_scale": (list(V_SCALES), {"default": "per_token",
+                                 "tooltip": "V's INT8 scale: per token (folded into P, the most accurate; ~11 % slower "
+                                            "kernel), outliers (experimental: per channel without each head's 8 largest "
+                                            "keys, added exactly: Z-Image's two extreme tokens; ~1 ms more quantization) "
+                                            "or per channel (the earlier path)"}),
+    "mode": (["accurate", "fast"], {"default": "accurate",
+                                    "tooltip": "accurate: INT8 Q·Kᵀ and P·V, below SageAttention 2's error. fast: NVFP4 "
+                                               "(attention_fp4), SageAttention 3's error class and faster than it; "
+                                               "v_scale does not apply"}),
+}
+
+
+def choose_kernel(v_scale: str, mode: str) -> None:
+    SETTINGS.clear()
+    SETTINGS.update(FAST if mode == "fast" else V_SCALES[v_scale])
+
+
 class UnicaAttentionWanVideo:
     @classmethod
     def INPUT_TYPES(cls):
@@ -252,7 +273,8 @@ class UnicaAttentionWanVideo:
                                           "tooltip": "Compare with SageAttention 2 and FP32 every n-th self-attention call (0: off)"}),
                 "measure_heads": ("INT", {"default": 2, "min": 1, "max": 40,
                                           "tooltip": "Heads per measured call: the FP32 reference is slow"}),
-            }
+            },
+            "optional": KERNEL_INPUTS,  # optional, so that workflows saved before it still validate
         }
 
     RETURN_TYPES = ("WANVIDEOMODEL",)
@@ -261,9 +283,10 @@ class UnicaAttentionWanVideo:
     CATEGORY = "UnicaAttention"
     DESCRIPTION = "Self-attention of the WAN model on UnicaAttention (INT8 Q·Kᵀ, u8 × s8 P·V, sm_120)"
 
-    def patch(self, model, enabled, measure_every, measure_heads):
-        if not enabled:
+    def patch(self, model, enabled, measure_every, measure_heads, v_scale="per_token", mode="accurate"):
+        if not enabled or checked().status == unica.check.UNSUPPORTED:
             return (model,)
+        choose_kernel(v_scale, mode)
         if not wrap_attention() and not any(getattr(getattr(m, "attention", None), "unica", False)
                                             for n, m in sys.modules.items() if n.endswith("wanvideo.modules.model")):
             raise RuntimeError("ComfyUI-WanVideoWrapper's wanvideo.modules.model is not loaded")
@@ -278,6 +301,20 @@ class UnicaAttentionWanVideo:
 POSITIONAL = ("heads", "mask", "attn_precision", "skip_reshape", "skip_output_reshape")
 
 
+FAILED: list = []  # the error, once a call to unica has failed: every call after it goes to the model's own attention
+
+
+@functools.cache
+def checked() -> unica.check.Compatibility:
+    """unica.compatibility(), logged once: if unica cannot run here, the nodes leave the model as it is."""
+    status = unica.compatibility()
+    if status.status == unica.check.UNSUPPORTED:
+        log.warning("%s\nThe Unica nodes leave the model's own attention in place.", status)
+    elif status.status == unica.check.UNTESTED:
+        log.warning("%s", status)
+    return status
+
+
 def native_override(previous):
     """An optimized_attention_override for ComfyUI's own models. ComfyUI calls it as (func, q, k, v, heads=, ...):
     q, k, v are [batch, tokens, heads · dim], or [batch, heads, tokens, dim] with skip_reshape. Self-attention
@@ -288,7 +325,8 @@ def native_override(previous):
         # WAN passes heads by name, most other models by position (Flux, LTX, Qwen-Image, Lumina...): read both
         named = dict(zip(POSITIONAL, args)) | kwargs
         heads = named.get("heads")
-        reason = ("positional arguments" if len(args) > len(POSITIONAL) else "no heads" if heads is None else
+        reason = ("unica failed" if FAILED else "positional arguments" if len(args) > len(POSITIONAL) else
+                  "no heads" if heads is None else
                   "mask" if named.get("mask") is not None else "not on the GPU" if not q.is_cuda else None)
         if reason is None:
             skip_reshape = named.get("skip_reshape", False)
@@ -304,7 +342,13 @@ def native_override(previous):
         kwargs = named
         # [batch, tokens, heads, 128], WanVideoWrapper's layout, as views
         nhd = [x.transpose(1, 2) if skip_reshape else x.view(x.shape[0], x.shape[1], heads, dim) for x in (q, k, v)]
-        out = unica_nhd(*nhd)
+        try:
+            out = unica_nhd(*nhd)
+        except RuntimeError as error:  # e.g. a driver that cannot load the cubins: this call and every later one as before
+            if not FAILED:
+                log.error("unica failed, the model's own attention takes over: %s", error)
+            FAILED.append(error)
+            return previous(func, q, k, v, *args, **kwargs) if previous else func(q, k, v, *args, **kwargs)
         native_measurement(*nhd, options=kwargs.get("transformer_options"))
         return out.transpose(1, 2) if skip_output_reshape else out.view(out.shape[0], out.shape[1], heads * dim)
 
@@ -373,15 +417,7 @@ class UnicaAttentionNative:
                                                      "(~2 ms less per call). Patches WanSelfAttention.forward"}),
                 "measure_tag": ("STRING", {"default": "",
                                            "tooltip": "Written into the measurement CSV, e.g. the model's name"}),
-                "v_scale": (list(V_SCALES), {"default": "per_token",
-                                             "tooltip": "V's INT8 scale: per token (folded into P, the most accurate; "
-                                                        "~11 % slower kernel), outliers (experimental: per channel without each head's "
-                                                        "8 largest keys, added exactly: Z-Image's two extreme tokens; "
-                                                        "~1 ms more quantization) or per channel (the earlier path)"}),
-                "mode": (["accurate", "fast"], {"default": "accurate",
-                                                "tooltip": "accurate: INT8 Q·Kᵀ and P·V, below SageAttention 2's error. "
-                                                           "fast: NVFP4 (attention_fp4), SageAttention 3's error class "
-                                                           "and faster than it; v_scale does not apply"}),
+                **KERNEL_INPUTS,
             },
         }
 
@@ -394,10 +430,9 @@ class UnicaAttentionNative:
 
     def patch(self, model, enabled, measure_every, measure_heads, fuse_rope=False, measure_tag="",
               v_scale="per_token", mode="accurate"):
-        if not enabled:
+        if not enabled or checked().status == unica.check.UNSUPPORTED:
             return (model,)
-        SETTINGS.clear()
-        SETTINGS.update(FAST if mode == "fast" else V_SCALES[v_scale])
+        choose_kernel(v_scale, mode)
         native_measurement.every, native_measurement.heads = measure_every, measure_heads
         native_measurement.tag = measure_tag
         native_measurement.routes.clear()

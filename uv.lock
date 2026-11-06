@@ -605,8 +605,11 @@ wheels = [
 
 [[package]]
 name = "unica-attention"
-version = "0.0.0"
+version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "torch" },
+]
 
 [package.dev-dependencies]
 bench = [
@@ -615,6 +618,7 @@ bench = [
 ]
 
 [package.metadata]
+requires-dist = [{ name = "torch", index = "https://download.pytorch.org/whl/cu132" }]
 
 [package.metadata.requires-dev]
 bench = [

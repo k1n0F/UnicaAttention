@@ -1,6 +1,7 @@
 """CUDA driver API through ctypes: nvcc builds a .cubin, the driver loads it, kernels run on torch's stream.
 
-No C++ extension: nothing to rebuild for each torch version.
+No C++ extension: nothing to rebuild for each torch version. A cubin is the GPU's own machine code, the same file on
+Windows and Linux, so one package serves both: the installed one carries its cubins in unica/cubins/.
 """
 
 import ctypes
@@ -12,16 +13,34 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+SHIPPED = Path(__file__).resolve().parent / "cubins"  # the cubins of an installed package (build_wheel.py)
 ARCH = "sm_120a"
 
-_cuda = ctypes.CDLL("nvcuda.dll" if os.name == "nt" else "libcuda.so.1")
+
+@functools.cache
+def driver():
+    """The CUDA driver library, loaded on first use, so that importing unica works without one: compatibility()
+    then says why it cannot run, and the ComfyUI node falls back instead of failing to load."""
+    return ctypes.CDLL("nvcuda.dll" if os.name == "nt" else "libcuda.so.1")
+
+
+def driver_version() -> int:
+    """The CUDA version the driver supports, as 1000 · major + 10 · minor: 13040 for CUDA 13.4."""
+    version = ctypes.c_int()
+    _check(driver().cuDriverGetVersion(ctypes.byref(version)))
+    return version.value
 
 
 def _check(res):
     if res:
         msg = ctypes.c_char_p()
-        _cuda.cuGetErrorString(res, ctypes.byref(msg))
+        driver().cuGetErrorString(res, ctypes.byref(msg))
         raise RuntimeError(f"CUDA driver error {res}: {msg.value.decode() if msg.value else '?'}")
+
+
+def cubin_name(name, defines):
+    """<name>-KEY1=1-KEY2=2.cubin: one file per combination of -D flags."""
+    return name + "".join(f"-{key}={value}" for key, value in sorted(defines.items())) + ".cubin"
 
 
 def cubin(name, defines=None):
@@ -29,10 +48,17 @@ def cubin(name, defines=None):
 
     defines become -D flags, and each combination gets its own cubin: build/<name>-KEY1=1-KEY2=2.cubin.
     Only the .cu file's own time is checked: a change in an included header does not trigger a rebuild.
+    Without csrc/ (an installed package) it is the shipped cubin, and settings outside the shipped set are an error.
     """
     defines = defines or {}
-    suffix = "".join(f"-{key}={value}" for key, value in sorted(defines.items()))
-    src, out = ROOT / "csrc" / f"{name}.cu", ROOT / "build" / f"{name}{suffix}.cubin"
+    src, out = ROOT / "csrc" / f"{name}.cu", ROOT / "build" / cubin_name(name, defines)
+    if not src.exists():
+        shipped = SHIPPED / out.name
+        if not shipped.exists():
+            raise RuntimeError(f"{out.name} is not shipped in this package (it has "
+                               f"{', '.join(sorted(p.name for p in SHIPPED.glob('*.cubin'))) or 'none'}); "
+                               f"other settings need the repository and nvcc")
+        return shipped.read_bytes()
     if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
         out.parent.mkdir(exist_ok=True)
         flags = [f"-D{key}={value}" for key, value in sorted(defines.items())]
@@ -45,9 +71,9 @@ def cubin(name, defines=None):
 def _context():
     """The device's primary context, the one torch works in. Retained once per process and never released:
     torch keeps it alive anyway, and the driver frees it at exit."""
-    _check(_cuda.cuInit(0))
+    _check(driver().cuInit(0))
     ctx = ctypes.c_void_p()
-    _check(_cuda.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), torch.cuda.current_device()))
+    _check(driver().cuDevicePrimaryCtxRetain(ctypes.byref(ctx), torch.cuda.current_device()))
     return ctx
 
 
@@ -63,14 +89,14 @@ class Module:
     """One .cubin loaded into torch's context. module["name"] gives a kernel. Use module(), not this directly."""
 
     def __init__(self, name, defines=None):
-        _check(_cuda.cuCtxSetCurrent(_context()))
+        _check(driver().cuCtxSetCurrent(_context()))
         self._image = cubin(name, defines)  # keeps the bytes alive while the module exists
         self._mod = ctypes.c_void_p()
-        _check(_cuda.cuModuleLoadData(ctypes.byref(self._mod), self._image))
+        _check(driver().cuModuleLoadData(ctypes.byref(self._mod), self._image))
 
     def __getitem__(self, name):
         f = ctypes.c_void_p()
-        _check(_cuda.cuModuleGetFunction(ctypes.byref(f), self._mod, name.encode()))
+        _check(driver().cuModuleGetFunction(ctypes.byref(f), self._mod, name.encode()))
         return Kernel(f, self)
 
 
@@ -91,7 +117,7 @@ def tensor_map_2d(tensor, element_type, width, rows, row_bytes, box_width, box_r
     of box_width × box_rows. A box may be wider or longer than the tensor: what lies outside comes in as
     zeros, which is how a kernel gets padded rows in shared memory from unpadded ones in global memory."""
     tensor_map = TensorMap()
-    _check(_cuda.cuTensorMapEncodeTiled(
+    _check(driver().cuTensorMapEncodeTiled(
         ctypes.byref(tensor_map), element_type, 2, ctypes.c_void_p(tensor.data_ptr()),
         (ctypes.c_uint64 * 2)(width, rows), (ctypes.c_uint64 * 1)(row_bytes),
         (ctypes.c_uint32 * 2)(box_width, box_rows), (ctypes.c_uint32 * 2)(1, 1),
@@ -122,4 +148,4 @@ class Kernel:
         g = (*grid, 1, 1)[:3] if isinstance(grid, tuple) else (grid, 1, 1)
         b = (*block, 1, 1)[:3] if isinstance(block, tuple) else (block, 1, 1)
         stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-        _check(_cuda.cuLaunchKernel(self.f, *g, *b, smem, stream, params, None))
+        _check(driver().cuLaunchKernel(self.f, *g, *b, smem, stream, params, None))

@@ -47,7 +47,7 @@ POLL_SECONDS = 2
 RESTART_WAIT_SECONDS = 600  # ComfyUI's watchdog restarts it after a crash
 FIELDS = ["time", "model", "mode", "round", "seconds", "calls", "rel_l2_median", "rel_l2_max", "rival",
           "rival_rel_l2_median", "below_rival", "unica", "comfyui", "torch", "cuda", "python", "gpu", "driver",
-          "power_limit"]
+          "power_limit", "sm_clock", "temperature"]
 
 
 def call(path: str, body: bytes | dict | None = None, content_type: str = "application/json"):
@@ -91,6 +91,13 @@ def environment(comfyui_dir: str | None) -> dict:
     return {"unica": output("git", "-C", str(REPO), "describe", "--always", "--dirty", "--tags"),
             "comfyui": comfyui, "torch": system["pytorch_version"], "cuda": release[1] if release else "",
             "python": system["python_version"].split()[0], "gpu": gpu, "driver": driver, "power_limit": power}
+
+
+def gpu_state() -> dict:
+    """The SM clock and temperature right after a render: renders drift 3-8 % between runs (LOG M4.26)."""
+    clock, temperature = (output("nvidia-smi", "--query-gpu=clocks.sm,temperature.gpu", "--format=csv,noheader")
+                          .split(", ") + ["", ""])[:2]
+    return {"sm_clock": clock, "temperature": temperature}
 
 
 def graph(model: str, mode: str, measure_every: int, tag: str) -> dict:
@@ -176,10 +183,12 @@ def measured_errors(tag: str) -> dict[str, dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("models", nargs="*", default=list(MEASURE_EVERY), choices=list(MEASURE_EVERY))
+    # no default here: argparse checks a list default against choices as one value and rejects it
+    parser.add_argument("models", nargs="*", choices=list(MEASURE_EVERY))
     parser.add_argument("--rounds", type=int, default=ROUNDS)
     parser.add_argument("--comfyui-dir", help="ComfyUI's checkout, to record its commit")
     args = parser.parse_args()
+    args.models = args.models or list(MEASURE_EVERY)
 
     env = environment(args.comfyui_dir)
     print(", ".join(f"{key} {value}" for key, value in env.items()))
@@ -194,7 +203,7 @@ def main() -> None:
 
         def record(model, mode, round_, **values):
             writer.writerow({"time": datetime.now().isoformat(timespec="seconds"), "model": model, "mode": mode,
-                             "round": round_, **values, **env})
+                             "round": round_, **values, **env, **gpu_state()})
             f.flush()
 
         summary = {}

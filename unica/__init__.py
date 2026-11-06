@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import ctypes
 import math
+import warnings
 import weakref
 
 import torch
 
+from unica.check import OK, compatibility
 from unica.cuda import UINT8, UINT16, module, tensor_map_2d
+
+if (_compatibility := compatibility()).status != OK:  # untested here, or cannot run: say so once, on import
+    warnings.warn(str(_compatibility), stacklevel=2)
 
 HEAD_DIM = 128
 WARP_SIZE = 32
@@ -45,6 +50,10 @@ TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST
 # M4.17: kernels that read q, k, v and write the output in the caller's layout (TokenLayout), e.g. ComfyUI's
 # [batch, tokens, heads, 128] seen as [batch, heads, tokens, 128] through a transpose. The others get contiguous copies.
 LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
+# The settings the ComfyUI node runs, and so the only ones an installed package ships cubins for (build_wheel.py):
+# the accurate mode with each of its V scales (M4.23, M4.25) and the fast mode (M4.21). Others need the repository.
+PRESETS = {"per_token": dict(V_TOKEN=1), "per_channel": {}, "outliers": dict(V_OUTLIERS=8),
+           "fast": dict(kernel="attention_fp4", SMOOTH_Q=512)}
 
 
 class TokenLayout(ctypes.Structure):
@@ -116,7 +125,7 @@ def attention(
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         out = torch.empty_like(q)
         layout_arg = ()
-    defines = {f"UNICA_{key}": value for key, value in tile.items() if TILE[key] != value}
+    defines = build_defines(tile)
     warps = tile.get("WARPS_PER_BLOCK", TILE["WARPS_PER_BLOCK"])
     grid = (math.ceil(n_queries / (warps * ROWS_PER_WARP)), batch * heads)
     scale_log2 = HEAD_DIM**-0.5 * LOG2E
@@ -124,6 +133,11 @@ def attention(
         inputs = kernel_inputs(q, k, v, kernel, rope, **tile)
     module("flash", **defines)[kernel](grid, warps * WARP_SIZE, *inputs, out, n_queries, n_keys, scale_log2, *layout_arg)
     return out
+
+
+def build_defines(tile: dict) -> dict:
+    """The -D flags of the cubin that `tile` (overrides of TILE) needs: only what differs from TILE."""
+    return {f"UNICA_{key}": value for key, value in tile.items() if key != "kernel" and TILE[key] != value}
 
 
 def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str, rope: torch.Tensor | None = None,

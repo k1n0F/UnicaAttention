@@ -3,3 +3,5 @@ __pycache__/
 *.cubin
 *.exe
 build/
+dist/
+assets/wan_00004.mp4

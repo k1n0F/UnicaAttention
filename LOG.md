@@ -2800,6 +2800,78 @@ What was taken out of the studio workflows:
   decode. It was the first such crash in 14 days, and the same graph passed again. The bench now waits for the
   restart, loads the models again untimed and goes on, instead of stopping an hour-long run.
 
+**Full run on e0bc502** (median of 3 renders in seconds; error: median rel L2, and in how many measured calls it is
+below the rival: SageAttention 2 for the accurate modes, 3 for fast). WAN comes from a second run of its own: during
+the first one, round 0 shared the GPU with a check of the kernels.
+
+| model | off | sage2 | sage3 | per_channel | per_token | outliers | fast |
+|---|---|---|---|---|---|---|---|
+| WAN | 68.2 | 45.6 | **44.2** | 48.6 | 50.2 | 48.3 | 44.5 |
+| LTX | 43.7 | 37.9 | 40.3 | 40.6 | 41.4 | 45.1 | 43.0 |
+| Qwen | 5.7 | 4.8 | **4.6** | 4.8 | 4.8 | 4.9 | 4.7 |
+| Z-Image | 12.9 | **10.8** | 11.1 | 11.0 | 11.1 | 11.7 | 11.4 |
+| Moss | 9.9 | **9.7** | 10.1 | 10.1 | 10.2 | 10.8 | 10.5 |
+
+| error | sage2 | per_token | sage3 | fast |
+|---|---|---|---|---|
+| WAN | 1.51 % | **0.78 %**, 21/22 | 8.60 % | **8.16 %**, 22/22 |
+| LTX | 0.58 % | **0.42 %**, 20/20 | 3.44 % | **3.10 %**, 17/20 |
+| Qwen | 1.81 % | **1.14 %**, 20/20 | 12.37 % | **10.94 %**, 20/20 |
+| Z-Image | 2.07 % | **1.05 %**, 34/34 | 15.29 % | **12.13 %**, 32/34 |
+| Moss | 2.08 % | **1.10 %**, 40/40 | 13.18 % | **11.73 %**, 40/40 |
+
+- **On error, Unica wins everywhere:** per token is below SageAttention 2 in 135 of 136 calls, fast below
+  SageAttention 3 in 131 of 136.
+- **On the time of a whole render, it does not.** On WAN, fast ties SageAttention 3 (44.5 vs 44.2 s), but the accurate
+  modes are 6–10 % slower than SageAttention 2 (per token 50.2 vs 45.6 s). This is not noise: the rounds agree within
+  ±1 s. Elsewhere it is level within a few tenths of a second. This contradicts the kernel benchmarks, and the cause is
+  not known yet. Candidates, to measure, not to assume:
+  - the quantization and torch launches around the kernel;
+  - cross-attention: the KJNodes patch sends it to SageAttention too, while Unica passes it to SDPA;
+  - SageAttention being cheaper on the short calls.
+- **Fast is the slower mode on short sequences.** `python -m unica` on [1, 16, 4096, 128]: fast 1.3–1.7 ms, per token
+  0.63 ms. On WAN's long calls it is the faster one. This is why it loses on Moss and Z-Image.
+- **Runs drift by 3–8 % between them.** The second WAN run was slower than the first in every mode, the untouched ones
+  too (off 66.2 → 68.2 s). Modes compare only within one run. The bench now writes the SM clock and the temperature
+  after each render.
+- **LTX's medians are not reliable.** Within one mode, renders spread from 35 to 53 s, and the first render after
+  loading took 81 s. LTX 22B and Gemma do not fit in 16 GB together, so weights move in and out between renders. Its
+  errors are clean.
+- **Moss is level everywhere, SageAttention included:** its calls are short, and attention is not what takes the time.
+
+## M4.27 — the package: one wheel for Windows and Linux, a compatibility check
+
+The idea: anyone with the card installs it with pip, nothing to build, and is told plainly when it will not run.
+
+- **One wheel, `py3-none-any`.** A cubin is the GPU's own machine code, the same file for the driver on Windows and on
+  Linux. The wheel ships the four cubins the node runs (`unica.PRESETS`):
+  - plain `flash.cubin`: per channel, fp4 and all the quantizers;
+  - `V_TOKEN=1`, `V_OUTLIERS=8`, `SMOOTH_Q=512`.
+
+  [build_wheel.py](build_wheel.py) compiles them fresh from `csrc/` and prints their sha256, so that WSL can check it
+  loads the very same bytes. An installed package has no `csrc/` and takes the shipped cubins. A setting outside them
+  says so, instead of looking for nvcc.
+- **The driver library loads on first use.** Until now `import unica` loaded `nvcuda.dll` straight away, so on a
+  machine without the driver the import failed, and the ComfyUI node with it.
+- **`unica.compatibility()`** has three answers:
+  - **cannot run:** compute capability other than 12.0 (sm_120a code is for 12.0 only), a driver for CUDA 12, no
+    driver, torch without CUDA;
+  - **untested:** another 12.0 card, a driver older than the tested one, torch other than 2.14, Linux (until WSL);
+  - **ok:** otherwise.
+
+  The package warns once on import. The nodes then:
+  - leave the model's own attention in place if it cannot run;
+  - log a warning if it is untested;
+  - send every later call to the model's own attention if a call to unica raises.
+- **`python -m unica`** prints the verdict and runs each preset against FP32 on random inputs. The thresholds catch a
+  broken kernel, not a worse one: on N(0, 1) the fast mode loses 19.26 %, because random data is FP4's worst case
+  (M4.2: P·V alone 13.7 %).
+- **Checked from a clean environment outside the repository, without nvcc on PATH:**
+  - with a CPU-only torch it says "cannot run" and fails nothing;
+  - with torch 2.14+cu132 the four presets give errors bit for bit the same as in the repository (1.58 / 1.67 / 1.66 /
+    19.26 %);
+  - an unshipped setting gives the error above.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other
