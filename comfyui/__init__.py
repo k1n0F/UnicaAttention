@@ -143,7 +143,11 @@ class Measurement:
         """Advances the call count and says whether this call is measured. With ComfyUI's transformer_options the count
         is step · blocks + block + 1 within one run: the step advances when sigma falls and restarts when it rises (a
         new run), so every run measures the same (step, block) pairs (M4.20 found the plain count running on across
-        runs). Without them (WanVideoWrapper), a plain count."""
+        runs). Without them (WanVideoWrapper), a plain count. Off (every 0), it does nothing: reading sigma is a
+        device-to-host copy, which waits for the GPU on every call and leaves it idle while Python queues the rest of
+        the block (M4.28: ~1 s per WAN step)."""
+        if self.every == 0:
+            return False
         block, sigmas = (options or {}).get("block_index"), (options or {}).get("sigmas")
         if sigmas is None:
             self.calls += 1

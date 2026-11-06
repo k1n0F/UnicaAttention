@@ -94,6 +94,7 @@ def test_measurement_count_runs_per_step_and_block():
     """The count is step · blocks + block + 1 within a run. Calls outside the numbered blocks (Lumina's context
     refiners: sigmas, no block_index) are not counted and do not break it (Z-Image, Moss crashed on them)."""
     m = comfyui.Measurement("test")
+    m.every = 1000  # counting runs only while measuring
     sigma = lambda s: {"sigmas": torch.tensor([s])}  # noqa: E731
     seen = []
     for s in (1.0, 0.5):  # two steps of a 3-block model, each preceded by a refiner call
@@ -109,6 +110,13 @@ def test_measurement_count_runs_per_step_and_block():
     ltx = comfyui.Measurement("test")
     ltx.every = 2
     assert [ltx.due(sigma(1.0)) for _ in range(4)] == [False, True, False, True]
+
+    # off, it reads nothing: a GPU sigma would cost a device-to-host wait on every call (M4.28)
+    class Untouchable:
+        def max(self):
+            raise AssertionError("sigma read while not measuring")
+    off = comfyui.Measurement("test")
+    assert not off.due({"sigmas": Untouchable(), "block_index": 0})
 
 
 if __name__ == "__main__":

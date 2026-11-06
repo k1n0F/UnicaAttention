@@ -2872,6 +2872,65 @@ The idea: anyone with the card installs it with pip, nothing to build, and is to
     19.26 %);
   - an unshipped setting gives the error above.
 
+## M4.28 — why WAN's renders were slower than SageAttention: a sync in the node
+
+M4.26 left the accurate modes 6–10 % behind SageAttention 2 on WAN, and fast level with SageAttention 3. The kernel
+benchmarks said otherwise.
+
+**Step 1: one WAN call by every path** ([bench/wan_call.py](bench/wan_call.py)). q, k, v are
+[1, 34020, 40 · 128] fp16, as ComfyUI's WAN passes them; cross-attention to 512 text tokens. A render has 160 calls of
+each kind. Hypotheses, written before measuring:
+
+| part | hypothesis | measured |
+|---|---|---|
+| fp16 → bf16 of q, k, v and back (WAN's activations are fp16, M4.17 assumed bf16) | 3.5 ms | 3.58 ms alone, ~2.5 ms inside the path |
+| per token's kernel against SageAttention 2 | +9 ms (M4.23: +16 %) | +13 ms (88 vs 75 ms) |
+| per channel against SageAttention 2 | 0 | +4.6 ms (79.6 vs 75 ms) |
+| cross-attention: SDPA against SageAttention 2 | +1 ms | +1.6 ms (3.5 vs 1.95 ms) |
+
+Also measured: fast against SageAttention 3 on self-attention is −5.8 ms (55.0 vs 60.8 ms). On cross-attention,
+SageAttention 3 is the slowest of the three (5.8 ms).
+
+Per render, this predicted per channel +1.0 s, per token +2.4 s and fast −1.3 s. The renders had +3.0, +4.6 and
++0.3 s. That leaves ~2 s in every Unica mode that one call alone does not show.
+
+**Step 2: ComfyUI's log, step by step.** Per sampling step (40 blocks), per channel took 10.05 s against SageAttention
+2's 8.96 s. The calls predicted +0.25 s. So in the running model, each Unica call cost 10–25 ms more than alone.
+
+**Step 3: the cause.** `Measurement.due()` ran on every self-attention call, with `measure_every` 0 too. It read
+`float(sigmas.max())`, and `sigmas` is on the GPU, so the read is a device-to-host copy. The CPU waits there until the
+GPU has done everything queued. The GPU then idles while Python queues the rest of the block: norms, linears, RoPE.
+One call alone cannot show it, since nothing is queued after it. The off and sage modes do not use the node, so they
+never paid it. Fix: off, `due()` returns at once and reads nothing; a test checks that sigma is not touched.
+
+This is host-side code. Neither the kernel nor its SASS changes, and Nsight Compute has nothing to show here: the cost
+is the GPU waiting between kernels, not inside one.
+
+**Step 4: WAN again, 3 rounds** (sage2, sage3, per_channel, per_token, fast), with hypotheses written before:
+
+| mode | render | step (high / low noise) | hypothesis | verdict |
+|---|---|---|---|---|
+| sage2 | 45.9 s | 9.34 / 9.37 s | — | — |
+| sage3 | 46.6 s | 9.31 / 9.23 s | — | — |
+| per_channel | 47.9 s | 9.94 / 9.84 s | within ~1 s of sage2 | no: +2.0 s, but half the gap is gone (+0.6 s per step, was +1.09) |
+| per_token | 49.4 s | 10.08 / 10.07 s | ~+2.4 s against sage2 | close: +3.5 s |
+| fast | **44.6 s** | **9.05 / 9.11 s** | ~−1.3 s against sage3 | yes, more: −2.0 s |
+
+The errors are the same as in M4.26.
+
+- **Fast is now the fastest mode on WAN**, ahead of both SageAttention 2 and 3, and below SageAttention 3's error in
+  22 of 22 calls.
+- **The accurate modes are still behind SageAttention 2.** Per channel: +0.6 s per step where the calls predict +0.25.
+  Per token: +0.7 against +0.58. What is left:
+  - the fp16 conversion (~0.1 s per step);
+  - per token's kernel;
+  - cross-attention through SDPA;
+  - ~0.35 s per step for per channel that is still unexplained.
+- **Runs drift within a run, too.** Every mode got faster from round 0 to round 2, by 0.3–0.5 s per step; SageAttention
+  2 went from 9.74 to 9.22. That is the size of the differences sought. The temperature stayed at 42–44 °C, so it is not
+  heat. The SM clock the bench wrote was read after the render, at idle, so it shows nothing. The bench now samples
+  the clock every 2 s while a render runs and writes their median.
+
 ## M2 — instruction budget, the input for M3
 
 **Instruction mix** (ncu, 4 heads): 537 M HMMA and 5.0 G warp instructions in all, **8.3 other

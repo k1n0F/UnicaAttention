@@ -93,11 +93,21 @@ def environment(comfyui_dir: str | None) -> dict:
             "python": system["python_version"].split()[0], "gpu": gpu, "driver": driver, "power_limit": power}
 
 
+SAMPLES: list[tuple[int, int]] = []  # (SM clock in MHz, temperature in °C), read while a render runs
+
+
+def sample_gpu() -> None:
+    reading = output("nvidia-smi", "--query-gpu=clocks.sm,temperature.gpu", "--format=csv,noheader,nounits")
+    if re.fullmatch(r"\d+, \d+", reading):
+        SAMPLES.append(tuple(map(int, reading.split(", "))))
+
+
 def gpu_state() -> dict:
-    """The SM clock and temperature right after a render: renders drift 3-8 % between runs (LOG M4.26)."""
-    clock, temperature = (output("nvidia-smi", "--query-gpu=clocks.sm,temperature.gpu", "--format=csv,noheader")
-                          .split(", ") + ["", ""])[:2]
-    return {"sm_clock": clock, "temperature": temperature}
+    """The median SM clock and the highest temperature while the last render ran, from the samples taken every
+    POLL_SECONDS: renders drift 3-8 % between runs (LOG M4.26). Read after a render, the clock is the idle one."""
+    clocks, temperatures = zip(*SAMPLES, strict=True) if SAMPLES else ((), ())
+    SAMPLES.clear()
+    return {"sm_clock": statistics.median(clocks) if clocks else "", "temperature": max(temperatures, default="")}
 
 
 def graph(model: str, mode: str, measure_every: int, tag: str) -> dict:
@@ -142,6 +152,7 @@ def render(model: str, mode: str, measure_every: int, tag: str) -> float | None:
             history = call(f"/history/{prompt_id}").get(prompt_id)
             if history and history["status"].get("completed") is not None:
                 break
+            sample_gpu()
             time.sleep(POLL_SECONDS)
     except urllib.error.HTTPError as error:
         print(f"  {tag}: rejected: {error.read().decode()[:2000]}")
@@ -186,6 +197,7 @@ def main() -> None:
     # no default here: argparse checks a list default against choices as one value and rejects it
     parser.add_argument("models", nargs="*", choices=list(MEASURE_EVERY))
     parser.add_argument("--rounds", type=int, default=ROUNDS)
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=MODES, help="a subset of MODES, in this order")
     parser.add_argument("--comfyui-dir", help="ComfyUI's checkout, to record its commit")
     args = parser.parse_args()
     args.models = args.models or list(MEASURE_EVERY)
@@ -218,9 +230,9 @@ def main() -> None:
             errors = measured_errors(measured_tag)
             for mode, values in errors.items():
                 record(model, mode, "measured", **values)
-            times = {mode: [] for mode in MODES}
+            times = {mode: [] for mode in args.modes}
             for round_ in range(args.rounds):
-                for mode in MODES if round_ % 2 == 0 else reversed(MODES):
+                for mode in args.modes if round_ % 2 == 0 else reversed(args.modes):
                     tag = f"{model}_{stamp}_r{round_}_{mode}"
                     try:
                         seconds = render(model, mode, 0, tag)
@@ -235,9 +247,9 @@ def main() -> None:
 
     print(f"\nmedian of {args.rounds} renders; error: median (max) rel L2 over the measured calls")
     for model, (times, errors) in summary.items():
-        off = statistics.median(times["off"]) if times["off"] else None
+        off = statistics.median(times["off"]) if times.get("off") else None
         print(model)
-        for mode in MODES:
+        for mode in args.modes:
             if not times[mode]:
                 print(f"  {mode:12} failed")
                 continue
