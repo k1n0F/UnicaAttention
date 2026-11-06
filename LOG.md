@@ -2978,3 +2978,59 @@ in WSL2 (Ubuntu 22.04, kernel 6.6) on this RTX 5080: the Windows driver 617.14 s
 
 `compatibility()` now counts Linux as tested. What WSL does not check is a native Linux driver: the first rented card
 will.
+
+## M4.30 — the quality test on "wan stable work": blur from the workflow, and a VRAM overflow that reset the driver
+
+The idea: compare the attention modes on a real quality workflow, not the bench's fast one. That workflow is "wan
+stable work" (WanVideoWrapper, three passes):
+- high noise at CFG 3.5 over sigmas 1 → 0.9;
+- a finishing pass with Lightning;
+- a hires pass at 1 MP from sigma 0.9;
+- Nomos ×2 and RIFE ×5 at the end.
+
+The run used the old prompt and negative, seed 42, and no LoRA on the high model: with it, loading crashes, filling RAM
+and VRAM. Each mode got one render.
+
+**Blur everywhere, the reference included.** Past the first frame, every mode's video is soft, with hatched hair and
+melting edges, SageAttention 2's (the workflow's own attention) as much as the others. So the blur comes from the
+workflow without its high-noise LoRA, not from the attention. The likely cause is 4 steps of the full high-noise model,
+too few to build sharp motion.
+
+**Relative to SageAttention 2**, on the hires pass before upscaling and interpolation (113 frames, 768 × 1360):
+
+| mode | PSNR mean (worst frame) | flicker | by eye |
+|---|---|---|---|
+| sageattn_3 | 24.80 dB (21.33) | 5.79 | the face melts, the hand doubles |
+| unica accurate | **28.62 dB (26.31)** | **4.16** | closest to the reference, the same blur |
+
+The fast render was stopped before its hires pass ended.
+
+**The hires pass is 118,320 tokens per call, and it overflowed the VRAM:**
+
+| render | hires pass | reserved VRAM peak |
+|---|---|---|
+| sageattn | 84 s per step | 13.5 GB |
+| sageattn_3 | 167–182 s per step | 14.4 GB |
+| unica accurate | ~245 s per step | 15.6 of 16 GB in use, 23 GB of shared memory |
+
+The GPU showed 99 % utilization at 100–180 W, far below what real compute draws under the 360 W limit. Windows does not
+fail on an overflow: it moves part of the memory to system RAM, read over PCIe.
+
+At 118 k tokens, one copy of q, k or v is 1.21 GB. Unica's path holds about 7.9 GB besides the model's own tensors:
+- q, k, v converted to bf16: 3.63 GB;
+- Q8, K8, V8: 1.8 GB;
+- the output in bf16, then in fp16: 2.4 GB.
+
+SageAttention 2 holds about 3 GB. To be measured: the peaks of both paths on this shape.
+
+**During the fast render the driver reset the GPU context** (System log, nvlddmkm ID 153, 04:08:34). The screen showed
+broken glyphs, then the taskbar kept a stale dark colour, and only a reboot cleared it. There was no other driver error
+in three days, apart from 03.11: a misaligned address, our own kernel bug during development, fixed then. The memory
+runs at its stock 15,001 MHz. Hypothesis: the overflow made single kernel launches take seconds over PCIe, and Windows
+reset the context.
+
+What follows:
+- no Unica hires runs until the memory is fixed;
+- reading fp16 directly in the quantizers and writing fp16 out of the kernel goes from an optimization to a necessity;
+- huge calls get split by heads, so that one launch stays well under a second;
+- the LoRA comes back with `merge_loras = false` in WanVideoWrapper: applied on the fly, with no merge at load.
