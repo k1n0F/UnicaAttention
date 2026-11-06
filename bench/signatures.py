@@ -4,7 +4,8 @@ ComfyUI's [batch, tokens, heads, 128]), one part per hypothesis of LOG.md M4.33.
 usage: uv run python bench/signatures.py mean          H1: K's mean, rope_stats against torch's k.mean
        uv run python bench/signatures.py speed         H2: whole call per mode and length, TOPS
        uv run python bench/signatures.py pieces [n]    H3: 118,320 (or n) tokens in pieces of 1 head against 10
-       uv run python bench/signatures.py ripple        H4: where fast's error sits along the tokens (WAN dumps)
+       uv run python bench/signatures.py ripple [set]  H4: where fast's error sits along the tokens (dumps: bench,
+                                                        stable, hires)
 """
 
 import statistics
@@ -24,7 +25,10 @@ LENGTHS = {"stable work, high / Lightning": 29928, "Rigsy bench": 34020, "stable
 HEADS, DIM = 40, 128
 MODES = ("per_channel", "per_token", "fast")
 PEAK = {"per_channel": 460e12, "per_token": 460e12, "fast": 935e12, "sage2": 460e12, "sage3": 935e12}
-ROW_TOKENS = 54  # the bench's 480 × 864: 30 × 54 tokens per frame
+# Dumps by signature: file pattern, tokens, tokens per row and per frame (latent / 8, patches of 2 × 2)
+DUMPS = {"bench": ("wan_call*.pt", 34020, 54, 1620),  # Rigsy bench, 480 × 864: 30 × 54 per frame (M4.22)
+         "stable": ("WanVideo_call*.pt", 29928, 43, 1032),  # stable work high / Lightning, 384 × 688: 24 × 43
+         "hires": ("WanVideo_call*.pt", 118320, 85, 4080)}  # stable work hires, 768 × 1360: 48 × 85 (M4.34)
 SMOOTH = 512
 
 
@@ -124,11 +128,15 @@ def pieces(tokens: int = LENGTHS["stable work, hires"]) -> None:
     unica.heads_per_call = original
 
 
-def ripple() -> None:
+def ripple(dumps: str = "bench") -> None:
+    pattern, tokens, row, frame = DUMPS[dumps]
+    print(f"{dumps}: {tokens} tokens, {row} per row, {frame} per frame")
     edges, middles, peaks = {m: [] for m in ("per_token", "fast")}, {m: [] for m in ("per_token", "fast")}, []
     profiles = {}
-    for path in sorted((REPO / "build" / "dumps").glob("wan_call*.pt")):
+    for path in sorted((REPO / "build" / "dumps").glob(pattern)):
         d = torch.load(path, map_location="cuda", weights_only=False)
+        if d["q"].shape[2] != tokens:
+            continue
         q, k, v = (d[x].bfloat16() for x in "qkv")
         ref = reference(q, k, v)
         per_query = {}
@@ -147,7 +155,7 @@ def ripple() -> None:
         spectrum = torch.fft.rfft(ratio - ratio.mean()).abs()
         frequencies = torch.fft.rfftfreq(ratio.shape[0], device=ratio.device)
         median = spectrum[1:].median()
-        for period in (ROW_TOKENS, SMOOTH, ROW_TOKENS * 30):
+        for period in (row, SMOOTH, frame):
             i = int(torch.argmin((frequencies - 1 / period).abs()))
             peaks.append((period, (spectrum[max(1, i - 2):i + 3].max() / median).item()))
         top = int(torch.argmax(spectrum[1:])) + 1
@@ -155,7 +163,7 @@ def ripple() -> None:
     for mode, values in edges.items():
         e, m = statistics.mean(values), statistics.mean(middles[mode])
         print(f"{mode:10} per-query error: block edges {100 * e:.3f} %, middles {100 * m:.3f} % (edges/middle {e / m:.3f})")
-    for period in (ROW_TOKENS, SMOOTH, ROW_TOKENS * 30):
+    for period in (row, SMOOTH, frame):
         values = [p[1] for p in peaks if p[0] == period]
         print(f"fast/accurate spectrum at period {period:5}: peak/median median {statistics.median(values):.2f}, "
               f"max {max(values):.2f}")
@@ -170,4 +178,4 @@ def ripple() -> None:
 
 
 if __name__ == "__main__":
-    {"mean": mean, "speed": speed, "pieces": pieces, "ripple": ripple}[sys.argv[1]](*map(int, sys.argv[2:]))
+    {"mean": mean, "speed": speed, "pieces": pieces, "ripple": ripple}[sys.argv[1]](*(int(a) if a.isdigit() else a for a in sys.argv[2:]))

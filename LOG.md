@@ -3264,3 +3264,53 @@ settle it at that length.
 Next, by these numbers:
 - accurate stays behind SageAttention 2 by 5–7 % (per channel) and 15–18 % (per token) per call;
 - fast at hires could merge its 1-head pieces into one grid (the wave tail, ~3 %) or pick pieces that fill whole waves.
+
+## M4.34 — real q, k, v from "wan stable work": the hires pass at 118,320 tokens
+
+The idea: H4 of M4.33 (fast's ripple) was checked only on the bench's 34 k dumps. One render of "wan stable work"
+(accurate per token, measure_every 13, 2 heads) saved the measured q, k, v. The guard stopped the hires pass after 95 s:
+shared memory +1.85 GiB, where M4.32's render without measuring stayed at +0. The likely cause is the measurement
+itself (FP32 reference, SageAttention 3 and the emulator on top of a full card). Saved: 30 calls at 29,928 tokens and 3
+at 118,320 (calls 403, 416, 429).
+
+Hypothesis, written before measuring: H4 holds at both lengths as at 34 k. The error of a 512-block's edges is within 5 %
+of its middle. The fast / accurate ratio has no peak at the row period (43 and 85 tokens; peak < 3× the median), and the
+frame (1032 and 4080 tokens) is the strongest period.
+
+**The measurement is what overflowed.** One measured call at 118,320 tokens, 40 heads, 2 of them measured, on an
+otherwise empty card: 2.47 GiB above the inputs, 31.7 s. On a full card during a render that is enough to spill to
+shared memory. Without measuring, M4.32's render stayed at +0. A hires run with every measurement would need a lighter
+measurement there, for example without SageAttention 3 and the emulator.
+
+**Errors on the real hires calls** (the node's CSV, rel L2 against FP32, median):
+
+| | 29,928 tokens (30 calls) | 118,320 tokens (3 calls) |
+|---|---|---|
+| Unica accurate per token | **0.694 %** | **0.834 %** |
+| Unica accurate per channel | 0.779 % | 0.953 % |
+| SageAttention 2 | 0.958 % | 1.233 % |
+| Unica fast (fp4_smooth512) | **6.744 %** | **7.461 %** |
+| SageAttention 3 | 7.095 % | 8.039 % |
+
+Per call at 118 k, Unica / SageAttention 2: 1.205 / 2.110, 0.834 / 1.233, 0.655 / 0.603 %. That last call is the only
+one in this render where SageAttention 2 is closer.
+
+**H4 held at both lengths** ([bench/signatures.py](bench/signatures.py) `ripple stable`, `ripple hires`):
+
+| | 29,928 | 118,320 |
+|---|---|---|
+| fast, 512-block edges / middles | 1.020 | 1.014 |
+| row period (43 / 85 tokens), peak / median, median (max) | 2.05 (3.03) | 2.26 (3.20) |
+| frame period (1032 / 4080 tokens) | 9.59 | 12.48 |
+| by position within 512 queries (eighths) | ±1.3 % | ±0.7 % (control 504: ±0.4 %) |
+
+The period-512 peaks (4.70 and 5.46) are the frame's harmonics at these lengths, not the blocks:
+- at 29,928, 1032 / 2 = 516 falls in the same frequency bin as 512;
+- at 118,320, 4080 / 8 = 510 is within one bin of it.
+
+The position profile, which harmonics do not touch, is flat to ±0.7 % at hires.
+
+Fast's per-query error is not larger at hires (6.1 % against 6.4 % at 34 k), and like there it follows the content of
+each frame. So the fine row ripple of M4.32's fast render does not come from any position pattern of the kernel's
+error. It is the size of FP4's error, carried through 10 denoising steps, as the drift of fast's render in the story
+(mouth, tilt) shows. Fast stays below SageAttention 3 at every length measured.
