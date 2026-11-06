@@ -235,7 +235,9 @@ def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str
         v_map = tensor_map_2d(v4, UINT8, V4_ROW_BYTES, v4.numel() // V4_ROW_BYTES, V4_ROW_BYTES, V4_ROW_BYTES, HEAD_DIM)
         return k_map, v_map, k4, v4, q4, qk_outer, v_outer, bias
     q8, q_scale = quantize_int8(q, None, Q_SCALE_BLOCK, rope)
-    k_mean = k.mean(-2, dtype=torch.float32) if rope is None else rope_stats(k, rope)[0]  # softmax cancels the mean
+    # softmax cancels the mean. rope_stats, not torch's k.mean: from ~32 k tokens k.mean sums in an order that depends
+    # on how many heads the tensor holds, so a call split into pieces was not bit for bit one call (M4.32, M4.33)
+    k_mean = rope_stats(k, rope)[0]
     k8, k_scale = quantize_int8(k, k_mean, K_SCALE_BLOCK, rope)
     if kernel == "attention_int8qk":
         return q8, k8, q_scale, k_scale, v

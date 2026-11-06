@@ -3178,3 +3178,89 @@ Open:
 - make accurate deterministic across pieces: K's mean from rope_stats, and the test at 32 k tokens;
 - SageAttention 2 rendered twice, to know what PSNR run-to-run noise alone gives;
 - fast's error on real QKV at 118 k tokens, and the ripples.
+
+## M4.33 — microbenchmarks on the workflows' call signatures
+
+The idea: no renders for now. Check the open questions of M4.32 with microbenchmarks on the call shapes the workflows
+make, write the hypotheses first, then measure. The signatures (self-attention, 40 heads, d = 128, fp16 in ComfyUI's
+[batch, tokens, heads, 128]):
+- 29,928 tokens: "wan stable work", high-noise and Lightning passes;
+- 34,020 tokens: the bench's Rigsy workflow (22 real q, k, v dumps exist, M4.22);
+- 118,320 tokens: "wan stable work", hires pass (no dumps: random data).
+
+Hypotheses, written before measuring:
+
+| | what | prediction |
+|---|---|---|
+| H1 | accurate's K mean from rope_stats (own kernel, fixed order) instead of torch's k.mean | bit for bit across pieces of 1, 4 and 12 heads at all three lengths; the mean pass costs within ±0.2 ms of k.mean at 34 k (both read K once, ~0.35 GB); error on the 22 WAN dumps changes by < 0.005 pp |
+| H2 | efficiency over length (whole call as the node runs it, % of today's peak: INT8 460, FP4 935) | fixed costs amortize: at 118 k accurate per token ≥ 57 % and fast ≥ 46 % (55 / 43 % at 34 k); 29,928 within 1 pp of 34,020 |
+| H3 | the split at 118 k: pieces of 1 head against 10 | ≤ +1 % for accurate, ≤ +2 % for fast (a few small launches per piece against ~25 ms of work per head) |
+| H4 | fast's ripple: is its error structured by the 512-query smoothing blocks or by the token rows (54 tokens per row at 34 k)? | no: on the WAN dumps the error of a block's first and last 16 queries is within 5 % of its middle, and the per-query error ratio fast / accurate has no spectral peak at period 54 or 512 (peak < 3× the median) |
+
+H3 missed (numbers below), so one more, written before measuring:
+
+| | what | prediction |
+|---|---|---|
+| H3b | the 1-head penalty is the tail of the last wave: a head at 118,320 tokens is 1849 blocks of 64 queries, 11 waves of 168 (84 SMs × 2) plus one block alone | at 118,272 tokens (1848 blocks, exactly 11 waves) pieces of 1 head cost ≤ +1 % against 10 |
+
+All in [bench/signatures.py](bench/signatures.py), one run per part, the GPU otherwise idle.
+
+**H1 held: accurate is now bit for bit the same however a call is split.** The accurate mode takes K's mean from
+rope_stats, the same pass fast already used. No kernel changed.
+
+| tokens (12 heads) | k.mean | rope_stats | pieces of 4 and 1 = one call, k.mean / rope_stats |
+|---|---|---|---|
+| 29,928 | 0.121 ms | 0.143 ms | no / **yes** |
+| 34,020 | 0.137 ms | 0.162 ms | no / **yes** |
+| 118,320 | 0.426 ms | 0.481 ms | no / **yes** |
+
+- About +0.08 ms per 40-head call at 34 k, within the predicted ±0.2 ms.
+- On the 22 WAN dumps the error is 0.8052 % either way (largest change 0.00002 pp).
+- tests/test_pieces.py now also splits a 34,020-token call of 4 heads into pieces of 1, for every preset. It fails
+  with the old k.mean and passes now.
+
+**H2 held, barely: longer calls are only 1–3 points more efficient.** The whole call as the node makes it, fp16 in
+[batch, tokens, heads, 128], random data, 3 alternating rounds:
+
+| path | 29,928 | 34,020 | 118,320 |
+|---|---|---|---|
+| per channel | 63.7 ms, 62.6 % | 84.2 ms, 61.2 % | 970 ms, 64.3 % |
+| per token | 70.5 ms, 56.5 % | 90.4 ms, 57.0 % | 1087 ms, 57.4 % |
+| fast | 45.2 ms, 43.4 % | 57.2 ms, 44.3 % | 659 ms, 46.6 % |
+| SageAttention 2 | 59.9 ms, 66.5 % | 78.4 ms, 65.7 % | 922 ms, 67.6 % |
+| SageAttention 3 | 45.4 ms, 43.2 % | 58.3 ms, 43.5 % | not run (27.9 GiB) |
+
+Percentages are of today's peaks: INT8 460 TOPS, FP4 935 TFLOPS (bench/peak.py).
+- Fast ties SageAttention 3 at 30 k and 34 k, and is 1.40× SageAttention 2 at 118 k.
+- Accurate per channel is 5–7 % behind SageAttention 2 here, and per token 15–18 %. The hires pass in M4.32 hid this
+  (259 vs 263 s) because attention is only part of each step.
+- At 29,928 per channel is 1.4 points from 34 k, not within 1.
+
+**H3 missed, H3b held for fast.** Pieces of 1 head against 10, 118,320 tokens:
+
+| tokens | blocks per head | per token | fast |
+|---|---|---|---|
+| 118,320 | 1849 = 11 × 168 + 1 | +2.7 %, then −2.7 % on a rerun | +5.0 %, +5.4 % |
+| 118,272 | 1848 = 11 × 168 | +0.6 % | +2.0 % |
+
+- For fast, about 3 of its 5 points are the last wave: one block running alone after 11 full waves, once per piece.
+  The other 2 points are its fixed cost per piece (Q's statistics, smooth_bias).
+- For per token the run-to-run spread (±3 %) is larger than the effect, so no conclusion.
+- In the M4.32 hires render 6519 of 6524 calls ran as 1-head pieces, so fast paid ~5 % there.
+
+**H4: no row structure, and the smoothing blocks leave only a faint mark.** Per-query error on the 22 WAN dumps at
+34,020 tokens:
+- Edges against middles of the 512-query blocks: fast 6.575 / 6.445 % (1.020), per token 0.997. Within the predicted 5 %.
+- The fast / accurate ratio by position within a block, in eighths: 1.016 1.000 0.996 0.992 0.993 0.994 0.999 1.011.
+  A shallow U, ±1.5 %, against ±0.3 % on a control period of 504. The ends of a block lie farther from its mean q̄,
+  since neighbouring tokens are alike.
+- Spectrum of the fast / accurate ratio (peak / median): period 54 (a row) 1.99, held; period 512 3.52, missed (that
+  U); period 1620 (a frame) 12.6, the strongest in 15 of 22 dumps.
+
+Fast's extra error follows the content: the same places of every frame. It does not follow rows or the kernel's
+blocks. So the fine row ripple seen in the M4.32 render is not a kernel pattern at 34 k. Hires dumps (118 k) would
+settle it at that length.
+
+Next, by these numbers:
+- accurate stays behind SageAttention 2 by 5–7 % (per channel) and 15–18 % (per token) per call;
+- fast at hires could merge its 1-head pieces into one grid (the wave tail, ~3 %) or pick pieces that fill whole waves.

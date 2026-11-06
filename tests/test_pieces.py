@@ -24,6 +24,17 @@ def test_pieces_are_one_call(qkv, preset, monkeypatch):
     assert half.dtype == torch.float16 and torch.equal(half, whole.half())
 
 
+@pytest.mark.parametrize("preset", list(unica.PRESETS))
+def test_pieces_are_one_call_at_a_wan_length(preset, monkeypatch):
+    """M4.33: at 700 tokens torch's k.mean happened to agree; from ~32 k it summed in an order set by the number of
+    heads, and pieces moved the output by 1 ulp. The bench's 34,020 tokens, 4 heads against pieces of 1."""
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 4, 34020, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    whole = unica.attention(q, k, v, **unica.PRESETS[preset])
+    monkeypatch.setattr(unica, "heads_per_call", lambda *args: 1)
+    assert torch.equal(unica.attention(q, k, v, **unica.PRESETS[preset]), whole)
+
+
 def test_pieces_keep_the_callers_layout(qkv, monkeypatch):
     monkeypatch.setattr(unica, "heads_per_call", lambda *args: 3)
     nhd = [x.transpose(1, 2).contiguous().half() for x in qkv]  # ComfyUI's [batch, tokens, heads, 128] in fp16
