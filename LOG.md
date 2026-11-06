@@ -3103,3 +3103,78 @@ Since small pieces cost next to nothing, the reserve is now the larger of 1 GiB 
 
 Next: fp16 read directly by the quantizers and written by the kernel, which removes the bf16 copies and the second
 output. The q̄ · k table for fast is computed inside the kernel instead (decision pending).
+
+## M4.32 — the free VRAM counted without torch's unused pool: the hires pass of "wan stable work" at SA2's speed
+
+The idea: rerun "wan stable work" with the M4.31 split, now with the high-noise Lightning LoRA back
+(`wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise`, Comfy-Org's repack, applied with `merge_loras = false`, strength 1;
+torch.compile off, inductor does not build with MSVC). Same prompt, negative and seed 42 as M4.30. Without merging,
+loading no longer fills the RAM and the VRAM.
+
+**The split did not hold in the real workflow.** SageAttention 2 went through: high 88 s, Lightning 30 s, hires
+(118,320 tokens) 263 s, about 66 s per step (84 in M4.30). Unica accurate was stopped by the guard on the hires pass:
+529 s and still running, with shared GPU memory +1.7 GiB in its first 20 s.
+
+Two hypotheses, written before measuring:
+- H1: the free VRAM is overestimated. free_vram counted what the driver has free plus what torch holds unused. Under
+  WDDM that pool need not be in the VRAM: with SageAttention 2, torch held 15.4 GiB while 11.8 GiB of the card was in
+  use. Prediction: 20+ heads per call on the hires pass, and a 6 GiB reserve brings it under 320 s.
+- H2: the system RAM is the limit (63.4 of 63.5 GiB with SageAttention 2), and the extra shared memory goes to the
+  pagefile. Prediction: page reads jump with Unica, and a larger reserve barely helps.
+
+A log of every sizing decision (`UNICA_LOG_VRAM=1`) on the hires pass:
+
+| run | reserve | heads per call | hires pass | shared growth |
+|---|---|---|---|---|
+| A, automatic | 1.6 GiB | 35 mostly (also 5, 37, 26, 14, 3) | stopped at 529 s | +1.7 GiB |
+| B | 6 GiB | 1 always | 260 s | 0 |
+
+- **H1 held.** At the end of the hires pass the driver had 0.00 GiB free, and the 35 heads came from torch's 7.5 GiB
+  of unused pool alone. The card was full (15.25 of 16 GiB dedicated), so part of that pool sat in system RAM. A call of
+  35 heads touches ~3 GiB of buffers, and WDDM evicted something else (model blocks) for them, on every call.
+- **H2 refuted.** Page reads were as high in B (93 k/s) as in A (129 k/s), and B ran at SageAttention 2's speed. That
+  paging is block swap's, not ours.
+- B was 1.0× SageAttention 2, better than the predicted 1.2×: one head at 118 k tokens is 85 MB of work, and the split
+  is next to free for the accurate mode (M4.31).
+
+**The fix:** free_vram is now what the driver reports free, and nothing else. When the card is full, a call gets one
+or a few heads.
+
+| mode | high | Lightning | hires | shared growth | heads per call at 118 k |
+|---|---|---|---|---|---|
+| SageAttention 2 | 88 s | 30 s | 263 s | +0.07 | — |
+| Unica accurate (per token) | 95 s | 31 s | **259 s** | 0 | 1 (6519×), 12 (4×), 4 (1×) |
+| Unica fast | 83 s | 29 s | **197 s** | 0 | 1 (6519×), 7 (6×), 5 (1×) |
+
+Predicted: accurate within 276 s (1.05× SageAttention 2), fast within 263 s. Both held, fast with 25 % to spare. No
+driver errors in any run.
+
+**Quality against SageAttention 2** (hires before upscaling, 113 frames of 768 × 1360):
+
+| mode | PSNR mean (worst frame) | flicker |
+|---|---|---|
+| Unica accurate | 25.69 dB (21.89) | 5.07 |
+| Unica accurate, reserve 6 GiB | 25.70 dB (21.90) | 5.06 |
+| Unica fast | 22.55 dB (20.31) | 6.19 |
+
+- With the LoRA, every mode is sharp: clean eyes, hair and collar, none of M4.30's smearing. M4.30's blur was the
+  missing LoRA.
+- Accurate matches SageAttention 2 by eye (the same smile and strands on frame 92).
+- Fast drifts in the story (mouth closed, another expression and tilt), and fine horizontal ripples show in the hair
+  and face that the others do not have. Its real error at 118 k tokens was never measured; M4.21 measured 34 k.
+
+**The two accurate renders are not bit for bit the same** (38.1 dB between them). They differ only in how the calls
+were split, and pieces were supposed to be bit for bit one call. A check on one 118 k call, 12 heads, in pieces of 12,
+4 and 1:
+- fast is bit for bit the same;
+- accurate differs by 1.2e-4 at most, 1 ulp.
+
+The cause is torch's `k.mean(-2)`, used by the accurate mode when RoPE is not fused. From ~32 k tokens its summation
+order depends on how many heads the tensor holds: 3e-9 apart at 32,760 and 118,320 tokens, equal at 700, the length
+tests/test_pieces.py used. A few int8 roundings of K move. Over 40 blocks and ten steps that 1 ulp grows to 38 dB.
+Fast takes its statistics from its own kernel (rope_stats), so it does not have this.
+
+Open:
+- make accurate deterministic across pieces: K's mean from rope_stats, and the test at 32 k tokens;
+- SageAttention 2 rendered twice, to know what PSNR run-to-run noise alone gives;
+- fast's error on real QKV at 118 k tokens, and the ripples.

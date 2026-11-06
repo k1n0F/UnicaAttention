@@ -56,6 +56,7 @@ LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
 # call sized to it filled the VRAM to the last megabyte. UNICA_VRAM_RESERVE_MB sets it at import; the nodes have an input.
 VRAM_RESERVE: int | None = (int(os.environ["UNICA_VRAM_RESERVE_MB"]) * 2**20
                              if "UNICA_VRAM_RESERVE_MB" in os.environ else None)
+LOG_VRAM = os.environ.get("UNICA_LOG_VRAM") == "1"  # print every sizing decision of heads_per_call
 # The settings the ComfyUI node runs, and so the only ones an installed package ships cubins for (build_wheel.py):
 # the accurate mode with each of its V scales (M4.23, M4.25) and the fast mode (M4.21). Others need the repository.
 PRESETS = {"per_token": dict(V_TOKEN=1), "per_channel": {}, "outliers": dict(V_OUTLIERS=8),
@@ -146,10 +147,12 @@ def attention(
 
 
 def free_vram(device: torch.device) -> int:
-    """Bytes a new allocation can take: what the driver has free, and what torch holds unused. Neither waits for the
-    GPU (M4.31 checked it: a sync here would idle the GPU on every call, as M4.28's did)."""
+    """Bytes of VRAM a call's temporary buffers can take: what the driver has free. Not what torch holds unused: under
+    WDDM part of that pool may already sit in system RAM (M4.32: driver 0 GiB free, torch 7.5 GiB unused, 35 heads
+    per call, every call paged over PCIe). Does not wait for the GPU (M4.31 checked it: a sync here would idle the GPU
+    on every call, as M4.28's did)."""
     free, _ = torch.cuda.mem_get_info(device)
-    return free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return free
 
 
 def vram_reserve(device: torch.device) -> int:
@@ -171,13 +174,21 @@ def heads_per_call(q: torch.Tensor, k: torch.Tensor, kernel: str, tile: dict) ->
     if kernel == "attention_fp4" and settings["SMOOTH_Q"]:
         padded_keys = math.ceil(n_keys / settings["KEYS_PER_TILE"]) * settings["KEYS_PER_TILE"]
         per_head += batch * math.ceil(n_queries / settings["SMOOTH_Q"]) * padded_keys * 4
-    return max(1, min(heads, (free_vram(q.device) - vram_reserve(q.device)) // per_head))
+    free = free_vram(q.device)
+    step = max(1, min(heads, (free - vram_reserve(q.device)) // per_head))
+    if LOG_VRAM:  # what the sizing saw, to check it against the real VRAM under WDDM (M4.32)
+        torch_unused = torch.cuda.memory_reserved(q.device) - torch.cuda.memory_allocated(q.device)
+        print(f"[unica vram] tokens {n_queries} heads {heads} {q.dtype} driver_free {free / 2**30:.2f} "
+              f"torch_unused {torch_unused / 2**30:.2f} reserve {vram_reserve(q.device) / 2**30:.2f} "
+              f"per_head {per_head / 2**30:.3f} GiB -> {step} heads per call", flush=True)
+    return step
 
 
 def in_pieces(q, k, v, kernel: str, rope, tile: dict) -> torch.Tensor:
     """attention() a few heads at a time, each piece converted to bfloat16 on its own, into one output in q's dtype
     and layout. Every head is computed alone anyway (its scales, its outliers), so the result is bit for bit the
-    same as in one call."""
+    same as in one call, with one exception (M4.32): from ~32k keys the accurate mode's torch k.mean sums in an order
+    that depends on the number of heads (~3e-9 apart), which moves a few int8 roundings and the output by 1 ulp."""
     out = torch.empty_like(q)
     step = heads_per_call(q, k, kernel, tile)  # after allocating out, so the free VRAM counts it
     for first in range(0, q.shape[1], step):
