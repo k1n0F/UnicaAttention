@@ -16,10 +16,11 @@ def test_the_tested_machine_is_ok():
 
 def test_untested_but_runs():
     for changes in ({"gpu": "NVIDIA GeForce RTX 5090"}, {"gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"},
-                    {"driver": 13020}, {"torch": "2.15.0+cu132"}, {"platform": "linux"}):
+                    {"driver": 13020}, {"torch": "2.15.0+cu132"}, {"platform": "freebsd"}):
         status = judge(**changes)
         assert status.status == UNTESTED and len(status.reasons) == 1, changes
-    assert len(judge(platform="linux", gpu="NVIDIA GeForce RTX 5060").reasons) == 2
+    assert len(judge(platform="freebsd", gpu="NVIDIA GeForce RTX 5060").reasons) == 2
+    assert judge(platform="linux").status == OK  # WSL2 on the RTX 5080 (LOG M4.29)
 
 
 def test_cannot_run():
@@ -29,4 +30,4 @@ def test_cannot_run():
         status = judge(**changes)
         assert status.status == UNSUPPORTED and status.reasons, changes
     # what cannot run is all that is said, not what is merely untested besides
-    assert judge(capability=(8, 9), platform="linux").reasons == judge(capability=(8, 9)).reasons
+    assert judge(capability=(8, 9), platform="freebsd").reasons == judge(capability=(8, 9)).reasons

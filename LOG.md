@@ -2949,3 +2949,32 @@ instructions per HMMA**; issue slots 24 % busy. Per warp and tile: 128 HMMA and 
 - Tensor ~61 ms and issue ~37 ms overlap only partly with 8 warps per SM: **expect 65–85 ms**, about
   SageAttention 2 (68–76 ms) with less error. Beating it needs fewer non-MMA instructions, not only
   faster MMA.
+
+## M4.29 — the wheel on Linux: WSL2 on the same card
+
+The decision: before PyPI and any rented card, the wheel has to work on Linux, since nearly every cloud runs it. Checked
+in WSL2 (Ubuntu 22.04, kernel 6.6) on this RTX 5080: the Windows driver 617.14 serves Linux through
+`/usr/lib/wsl/lib/libcuda.so.1`. Stage A only: uv, Python 3.12, torch 2.14.0+cu132 and the wheel from
+`build_wheel.py`. No CUDA toolkit, no nvcc, which is a user's machine.
+
+- **The same bytes.** The four shipped cubins have the sha256 that `build_wheel.py` printed on Windows.
+- **The same results.** `python -m unica` gives 1.58 / 1.67 / 1.66 / 19.26 %, bit for bit the Windows errors. Its one
+  remark was "untested: platform linux".
+- **The same speed.** Hypothesis before measuring: within ~2 % of Windows, the GPU and the driver being the same. The
+  kernel on WAN's shape [1, 40, 34020, 128] bf16, the same script, Windows and WSL alternating twice (median of
+  6 rounds × 5 runs):
+
+| preset | Windows | WSL |
+|---|---|---|
+| per_token | 91.4 / 93.5 ms | 91.5 / 92.2 ms |
+| per_channel | 81.9 / 82.8 ms | 82.2 / 82.9 ms |
+| outliers | 83.4 / 84.0 ms | 83.6 / 84.4 ms |
+| fast | 56.5 / 57.1 ms | 57.9 / 58.3 ms |
+| one small call (host cost) | 0.17 ms | 0.12–0.13 ms |
+
+  It held: within 1–2 %, and the host cost of a call is lower on Linux.
+- **PyTorch's SDPA is not the same.** On `python -m unica`'s shape it took 1.46 ms in WSL against 3.5 ms on Windows: the
+  Linux build has the flash backend. On a Linux machine, "off" in the ComfyUI bench is a stronger baseline than here.
+
+`compatibility()` now counts Linux as tested. What WSL does not check is a native Linux driver: the first rented card
+will.

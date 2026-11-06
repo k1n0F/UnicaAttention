@@ -19,7 +19,7 @@ MIN_DRIVER = 13000  # the cubins come from CUDA 13.2; a driver for CUDA 12 does 
 TESTED_GPU = "NVIDIA GeForce RTX 5080"
 TESTED_DRIVER = 13040  # 617.14
 TESTED_TORCH = "2.14"
-TESTED_PLATFORMS = {"win32"}  # Linux after the WSL run on the same card
+TESTED_PLATFORMS = {"win32", "linux"}  # Linux: WSL2 on the same card (LOG M4.29); a native Linux driver is not yet
 
 OK, UNTESTED, UNSUPPORTED = "ok", "untested", "unsupported"
 
