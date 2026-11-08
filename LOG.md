@@ -3508,3 +3508,174 @@ Against the prediction:
 Outside sampling the render spends ~345 s, not ~250 (M4.35 counted from the render's total). Ranked: RIFE 101–118,
 hires decode 81–89, VideoCombine 34–49 (25 s in the microbenchmark), text encoder 36 on the CPU, Nomos 18–21,
 VAE encodes 30–47, previews 12.
+
+## M4.37 — where RIFE loses 62–79 s inside ComfyUI
+
+The RIFE node took 101–118 s in the three renders of M4.36; the same loop took 39 s in M4.35's microbenchmark, which
+ran 13 frames and scaled the time per pair to 112 pairs.
+
+**What scales differently at 113 frames.** `_generic_frame_loop` preallocates its output with
+`torch.zeros(5 × 113, 3, 1536, 2720)` in float32: 28.3 GB, plus the node's 5.7 GB input (Nomos's frames, float32).
+At 13 frames that was 3.3 GB. In all three renders the system RAM peaked at 63.5 of 64 GiB, with ComfyUI's RSS at
+30–42 GiB before the node.
+
+**Hypotheses, before measuring:**
+- H1 (RAM): the 28.3 GB output does not fit next to ComfyUI's ~30 GB, so Windows pages. In a clean process the node
+  runs 113 frames in ≤ 45 s (the 13-frame scaling holds); with ~30 GB of ballast allocated first it takes ≥ 90 s,
+  and the page faults and the pagefile grow by tens of GB.
+- H2 (gc.collect, T5): the node calls gc.collect after every pair, 112 times; in ComfyUI's heap each call takes
+  0.2–0.5 s, so 20–55 s. It does not depend on RAM, so it shows only in the real process.
+H1 is checked here first (one process, with and without the ballast); if it does not explain the gap, a sampling
+profile of the real render follows.
+
+**H1, measured** (`bench/rife_ram.py`, the node's own loop, bicubic ×2 instead of Nomos, ComfyUI idle in the
+background holding its ~30 GB, 26 GiB free at the start):
+
+| frames | output | time | per pair | torch.zeros | gc.collect | free RAM | pagefile |
+|---|---|---|---|---|---|---|---|
+| 56 | 12.9 GiB | 22.1 s | 0.402 s | 0.6 s | 5.9 s, 55 calls | 21.2 → 8.2 GiB | 3.3 → 3.3 GiB |
+| 113 | 26.2 GiB | 53.7 s | 0.480 s | 6.8 s | 12.0 s, 112 calls | 16.2 → 0.0 GiB | 3.3 → 6.4 GiB |
+
+H1 held in kind, missed in size: at 113 frames the free RAM reaches 0, 3.1 GiB go to the pagefile, torch.zeros
+costs 11× more for 2× the size, and a pair is 19 % slower. But the node takes 54 s, not ≥ 90 s; the RAM explains
+~10 s of the 50–65 s gap. gc.collect is 0.107 s per call in this small process (12 s per node), so H2 needs the real
+process.
+
+The remaining ~50 s is inside ComfyUI's process. Main suspect now: the VRAM. aimdo keeps the WAN models staged in
+the VRAM after sampling; if RIFE's activations (1536 × 2720 per frame, 4 middle frames per pair) do not fit, WDDM
+places them in shared system memory and every pair runs over PCIe. The same mechanism would explain B's slow
+WanVideoEncode 1065 in M4.36 (the encoder staged in the VRAM).
+
+**Next: one render profiled per node** (the ComfyUI agent, config B of M4.36, so it also repeats the slow 1065):
+py-spy on ComfyUI's process during 1065, 981, 1049, 1051 and 984, plus the GPU sampled once per second (dedicated and
+shared memory, utilization, SM clock, power). Prediction, before the render:
+- H3 (VRAM): during RIFE the dedicated memory is ≥ 15 GiB and the shared memory grows by ≥ 1 GiB, the GPU
+  utilization stays < 60 %, and ≥ 60 % of the main thread's samples sit in the model's forward and in `.cpu()`
+  (waiting for the GPU); the same signature in 1065 (B) and not in A's 1065 timing;
+- H2: gc.collect takes 20–55 s of RIFE's samples (0.2–0.5 s per call);
+- 981 (hires decode, 81–89 s): compute-bound, utilization ≥ 90 %, no shared growth; if instead it shows H3's
+  signature, tiling (`enable_vae_tiling`) is the fix to test.
+
+**The profiled render** (ComfyUI agent, config B, suffix r4; 742.3 s; py-spy 0.4.3 `--rate 100 --threads`, without
+`--native` (the agent's retry built a wrong command line), no profile of 984; GPU sampled every ~1.3 s; files
+build/m437_*):
+
+| node | time | VRAM | util | SM clock | power | WDDM shared |
+|---|---|---|---|---|---|---|
+| 1065 WanVideoEncode | 14.9 s | 4.1 → 15.9 GiB | 91 % | 2891 MHz | 238 W | flat |
+| 981 WanVideoDecode, hires | 69.1 s | 15.6–15.9 GiB | 98 % | 2907 MHz | 133 W | +1.5 GiB over the base |
+| 1049 Nomos | 27.5 s | 4.3–6.7 GiB | 49 % | | 119 W | |
+| 1051 RIFE | 139.8 s | 4.1–7.2 GiB | 21 % | 2708 MHz | 77 W | flat |
+| 984 VideoCombine | 45.6 s | | 5 % | | 33 W | |
+
+RIFE's samples (all inside the node; the line in vfi_utils.py, ~seconds of the 140):
+
+| share | line | what |
+|---|---|---|
+| 55.6 % | 194 | `gc.collect()` after every pair: ~75 s, ~0.67 s per call |
+| 22.0 % | 175 | `.detach().cpu()` of each middle frame: waits for the GPU, then a pageable copy |
+| 7.9 % | 172 | `frame1.to(DEVICE)`: both frames uploaded again for each of the 4 middle frames |
+| 6.0 % | 147 | `torch.zeros` of the 28.3 GB output under RAM pressure |
+| 3.1 % | | the model's forward in Python |
+
+Against the prediction:
+- H3 (VRAM) for RIFE: refuted. 4–7 GiB of VRAM, shared flat, GPU at 21 % and 77 W. The node is host-bound.
+- H2 (gc.collect 20–55 s, 0.2–0.5 s per call): held in kind, larger: ~75 s, ~0.67 s per call, 6× the 0.107 s of a
+  small process. A full collection walks every tracked container in the process, and ComfyUI with its custom nodes
+  and caches has many more of them.
+- 1065 in B (+32 s in M4.36): not repeated, 14.9 s at 91 % utilization with the encoder on the GPU. M4.36's slow
+  1065 was a one-off; the "staged encoder" hypothesis has no support. The encoder on the GPU saves its ~33 s
+  (total 742.3 s against A's 764.6 and A2's 767.4).
+- 981 "compute-bound, no shared growth": half held. 98 % utilization and Python waits in `images.cpu()` (line 2152,
+  the sync after the queued decode), but only 133 W with the VRAM full and +1.5 GiB in shared memory: the GPU is busy
+  but starved, part of the decode likely runs over shared memory. 69 s here against 81–89 s in M4.36.
+
+**Decision:** an own node, RIFE VFI (Unica) in comfyui/rife.py: comfyui-frame-interpolation's IFNet, checkpoints and
+download, with the loop rebuilt. Each frame uploaded once, a pair's 4 middle frames in one batch, the output
+allocated without the zero fill and written in ComfyUI's [n, h, w, 3] layout (the original returns a permuted view of
+[n, 3, h, w]), no gc.collect per pair. The model gets the same positional arguments as in the original (fast_mode
+lands in IFNet's `training`). tests/test_rife.py checks the frame order against the original's with a stand-in model.
+
+**Hypothesis, before measuring** (it attacks host time: the GPU sat at 21 % in the original):
+- standalone (`bench/rife_ram.py`, same process, 113 frames, both loops in turn): the original 54 s, the new loop
+  ≤ 35 s: gc.collect −12 s, torch.zeros' fill −6 s, the re-uploads −4 s, the batch ~1.36× on the GPU part (M4.35);
+- the frames equal the original's to the rounding of batched convolutions: PSNR ≥ 90 dB, largest difference ≤ 1e-4;
+- in the render: the RIFE node 140 s → ≤ 50 s (gc.collect alone was ~75 s there);
+- VideoCombine (984) reads a contiguous [n, h, w, 3] instead of the permuted view: ≥ 5 s less of its 45.6 s.
+
+**Standalone result** (`bench/rife_ram.py … 113`, ComfyUI idle in the background, 26.7 GiB free at the start):
+
+| loop | time | per pair | torch.zeros | gc.collect | free RAM min | pagefile max |
+|---|---|---|---|---|---|---|
+| original | 53.6 s | 0.478 s | 6.1 s | 12.2 s, 112 calls | 0.1 GiB | 6.0 GiB |
+| RIFE VFI (Unica) | 28.7 s | 0.256 s | — | — | 7.4 GiB | 7.8 GiB |
+
+- ≤ 35 s: held, 1.87× faster in a small process (where gc.collect is cheap).
+- Accuracy on 13 frames: PSNR 98.1 dB against the original, the shapes equal; the largest difference is 3.3e-3,
+  above the predicted 1e-4 but below one 8-bit level (3.9e-3). The new output is contiguous, the original's is not.
+- This is host code: registers, SASS and ncu do not apply. The GPU side is unchanged except the batch of 4.
+
+**A/B in the render, profiled** (ComfyUI agent, after a restart; config B, both renders with the same prompt
+suffix r5, no cached nodes; py-spy `--native` on 1051 and 984):
+
+| | R1, RIFE VFI | R2, RIFE VFI (Unica) |
+|---|---|---|
+| total | 870.2 s | 765.6 s |
+| 1051 RIFE | 249.9 s (util 11 %, 49 W, VRAM 3.8–6.6 GiB) | 142.4 s (util 19 %, 68 W, VRAM 11.0–13.9 GiB) |
+| 984 VideoCombine | 104.2 s | 107.2 s |
+| 981 hires decode | 26.4 s | 33.8 s |
+
+Not a clean measurement: py-spy with `--native` fell behind ("results may be inaccurate") and inflated the
+profiled nodes: the original RIFE took 140 s and VideoCombine 46 s in M4.37 without `--native`. Under the same
+overhead the new node is 43 % faster; the predicted ≤ 50 s cannot be judged from this run.
+- R2's samples: 34 % in the copy of a batch to the output (it waits for the GPU and takes the page faults of
+  the first write into the fresh 28 GB: Windows zeroes pages on demand, so skipping torch.zeros moved that cost here
+  rather than removing it), 26 % launching ResConv's kernels from Python, 7 % uploads.
+- Frames: the hires videos (before Nomos and RIFE) are bit-identical in R1 and R2. The final videos differ at
+  PSNR 40.0 dB, and the input frames, which both nodes copy unchanged, differ just as much (39.9 dB): x264 at crf 19
+  reacts to sub-level differences in the neighbouring frames. The node's own output matched at 98.1 dB.
+- After the restart the hires decode 981 took 26–34 s against 69–89 s in M4.36–M4.37: its slowness depends on the
+  process's state, not on the graph.
+- 984 is not faster with the contiguous output (≥ 5 s predicted); judged again in the clean run.
+
+**Next: the same A/B without py-spy**, order reversed (R2 then R1), so that the times are clean.
+
+**What else holds the render back: theories T6–T12**, written while the clean A/B runs. Each has a number, to be
+checked. The render with the encoder on the GPU takes ~742–766 s: sampling ~400 s (hires 254–288, high 94–98,
+Lightning 31–36), the rest ~345 s.
+
+| | theory | prediction |
+|---|---|---|
+| T6 | VideoCombine (984, 34–49 s, GPU at 5 %) is numpy turning float32 into bytes one frame at a time on one thread (37 of 46 ms per frame in M4.35), plus page faults reading the 28 GB of frames from a full RAM | conversion in torch with 8 threads, or on the GPU before the copy back: 984 ≤ 15 s, −20…−35 s |
+| T7 | the hires pass pages: block swap streams the 14B model's blocks from a RAM that is full (Available 0.8–2.4 GiB, Pages Input/sec up to 44 k in M4.37; 93–129 k/s in M4.32). The spread of hires between renders (254–288 s) follows how full the RAM is (ComfyUI's RSS 29–48 GiB) | hires time grows with the page reads of its own pass; ~10 GiB more free RAM before hires (the encoder off the CPU already gave ~11 GiB) gives ≥ 15 s less |
+| T8 | attention is ~60 % of the hires pass (fast 197 s against accurate 259 s at a ~1.6× faster kernel gives ~160 s of attention), and per token's kernel is 15–18 % behind SageAttention 2 per call (57 % against 66–68 % of peak, M4.33) | per token at SageAttention 2's efficiency: −20…−25 s per hires pass; at per channel's (61–64 %): −10…−16 s |
+| T9 | the hires decode (981) spills to shared memory when the process is old: 26–34 s right after a restart, 69–89 s later, 133 W at 98 % utilization with +1.5 GiB shared in M4.37. The VRAM is held by models aimdo keeps staged and by torch's cache | freeing the VRAM before 981 (unload the sampler's model, empty the cache) keeps it ≤ 35 s in an old process: −35…−55 s; tiled decode as the fallback, its seams checked |
+| T10 | RIFE (Unica) is still host-bound (GPU at 19 % in R2): Python launching ~hundreds of small kernels per forward, and the page faults of writing 28 GB that Windows zeroes on first touch | fp16 autocast 1.65× (M4.35, PSNR 56 dB) or CUDA graphs ≥ 1.5×; the page faults ≥ 5 s of the node, removable only by a smaller output (not ComfyUI's IMAGE contract) |
+| T11 | Nomos (1049, 18–27 s) runs fp32 tiles of 512 with an overlap of 32 | whole frames in fp16: 6 s for 113 frames in M4.35 (PSNR 70.5 dB), so −12…−20 s |
+| T12 | the first render after a restart pays pinning and loading (RSS 47.8 GiB, shared +3.65 GiB in the high pass, total 870 s in R1 of M4.37b) | the first render ≥ 30 s slower than the next with the same graph; a warm-up render before any timing |
+
+Ranked by the expected gain: T9 (if the process is old), T6, T8, T7, T11, T10, T12. T6, T9 and T11 are workflow
+code, T8 is the kernel, T7 is memory.
+
+**The clean A/B** (ComfyUI agent, no profiler, no restart, R2 first then R1, the same prompt r5, no cached nodes;
+the hires videos of both are bit-identical, 113 of 113 frames):
+
+| node | R2, RIFE VFI (Unica) | R1, RIFE VFI | |
+|---|---|---|---|
+| 1051 RIFE | **40.7 s** (util 57 %, 151 W, VRAM ≤ 13.7 GiB) | 138.1 s (util 21 %, 76 W, VRAM ≤ 5.5 GiB) | **3.4×, −97.4 s** |
+| 984 VideoCombine | 50.3 s | 76.1 s | −25.8 s |
+| 981 hires decode | 31.0 s | 41.6 s | −10.6 s |
+| 1049 Nomos | 19.4 s | 21.0 s | |
+| 977 I2V encode | 30.7 s | 18.3 s | +12.4 s, a one-off |
+| total | **608.0 s** | 729.8 s | −121.8 s |
+
+Free RAM in the hires window: 2.0 GiB in R2, 0.86 GiB in R1.
+
+Against the prediction:
+- the RIFE node 140 s → ≤ 50 s: held, 40.7 s. The GPU went from 21 % to 57 % busy: the loop no longer stands between
+  the kernels.
+- VideoCombine ≥ 5 s less with the contiguous output: held in direction (−25.8 s), but the size is not RIFE's alone:
+  R1 ran with less free RAM, and VideoCombine on identical frames moved 46 → 76 s between earlier renders too. Not
+  credited to the node until measured on its own.
+- The render: −121.8 s, of which −97.4 s is the node itself. "wan stable work" went 765–767 s (M4.36 A, CPU encoder,
+  original RIFE) → 608 s (encoder on the GPU, RIFE VFI (Unica)).

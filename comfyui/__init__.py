@@ -18,6 +18,8 @@ measure_every > 0 also compares, on every n-th self-attention call, unica, SageA
 SageAttention 3 against FP32 attention on the first measure_heads heads of the real Q, K, V, and appends the
 errors to build/wan_attention_errors.csv in the UnicaAttention repository.
 
+RIFE VFI (Unica) (comfyui/rife.py) is comfyui-frame-interpolation's RIFE node with a faster loop (LOG M4.37).
+
 Install: a directory junction from ComfyUI/custom_nodes/UnicaAttention to this folder. unica's cubins must
 already be built (run the tests once): ComfyUI's shell has no nvcc.
 """
@@ -39,6 +41,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "bench"))
 
 import unica  # noqa: E402
+from .rife import UnicaRIFE  # noqa: E402
 from emulate import TODAY, emulate, errors, reference  # noqa: E402
 
 MODE = "unica"
@@ -459,6 +462,7 @@ class UnicaAttentionNative:
         return (patched,)
 
 
-NODE_CLASS_MAPPINGS = {"UnicaAttentionWanVideo": UnicaAttentionWanVideo, "UnicaAttentionNative": UnicaAttentionNative}
+NODE_CLASS_MAPPINGS = {"UnicaAttentionWanVideo": UnicaAttentionWanVideo, "UnicaAttentionNative": UnicaAttentionNative,
+                       "UnicaRIFE": UnicaRIFE}
 NODE_DISPLAY_NAME_MAPPINGS = {"UnicaAttentionWanVideo": "Unica Attention (WanVideo)",
-                              "UnicaAttentionNative": "Unica Attention (native)"}
+                              "UnicaAttentionNative": "Unica Attention (native)", "UnicaRIFE": "RIFE VFI (Unica)"}
