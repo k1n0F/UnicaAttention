@@ -28,6 +28,8 @@
 | **accurate** | INT8 Q·Kᵀ · u8 × s8 P·V | SageAttention 2 | below it in 135 of 136 real calls | level at 118 K tokens, 4–8 % slower on a 4-step WAN render |
 | **fast** | NVFP4 Q·Kᵀ and P·V, Q smoothed | SageAttention 3 | below it in 131 of 136 real calls | faster on long calls, slower on short ones; runs where SageAttention 3 runs out of VRAM |
 
+The kernel is not tied to WAN. It runs any self-attention with 128-dimensional heads, and the native ComfyUI node routes it for every model that uses ComfyUI's attention: video (WAN 2.2, LTX-2.3) and image (Qwen-Image-Edit, Z-Image, Moss) are measured below. WAN 2.2 is the main test because it is the heaviest one: 34 K tokens per call for a short clip and 118 K for a hires pass, where attention takes most of the time and a kernel's speed and error show the most.
+
 ## Results
 
 Everything is measured on one RTX 5080. Every step started with a written prediction, and the result is recorded even when the prediction failed: [LOG.md](LOG.md).
