@@ -1,0 +1,23 @@
+# Publishes the wheel attached to a GitHub release to PyPI (trusted publishing, no token).
+# The wheel is built and checked locally (build_wheel.py, then `python -m unica` from a clean venv): it holds the
+# compiled cubins, and the runner has no nvcc. Nothing is built here; the release's .whl goes to PyPI as it is.
+name: publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing
+      contents: read
+    steps:
+      - name: Download the release's wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${{ github.event.release.tag_name }}" --repo "${{ github.repository }}" --pattern "*.whl" --dir dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
