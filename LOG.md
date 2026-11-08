@@ -3412,3 +3412,99 @@ Every CPU benchmark from now on runs with these variables.
      PSNR 95 dB in fp32;
    - VideoCombine's float32 → bytes on the GPU (37 of its 46 ms per frame are numpy).
 4. Then the full cycle with the changes, against the same render without them, in the same session.
+
+## M4.36 — the text encoder of "wan stable work" (T1), microbenchmark
+
+**Evidence before measuring.** ComfyUI's log of the 2026-11-07 render: `Requested to load WanTEModel` at 01:16:52,
+`load device: cpu ... dtype: torch.float16`; the next node (WanVideoEncode, 9 s by its progress bar) ends at 01:17:36.
+So the text encoder took ~33 s of that render, on the CPU, for the prompt and the negative.
+
+**Hypothesis (T1, refined).** The cost is umt5-xxl's matmuls in fp16 on a CPU without fp16 arithmetic:
+- encoding both prompts at 8 threads, fp16: 25–35 s (the log's ~33 s minus the load from the disk);
+- bf16 at 8 threads: ≥ 2× faster than fp16 (Zen 5 has AVX-512 BF16, torch's fp16 CPU path converts);
+- 16 threads: ≤ 1.6× faster than 8;
+- on the GPU, fp16: < 1 s once the weights are there; the cost is the upload of 10.8 GB at ~25 GB/s, ~0.5 s pinned,
+  a few seconds pageable.
+
+**What ComfyUI actually computes on the CPU** (probe of `torch.nn.functional.linear`): all 168 Linear calls run in
+fp32 × fp32. `comfy.ops.Linear` keeps the weights in the file's dtype and casts each weight to fp32 on every call,
+since `should_use_fp16` is false for the CPU. The `dtype` model option does not reach the model: `wan.te(dtype_t5)`
+overrides it with the dtype detected in the file. Every prompt is padded to 512 tokens (`min_length=512`), so the two
+prompts are ~8.8 TFLOP of matmuls whatever their length.
+
+Where the 2026-11-07 render got `device: cpu`: the runner's API graph (`wan_stable_work_raw_api.json`) sets it on
+CLIPLoader. The workflow saved in the UI has `default`, which with aimdo means the GPU.
+
+**Result** (`bench/text_encoder.py`, ComfyUI's .venv-13, the four thread variables at 8; both prompts, 2 runs each):
+
+| path | time, s | rel L2 vs the render's path |
+|---|---|---|
+| CPU, fp16 weights (the render), 8 threads | 28.06, 27.98 | 0 |
+| CPU, fp16 weights, 16 threads | 18.68, 18.51 | 0 |
+| CPU, fp32 weights (no per-call cast), 8 threads | 26.05, 25.25 | 0 |
+| CPU, fp32 weights, 16 threads | 16.43, 15.73 | 0 |
+| GPU, fp16: first call (upload + setup), then | 8.94, 0.67 | 0.001 % |
+
+Against the hypothesis:
+- 25–35 s at 8 threads: held (28.0 s). 8.8 TFLOP in 28 s is 0.31 TFLOPS, ~12 % of the fp32 peak of 8 Zen 5 cores.
+- "bf16 ≥ 2× faster than fp16": the premise was wrong. There is no fp16 arithmetic to replace: ComfyUI computes in
+  fp32 on the CPU. The per-call cast costs 2.5–2.8 s (~10 %). bf16 arithmetic on the CPU would need a patch to
+  ComfyUI, so it was not measured.
+- 16 threads ≤ 1.6×: held (1.51×, 1.56× without the cast).
+- GPU < 1 s once loaded: held (0.67 s). The first call took 8.9 s, worse than "a few seconds" for the upload.
+
+So the text encoder costs ~28 s of a render whenever the prompt changes or ComfyUI restarted, and ~9 s on the GPU.
+
+**Next: three renders timed per node** (by the ComfyUI agent, fresh prompt each, `/free` before each): A = CLIPLoader
+`cpu`, B = `default` (GPU), A2 = `cpu` again, to separate the disk cache of the second render from B's gain.
+Prediction, written before the renders:
+- the CLIPTextEncode nodes: A and A2 28–33 s together, B 9–12 s, so B's render is 17–24 s shorter than A2's;
+- the encoder on the GPU must leave the VRAM before the 14B models load; if aimdo does not evict it cleanly, B shows
+  "loaded partially" or a larger shared-memory peak in the high pass, and that cost can eat the gain;
+- the per-node table checks T2–T5 with the numbers already written above (model loads 30–60 s, VAE 1065 + 981
+  40–80 s, preview decodes 965 + 972 10–20 s, RIFE's gc.collect ≥ 20 s inside the RIFE node's ~39 s + overhead).
+
+**The three renders** (ComfyUI agent, 2026-11-08, unica accurate, seed 42, prompt suffixes r1/r2/r3, `/free` before
+each; node time = its `executing` event to the next; no cached nodes; CSVs in build/m436_nodes_{A,B,A2}.csv):
+
+| node | | A (cpu) | B (GPU) | A2 (cpu) |
+|---|---|---|---|---|
+| 976 | WanVideoSampler, hires | 288.4 | 277.1 | 274.4 |
+| 1051 | RIFE VFI ×5 | 100.9 | 106.4 | 117.7 |
+| 934 | WanVideoSampler, high | 97.9 | 94.8 | 95.0 |
+| 981 | WanVideoDecode, hires | 80.8 | 88.6 | 83.6 |
+| 984 | VHS_VideoCombine | 49.2 | 34.1 | 47.6 |
+| 969 | WanVideoSampler, Lightning | 32.3 | 31.4 | 33.7 |
+| 948 + 947 + 946 | text encoder: load, prompt, negative | 36.0 | 3.9 | 38.4 |
+| 1049 | Nomos ×2 | 20.6 | 19.2 | 18.4 |
+| 977 | I2V encode (hires) | 15.9 | 16.1 | 15.0 |
+| 1065 | WanVideoEncode (before hires) | 14.3 | **47.4** | 15.6 |
+| 965 + 972 | preview decodes | 11.4 | 12.0 | 12.2 |
+| 1064, 937, others | | 13.1 | 15.7 | 12.6 |
+| | total | 764.6 | 749.3 | 767.4 |
+
+Peaks: VRAM 10.5 / 13.5 / 10.5 GiB, torch reserved 14.0 / 14.9 / 13.9, ComfyUI RSS 42.4 / 31.3 / 30.6 GiB.
+Run-to-run noise, from A against A2: up to ±17 s on one node (RIFE 101 vs 118, hires 288 vs 274), 3 s on the total.
+
+Against the prediction:
+- the text encoder on the CPU, 28–33 s: held (33.1 and 31.9 s for the two encode nodes; 36.0 / 38.4 with the
+  load). The disk cache does not help it (A2 ≈ A): it is compute.
+- on the GPU, 9–12 s: missed, in the good direction, 3.9 s. aimdo does not upload the 10.8 GB up front ("prepared
+  for dynamic VRAM loading. 10835MB Staged"); the weights stream in as the layers run.
+- B 17–24 s shorter than A2: the total is 18 s shorter, but not for the predicted reason. The encoder saves 34.5 s
+  and WanVideoEncode 1065 loses 31.8 s (29 frames at 1.86 s/it against 2.1–2.2 it/s in A and A2); the remaining
+  −15 s (VideoCombine −13.5, RIFE −11) is within the noise. With one B render, the net gain is ~0 ± 15 s.
+- the cost of the encoder on the GPU shows up where it was not predicted: no "loaded partially" line, no extra
+  shared memory in the high pass (B and A2 bases 21.2–21.6 GiB, +0.0–0.12), the WAN models load as in A. It lands in
+  WanVideoWrapper's own VAE encode, +3 GiB of VRAM peak. Hypothesis (unverified): the staged encoder stays in the
+  VRAM, and WanVideoWrapper's VAE allocates outside ComfyUI's model management, so nothing asks aimdo to evict it.
+- T2 (model loads 30–60 s): not visible as nodes; the loaders take < 0.6 s and block swap loads inside the samplers.
+  Not checked.
+- T3 (1065 + 981, 40–80 s): held above the range, 95 s in A. The hires decode 981 alone is 81–89 s.
+- T4 (965 + 972, 10–20 s): held, 11–12 s.
+- T5 (RIFE's overhead in ComfyUI ≥ 20 s): held, much larger. The node takes 101–118 s against 39 s in the
+  microbenchmark of the same loop (M4.35): 62–79 s go somewhere inside ComfyUI.
+
+Outside sampling the render spends ~345 s, not ~250 (M4.35 counted from the render's total). Ranked: RIFE 101–118,
+hires decode 81–89, VideoCombine 34–49 (25 s in the microbenchmark), text encoder 36 on the CPU, Nomos 18–21,
+VAE encodes 30–47, previews 12.
