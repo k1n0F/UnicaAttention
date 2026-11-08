@@ -32,11 +32,11 @@ The kernel is not tied to WAN. It runs any self-attention with 128-dimensional h
 
 ## Results
 
-Everything is measured on one RTX 5080. Every step started with a written prediction, and the result is recorded even when the prediction failed: [LOG.md](LOG.md).
+Everything is measured on one RTX 5080. Every step started with a written prediction, and the result is recorded even when the prediction failed: [LOG.md](https://github.com/k1n0F/UnicaAttention/blob/main/LOG.md).
 
 ### Five models in ComfyUI, real activations
 
-Error of self-attention against FP32 on the Q, K, V of real renders (median rel L2, and in how many measured calls it is below the rival). The graphs, seeds and models are in [bench/comfyui/](bench/comfyui/), so the run can be repeated (`bench/comfyui_models.py`).
+Error of self-attention against FP32 on the Q, K, V of real renders (median rel L2, and in how many measured calls it is below the rival). The graphs, seeds and models are in [bench/comfyui/](https://github.com/k1n0F/UnicaAttention/tree/main/bench/comfyui), so the run can be repeated (`bench/comfyui_models.py`).
 
 | Model | SageAttention 2 | **accurate** | SageAttention 3 | **fast** |
 |---|---|---|---|---|
@@ -156,15 +156,15 @@ tests/               against FP32, the emulator and each other, bit for bit wher
 
 ## Use
 
-You need an RTX 5080 or another sm_120 card, a driver for CUDA 13, and PyTorch with CUDA. The wheel ships the compiled kernels, so nvcc is not needed to run them; it works on Windows and on Linux (checked in WSL2 on the same card).
+You need an RTX 5080 or another sm_120 card, a driver for CUDA 13, and PyTorch with CUDA. The package ships the compiled kernels, so nvcc is not needed to run them; it works on Windows and on Linux (checked in WSL2 on the same card). The current release is a beta, so pip needs `--pre`.
 
 ```bash
-git clone https://github.com/k1n0F/UnicaAttention
-cd UnicaAttention
-uv run python build_wheel.py          # needs nvcc; or take the wheel from a release
-pip install dist/unica_attention-0.1.0-py3-none-any.whl
+pip install torch --index-url https://download.pytorch.org/whl/cu132   # first, or pip brings a CPU-only torch
+pip install --pre unica-attention
 python -m unica                       # is this machine supported? then each mode against FP32
 ```
+
+From source (needs nvcc, and MSVC on Windows): `uv run python build_wheel.py` compiles the kernels and builds the wheel into `dist/`.
 
 ```python
 import unica
@@ -199,4 +199,4 @@ Every result goes to [rigsy.dev/bench](https://rigsy.dev/bench), wins and losses
 
 ## License
 
-[MIT](LICENSE).
+[MIT](https://github.com/k1n0F/UnicaAttention/blob/main/LICENSE).

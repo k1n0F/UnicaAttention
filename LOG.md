@@ -3679,3 +3679,17 @@ Against the prediction:
   credited to the node until measured on its own.
 - The render: −121.8 s, of which −97.4 s is the node itself. "wan stable work" went 765–767 s (M4.36 A, CPU encoder,
   original RIFE) → 608 s (encoder on the GPU, RIFE VFI (Unica)).
+
+## M4.38 — 0.1.0b1 for PyPI
+
+Decision: the first upload to PyPI is a beta, `0.1.0b1`, so that pip installs it only with `--pre` and nobody takes
+it for a finished release.
+
+- pyproject: version 0.1.0b1, classifiers (Development Status :: 4 - Beta, NVIDIA CUDA :: 13, Windows, Linux; all
+  checked against trove-classifiers), links to the repository, LOG and rigsy.dev/bench.
+- README: links made absolute (PyPI renders the README without the repository around it); Use now starts from
+  `pip install --pre unica-attention`, with CUDA torch installed first, since pip would otherwise bring a CPU build.
+- The wheel only, no sdist: an sdist has no cubins and would need nvcc. The shipped cubins are newer than the last
+  change to csrc/ (2026-11-06), and the wheel holds no local paths.
+- Checked from a clean venv outside the repository, torch 2.14.0+cu132, nvcc off PATH: "tested on this machine",
+  the four presets at 1.58 / 1.67 / 1.66 / 19.26 %, bit for bit as in M4.27.

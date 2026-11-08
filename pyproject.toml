@@ -1,13 +1,29 @@
 [project]
 name = "unica-attention"
-version = "0.1.0"
+version = "0.1.0b1"
 description = "Attention kernel made for one GPU: RTX 5080 (sm_120)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
+keywords = ["attention", "cuda", "blackwell", "sm_120", "rtx-5080", "fp4", "int8", "comfyui", "wan"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 # the kernels need a CUDA build of torch; any version runs, 2.14 is the tested one (unica.compatibility() says so)
 dependencies = ["torch"]
+
+[project.urls]
+Repository = "https://github.com/k1n0F/UnicaAttention"
+Log = "https://github.com/k1n0F/UnicaAttention/blob/main/LOG.md"
+Benchmarks = "https://rigsy.dev/bench"
 
 [dependency-groups]
 bench = [
