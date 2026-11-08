@@ -3693,3 +3693,8 @@ it for a finished release.
   change to csrc/ (2026-11-06), and the wheel holds no local paths.
 - Checked from a clean venv outside the repository, torch 2.14.0+cu132, nvcc off PATH: "tested on this machine",
   the four presets at 1.58 / 1.67 / 1.66 / 19.26 %, bit for bit as in M4.27.
+
+**Published** 2026-11-08 by the GitHub release v0.1.0b1 (pre-release) through `.github/workflows/publish.yml`
+(trusted publishing, environment `pypi` with a required reviewer and only `v*` tags allowed). PyPI holds the very
+file checked above: 2 202 215 bytes, sha256 ca1a0919…a0d3f8. `pip install --pre unica-attention` into a clean venv
+with torch 2.14.0+cu132: "tested on this machine", the four presets at 1.58 / 1.67 / 1.66 / 19.26 %.
