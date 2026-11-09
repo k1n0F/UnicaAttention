@@ -46,6 +46,11 @@ constexpr int MMA_K = 16;
 #ifndef UNICA_V_TOKEN
 #define UNICA_V_TOKEN 0
 #endif
+// M4.41: with UNICA_V_TOKEN, 1 copies each tile's token scales into shared memory with V (one bulk copy on V's
+// mbarrier, a tile ahead); 0 reads them from L2 in the tile that uses them (M4.23).
+#ifndef UNICA_TOKEN_COPY
+#define UNICA_TOKEN_COPY 1
+#endif
 // M3.15: 0 sums the float P before rounding for the softmax denominator, in the u8 kernels.
 #ifndef UNICA_SUM_ROUNDED
 #define UNICA_SUM_ROUNDED 1
@@ -1012,14 +1017,16 @@ __device__ __forceinline__ void add_row_sum_u8(float row_sum[2], const uint32_t 
         row_sum[half] = row_sum[half] * alpha[half] + __uint2float_rn(sum[half]) * beta[half];
 }
 
-// M4.23: online_softmax_u8 with V scaled per token (quantize_v's v_token). tok[b]: this lane's two keys of block b,
-// {log2 s, log2 s, 1 / s, 1 / s} of keys 8b + col and + 1. A score becomes x = s · scale_log2 + log2 s_j, and
+// M4.23: online_softmax_u8 with V scaled per token (quantize_v's v_token). tok[STRIDE · b]: this lane's two keys of
+// block b, {log2 s, log2 s, 1 / s, 1 / s} of keys 8b + col and + 1 (STRIDE 1: registers; MMA_N / 2: a tile in shared
+// memory, M4.41). A score becomes x = s · scale_log2 + log2 s_j, and
 // 255 · 2^(x − tile max) is P' = p · s_j against the max of P' in the tile, so every key's V row keeps its own
 // 127 steps, outlier tokens or not. The denominator is Σ p = Σ P' / s_j, gathered here in float before rounding
 // (8-bit weights cannot span the s_j of outliers, ~250× apart in Z-Image); add_row_sum_u8 is not used.
+template <int STRIDE>
 __device__ __forceinline__ void online_softmax_u8_token(float scores[KEY_BLOCKS][4], float row_max[2], float row_sum[2],
                                                         float alpha[2], float beta[2], float scale_log2,
-                                                        const float4 tok[KEY_BLOCKS]) {
+                                                        const float4* tok) {
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
         float tile_max = -CUDART_INF_F;
@@ -1027,8 +1034,8 @@ __device__ __forceinline__ void online_softmax_u8_token(float scores[KEY_BLOCKS]
         for (int block = 0; block < KEY_BLOCKS; ++block) {
             float& x0 = scores[block][2 * half];
             float& x1 = scores[block][2 * half + 1];
-            x0 = fmaf(x0, scale_log2, tok[block].x);
-            x1 = fmaf(x1, scale_log2, tok[block].y);
+            x0 = fmaf(x0, scale_log2, tok[STRIDE * block].x);
+            x1 = fmaf(x1, scale_log2, tok[STRIDE * block].y);
             tile_max = fmaxf(tile_max, fmaxf(x0, x1));
         }
         tile_max = quad_max(tile_max);
@@ -1044,7 +1051,7 @@ __device__ __forceinline__ void online_softmax_u8_token(float scores[KEY_BLOCKS]
             float& p1 = scores[block][2 * half + 1];
             p0 = exp2_ftz(p0 + offset);
             p1 = exp2_ftz(p1 + offset);
-            tile_sum = fmaf(p0, tok[block].z, fmaf(p1, tok[block].w, tile_sum));
+            tile_sum = fmaf(p0, tok[STRIDE * block].z, fmaf(p1, tok[STRIDE * block].w, tile_sum));
         }
         row_sum[half] = row_sum[half] * alpha[half] + tile_sum * beta[half];
         row_max[half] = new_max;
@@ -1611,7 +1618,15 @@ __device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap& map, i
         : "memory");
 }
 
+// `bytes` (a multiple of 16) from global memory into shared memory (both 16-byte aligned), counted on `barrier`
+__device__ __forceinline__ void bulk_load(void* dst, const void* src, int bytes, uint64_t* barrier) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 ::"r"(smem_address(dst)), "l"(src), "r"(bytes), "r"(smem_address(barrier)) : "memory");
+}
+
 constexpr int K_TILE_BYTES = KEYS_PER_TILE * K8_STRIDE;  // a box of 144 bytes × KEYS_PER_TILE rows
+constexpr bool TOKEN_TILES = UNICA_V_TOKEN && UNICA_TOKEN_COPY;
+constexpr int TOK_TILE_BYTES = KEYS_PER_TILE / 2 * sizeof(float4);  // a tile's v_token, one float4 per pair of keys
 constexpr int V_TILE_BYTES = UNICA_V_PAIRS ? KEYS_PER_TILE / 2 * V8_STRIDE : KEYS_PER_TILE * K8_STRIDE;
 
 // M4.25: the part of P·V of a head's V_OUTLIERS keys with the largest max |v|, which quantize_v left out of V8 (zero
@@ -1683,6 +1698,8 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     __shared__ __align__(128) int8_t k_tiles[2][K_TILE_BYTES];
     __shared__ __align__(128) int8_t v_tiles[2][KEYS_PER_TILE * K8_STRIDE];
     __shared__ __align__(16) int8_t q_tiles[WARPS_PER_BLOCK][ROWS_PER_WARP * K8_STRIDE];
+    // M4.41: tok_tiles[b] holds the token scales of the tile whose V is in v_tiles[b] (one float4 when unused)
+    __shared__ __align__(16) float4 tok_tiles[2][TOKEN_TILES ? KEYS_PER_TILE / 2 : 1];
     // landed[p]: the copies issued in iterations t with t % 2 == p; landed[2]: those of the prologue
     __shared__ __align__(8) uint64_t landed[3];
 
@@ -1709,9 +1726,14 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     auto load_k = [&](int buffer, int tile, uint64_t* barrier) {
         tma_load_2d(k_tiles[buffer], k_map, 0, k_row0 + tile * KEYS_PER_TILE, barrier);
     };
+    // v_token's tiles lie in one piece per head, padded to whole tiles like V8: a tile is 512 contiguous bytes
+    const float4* tok_head = v_token + size_t(blockIdx.y) * v8_tokens(n_keys) / 2;
     auto load_v = [&](int buffer, int tile, uint64_t* barrier) {
         tma_load_2d(v_tiles[buffer], v_map, 0, v_row0 + tile * V_ROWS_PER_TILE, barrier);
+        if constexpr (TOKEN_TILES)
+            bulk_load(tok_tiles[buffer], tok_head + tile * (KEYS_PER_TILE / 2), TOK_TILE_BYTES, barrier);
     };
+    constexpr int V_BYTES = V_TILE_BYTES + (TOKEN_TILES ? TOK_TILE_BYTES : 0);  // what one load_v delivers
 
     if (threadIdx.x == 0) {
         for (int i = 0; i < 3; ++i) mbarrier_init(&landed[i], 1);
@@ -1719,7 +1741,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        mbarrier_expect_bytes(&landed[2], (n_tiles > 1 ? 2 : 1) * K_TILE_BYTES + V_TILE_BYTES);
+        mbarrier_expect_bytes(&landed[2], (n_tiles > 1 ? 2 : 1) * K_TILE_BYTES + V_BYTES);
         load_k(0, 0, &landed[2]);
         load_v(0, 0, &landed[2]);
         if (n_tiles > 1) load_k(1, 1, &landed[2]);
@@ -1749,7 +1771,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         if (threadIdx.x == 0 && t + 1 < n_tiles) {
             // ldmatrix read these buffers through the generic proxy; TMA writes them through the async one
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            mbarrier_expect_bytes(&landed[now], (t + 2 < n_tiles ? K_TILE_BYTES : 0) + V_TILE_BYTES);
+            mbarrier_expect_bytes(&landed[now], (t + 2 < n_tiles ? K_TILE_BYTES : 0) + V_BYTES);
             if (t + 2 < n_tiles) load_k(now, t + 2, &landed[now]);
             load_v(later, t + 1, &landed[now]);
         }
@@ -1757,15 +1779,18 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         TRACE_MARK(slot, lane, t, 0);
         float alpha[2], beta[2];
         [[maybe_unused]] float4 tok[KEY_BLOCKS];
-        if constexpr (UNICA_V_TOKEN) {  // from L2: every block of the head reads the same; issued before Q·Kᵀ(t + 1)
+        if constexpr (UNICA_V_TOKEN && !TOKEN_TILES) {  // from L2: every block of the head reads the same
             const float4* pairs = v_token + (size_t(blockIdx.y) * v8_tokens(n_keys) + key0 + col) / 2;
 #pragma unroll
             for (int block = 0; block < KEY_BLOCKS; ++block) tok[block] = __ldg(pairs + block * MMA_N / 2);
         }
         qk_scores_int8_q_smem(scores[later], q_tiles[warp], k_tiles[later], lane);  // stale in the last iteration
-        if constexpr (UNICA_V_TOKEN)
-            online_softmax_u8_token(scores[now], row_max, row_sum, alpha, beta,
-                                    q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], tok);
+        if constexpr (TOKEN_TILES)  // M4.41: landed with V(t), in this tile's buffer
+            online_softmax_u8_token<MMA_N / 2>(scores[now], row_max, row_sum, alpha, beta,
+                                               q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], &tok_tiles[now][lane % 4]);
+        else if constexpr (UNICA_V_TOKEN)
+            online_softmax_u8_token<1>(scores[now], row_max, row_sum, alpha, beta,
+                                       q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], tok);
         else
             online_softmax_u8(scores[now], row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
         TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
@@ -2000,12 +2025,6 @@ __device__ __forceinline__ void pv_fp4(float out[D_BLOCKS][4], float row_sum_acc
 #ifndef UNICA_BULK_COPY
 #define UNICA_BULK_COPY 1
 #endif
-
-// `bytes` (a multiple of 16) from global memory into shared memory (both 16-byte aligned), counted on `barrier`
-__device__ __forceinline__ void bulk_load(void* dst, const void* src, int bytes, uint64_t* barrier) {
-    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                 ::"r"(smem_address(dst)), "l"(src), "r"(bytes), "r"(smem_address(barrier)) : "memory");
-}
 
 // M4.8: attention_int8pv_tma with P·V in NVFP4. Q·Kᵀ, its pipelining and the K tiles are unchanged. v_map: V4
 // (quantize_v4) as rows of V4_ROW_BYTES, box V4_ROW_BYTES × HEAD_DIM: one tile. v_outer: the float scale per

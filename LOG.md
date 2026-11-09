@@ -3806,3 +3806,161 @@ drive and the CUDA toolkit's folder, but no user folder.
 file checked above (sha256 9d3f2f2c…c4548d). For a few minutes the simple index behind PyPI's CDN still listed only b1,
 and pip could not find b2. `pip install --pre unica-attention==0.1.0b2` into a clean venv: SMALL_CALL_FRACTION present,
 "tested on this machine", the four presets at 1.58 / 1.67 / 1.66 / 19.26 %.
+
+## M4.40 — the hires decode: why it is slow in an old process (T9)
+
+The hires decode 981 (WanVideoDecode, 113 frames of 768 × 1360, untiled) has taken two very different times:
+
+| renders | 981 |
+|---|---|
+| M4.36 A, B, A2 (an old process, `/free` before each) | 80.8, 88.6, 83.6 s |
+| M4.37 r4 (profiled) | 69.1 s, VRAM 15.6–15.9 GiB, +1.5 GiB shared, 98 % busy at 133 W |
+| M4.37b right after a restart, then the clean A/B | 26.4, 33.8, then 31.0, 41.6 s |
+
+T9 said: the VRAM is held by staged models and torch's cache, the decode spills to shared memory, and freeing the
+VRAM before 981 fixes it. Before anything is changed, the workflow and WanVideoWrapper's code weaken that:
+- WanVideoDecode already calls `soft_empty_cache()` before and after the decode, so torch's cache is not it;
+- the hires sampler 976 has `force_offload` on and block swap keeps all 40 blocks in the RAM, so the 14B model
+  leaves the GPU after sampling;
+- M4.36's renders peaked at 10.5 GiB of VRAM for the whole render, and 981 still took 81–89 s.
+
+So a purge before 981 (the workflow already has two PurgeVRAM nodes, both after it) may do nothing. The mechanism is
+checked first, apart from ComfyUI: [bench/hires_decode.py](bench/hires_decode.py) decodes the hires latent's shape
+([1, 16, 29, 96, 170], random values: a convolution's time does not depend on them) with WanVideoWrapper's own VAE
+code, while a ballast tensor takes a set amount of the VRAM. Windows' sysmem fallback lets an allocation go past the
+VRAM into shared memory instead of failing, which is the suspected mechanism. ComfyUI leaves `cudnn.benchmark` off
+unless `--fast autotune`; the bench imports ComfyUI's model management, so it runs the same way.
+
+Hypotheses, written before measuring:
+- H1: in a fresh process, without ballast, the decode takes 26–34 s, as right after a restart; torch's peak is
+  8–12 GiB.
+- H2 (T9's mechanism): the time stays flat while the ballast plus the peak fit in the free VRAM, and rises ≥ 2×
+  (≥ 60 s, as in M4.36–M4.37) once ~1.5 GiB of it lands in shared memory.
+- H3, the alternative: if the time rises before anything overflows, the spill is not the cause, and cuDNN choosing
+  algorithms with a smaller workspace when free VRAM is short becomes the suspect (checked then by the kernel names
+  under ncu, fast against slow).
+- H4: tiled (the node's defaults, 272 / 144 px) peaks at ≤ 4 GiB, stays flat across the ballasts, and costs ≤ 1.3×
+  the untiled time without ballast.
+
+**Result** (bench/hires_decode.py, ComfyUI idle, the desktop holding ~2 GiB: 14.57 GiB free at the start):
+
+| decode | peak | over the free VRAM | time |
+|---|---|---|---|
+| whole | 15.15 GiB | 0.58 GiB | 102.7 s (98.7, 97.3 with the real latent) |
+| whole, ballast 4 GiB | 15.15 | 4.58 | 549.6 s |
+| whole, ballast 6 GiB | 15.15 | 6.58 | 699.1 s |
+| tiled 272 / 144, ballast 0, 6, 10 GiB | 1.45 | 0 | 70.4, 70.0, 68.5 s |
+
+During the spilled whole decode the GPU showed 99 % busy at 71 W and 32 °C; the tiled one ran at 232 W. That is the
+machine-level picture of 981 in M4.37 (98 % at 133 W): the SMs are scheduled but wait on PCIe for the activations that
+live in shared memory. The larger runs (8–12 GiB of ballast) were stopped: the time only grows, ~100 s per GiB over.
+
+- H1 missed: the whole decode is not 26–34 s in a fresh process, and its peak is not 8–12 GiB. It needs 15.15 GiB
+  by itself, so on a 16 GiB card with a desktop it overflows even with nothing else loaded.
+- H2 held, much steeper than written: 0.58 GiB over already costs ~3× (98–103 s against ~29 s that fit), and the
+  time keeps growing with the overflow. The fast renders after a restart (26–34 s) were the ones where it happened
+  to fit. "An old process" was a proxy: what counts is how much of the VRAM everything else holds at that minute,
+  the desktop included. Freeing before 981 cannot fix it: WanVideoDecode already empties torch's cache, the model is
+  already off, and the decode alone does not fit.
+- H3: nothing to separate. The slow runs all overflowed; the tiled ones never did and stayed flat.
+- H4 half held: the peak 1.45 GiB and flat across the ballasts, but 68–70 s, 2.3× a decode that fits, not ≤ 1.3×.
+  The default tiles (34 × 34 latent, stride 18 × 16) compute 3.2× the frame's area in their overlaps.
+
+**Quality of the tilings**, on a real latent: m437c R2's hires video (113 portrait frames, 1360 high, 768 wide)
+encoded by the same VAE, then decoded whole (the reference) and tiled. The whole-video PSNR, and the worst 16-pixel
+band of columns and of rows, where a seam would gather (rounding to 8 bits alone is ~59 dB):
+
+| tiling (tile / stride, px) | peak | time | PSNR | worst column / row band |
+|---|---|---|---|---|
+| 272 / 144 (the node's default) | 1.44 GiB | 64.5 s | 50.6 dB | 47.8 / 46.1 dB |
+| 512 / 256 | 4.01 | 50.9 | 53.2 | 51.5 / 50.0 |
+| three tiles, frame-wide, 512 high, 88 px overlap | 7.67 | 32.0 | 54.8 | 49.7 / 50.8 |
+| two tiles, frame-wide, 768 high, 16 px overlap | 11.30 | 29.1 | 57.0 | 54.8 / 53.5 |
+| two tiles, 176 px overlap | 11.30 | 28.7 | 57.0 | 54.8 / 53.5 |
+
+- The default's error shows a faint grid of seams at 8× brightness (build/m440_diff8_272_144.png); two tiles show
+  only the contours, no seam (m440_diff8_two_tiles.png). The memory that tiling spoils the picture is the small
+  default tiles.
+- The overlap of the two tiles does not change the result: their worst bands are not at the seam.
+- WanVideoWrapper's tiled decode adds up the tiles in `values` and `weight` of the latent's dtype (bf16 here) and
+  divides in bf16; with 45 overlapping tiles that rounding is a likely part of the default's error. Not measured
+  apart.
+- Two frame-wide tiles take as long as a whole decode that fits (~29 s) at 3.85 GiB less: the margin under the 14.6
+  GiB a desktop leaves is 3.3 GiB instead of −0.6.
+
+## M4.41 — per token behind per channel: the token scales waited on L2
+
+**Not ping-pong.** The first idea for the kernel was FlashAttention 3's ping-pong: keep the two warps of a scheduler
+out of phase, so that one runs its softmax while the other issues mma. M3's timeline already measured what it fixes
+(H1, bunching): the time with no warp in an MMA phase was 0.078 against 0.125 for independent warps, so the warps
+already interleave better than chance. What holds the tensor pipe at ~64 % is the instruction mix: every non-MMA
+instruction of the scheduler costs tensor time (`peak_u8s8_mixed`: 8 FFMA per IMMA −19 %, unchanged with 4 warps per
+scheduler). On Hopper `wgmma` runs asynchronously once issued; `mma.sync` takes the issue port per instruction, so
+reordering the warps does not lower the count. Expected 0…−5 % for a rebuild to 8 warps per block (W8 was slower in
+M3). Not done. The lever by that model is fewer instructions per tile, and the largest gap is T8: per token behind
+per channel.
+
+**Measured** (compare.py, one process, 6 alternating rounds, 40 × 34,020): kernel 82.7 ms per channel, 93.1 ms per
+token, **+12.6 %** (M4.33: +12 %).
+
+Hypotheses, written before ncu:
+- H1: per token 10–14 % slower than per channel in one process. **Held**, +12.6 %.
+- H2: the extra cycles are stalls, mostly long scoreboard (the token scales' LDG): ≥ half of the added stall cycles.
+  **Held**, 71 %.
+- H2b: if wait and math pipe grow instead, it is the schedule. Not so.
+
+SASS of the loop (4 tiles in its body, per tile): per channel 578 instructions, per token 641 (+63): FADD +24, FFMA
++24, LDG +6, IDP −6, 0.5 LDL. Registers 235 and **255**, stack 8 and 24 bytes (12 bytes spilled). By the M3.9 model
+(~1 cycle per non-MMA instruction) +63 instructions are +2.2 % of a ~2808-cycle tile: **the model explains a fifth of
+the gap.** ncu (4 heads × 34,020) shows why: cycles +14.3 %, instructions +15.7 %, but cycles per issued instruction
+the same (5.72 / 5.65), and the stall cycles (per-issue ratio × instructions):
+
+| stall | per channel | per token | |
+|---|---|---|---|
+| long scoreboard | 0.19 | 1.44 | **+1.25** |
+| selected (issuing) | 2.12 | 2.45 | +0.33 |
+| wait | 3.07 | 3.35 | +0.28 |
+| mio throttle | 0.34 | 0.59 | +0.25 |
+| barrier | 1.21 | 0.81 | −0.40 |
+| all | 12.08 | 13.85 | +1.77 (+14.7 %) |
+
+Per instruction (ncu SourceCounters) the long-scoreboard samples of per token sit on: the FFMA that use the token
+scales (41 %), their `LDG.E.128.CONSTANT` 38–46 instructions earlier; the FMUL that uses `k_scale` of the tile
+(14.5 %), its LDG 26 instructions earlier; two IMMA (29 %) without a load as producer. The comment said "issued before
+Q·Kᵀ(t + 1)", but a tile's token scales are 8 float4, 32 registers per thread, and at the 255-register cap ptxas moved
+the loads next to their use: ~40 instructions at ~5.7 cycles each is ~230 cycles, less than L2's latency.
+
+**Change** (`UNICA_TOKEN_COPY`, default 1; 0 is M4.23): a tile's token scales are 512 contiguous bytes in v_token
+(padded to whole tiles like V8). Thread 0 copies them into shared memory with `cp.async.bulk`, on V's mbarrier, in the
+same step as V(t + 1); the softmax reads them with LDS from the buffer of the tile. The values and the arithmetic are
+the same.
+
+Hypotheses, written before measuring:
+- output bit for bit as TOKEN_COPY=0;
+- per token 93 → 85–88 ms (−5…−9 %), long scoreboard down to per channel's level, ≤ 240 registers, no LDL;
+- risk: in M4.21 each extra bulk copy of fast cost ~2 ms; here it rides on V's existing copy.
+
+**Result:**
+
+| | TOKEN_COPY=0 | TOKEN_COPY=1 | predicted |
+|---|---|---|---|
+| output | | bit for bit, 6 lengths (40 … 34,020, partial tiles, an outlier token) | held |
+| kernel, 40 × 34,020 | 91.7 ms | **89.5 ms (−2.4 %)**; a second run 91.5 against per channel's ~81.5 | 85–88 ms: **missed** |
+| registers, spills | 255, 12 / 16 bytes | 255, **0** | ≤ 240: missed; no LDL: held |
+| shared memory per block | 46,104 bytes | 47,128 (2 blocks per SM still fit) | |
+| loop SASS per tile | | 6 LDG.128 → 6 LDS.128, +8.5 to issue the copy | |
+| active cycles (ncu) | 20.89 M | 20.13 M (−3.6 %) | |
+| long scoreboard | 1.44 | **0.20** | held |
+| barrier | 0.81 | **1.41** | |
+
+- The wait for L2 is gone, but most of it came back at the tile's `__syncthreads`: the warps reach the barrier at
+  different times and wait for the slowest. As in M3.19, removing one stall shows the next.
+- What is left of the gap (per channel 81.5 against ~89.5–91.5 ms) is per token's arithmetic: +15 % instructions,
+  an FFMA and an FADD per key for log₂ s and the denominator weighted by 1 / s. The data no longer waits.
+- Per channel's SASS of `attention_int8pv_tma` is identical to the shipped cubin's. The 56 tests pass.
+
+**Trial: 1 / s from log₂ s** (`exp2(−log₂ s)` on the SFU instead of reading it; it was meant to free 16 registers,
+which the copy already made moot). Hypothesis: 0…+2 % slower, rel L2 the same to 0.01 %. Measured +0.9 % (92.3
+against 91.5 ms, inside that run's 6 % spread), rel L2 1.58 % in both: held, no gain. Not kept.
+
+The shipped per-token cubin (unica/cubins) is from before this change; the next wheel rebuilds it.
