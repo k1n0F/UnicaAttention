@@ -3801,3 +3801,8 @@ was built fresh by build_wheel.py, the four cubins as before. It was checked fro
 with torch 2.14.0+cu132 and nvcc off PATH: "tested on this machine", the four presets at 1.58 / 1.67 / 1.66 / 19.26 %,
 the same as b1. 2 202 803 bytes, sha256 9d3f2f2c…c4548d. The cubins' line info names the source folder on the build
 drive and the CUDA toolkit's folder, but no user folder.
+
+**Published** 2026-11-09 by the GitHub release v0.1.0b2 (pre-release) through the same workflow. PyPI holds the very
+file checked above (sha256 9d3f2f2c…c4548d). For a few minutes the simple index behind PyPI's CDN still listed only b1,
+and pip could not find b2. `pip install --pre unica-attention==0.1.0b2` into a clean venv: SMALL_CALL_FRACTION present,
+"tested on this machine", the four presets at 1.58 / 1.67 / 1.66 / 19.26 %.
