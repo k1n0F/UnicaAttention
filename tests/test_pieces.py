@@ -43,15 +43,28 @@ def test_pieces_keep_the_callers_layout(qkv, monkeypatch):
     assert torch.equal(out, unica.attention(*qkv).half())
 
 
-def test_heads_per_call_follows_the_free_vram(qkv, monkeypatch):
-    q, k, _ = qkv
-    per_head = 1 * 128 * 3 * SHAPE[2] * 2  # bf16 input: 2 bytes per element of q, k, v
-    monkeypatch.setattr(unica, "VRAM_RESERVE", 512 * 2**20)
-    monkeypatch.setattr(unica, "free_vram", lambda device: unica.VRAM_RESERVE + 5 * per_head)
+PER_HEAD = 1 * 128 * 3 * SHAPE[2] * 2  # bf16 input: 2 bytes per element of q, k, v
+
+
+def test_heads_per_call_follows_the_free_vram(monkeypatch):
+    q = k = torch.empty(SHAPE, dtype=torch.bfloat16)  # only shape and dtype are read: no GPU needed
+    monkeypatch.setattr(unica, "VRAM_RESERVE", 16 * PER_HEAD)  # 8 heads are half of it: not a small call
+    monkeypatch.setattr(unica, "free_vram", lambda device: unica.VRAM_RESERVE + 5 * PER_HEAD)
     assert unica.heads_per_call(q, k, unica.DEFAULT_KERNEL, {}) == 5
     assert unica.heads_per_call(q.half(), k.half(), unica.DEFAULT_KERNEL, {}) == 2  # fp16 needs its bf16 copies too
     monkeypatch.setattr(unica, "free_vram", lambda device: 0)
     assert unica.heads_per_call(q, k, unica.DEFAULT_KERNEL, {}) == 1  # never below one head
+
+
+def test_a_small_call_runs_whole_inside_the_reserve(monkeypatch):
+    """M4.39: 8 heads, 4.3 MB of buffers, against a 512 MB reserve: whole even with the free VRAM below the reserve, in
+    pieces only when the buffers do not fit in what is free at all."""
+    q = k = torch.empty(SHAPE, dtype=torch.bfloat16)
+    monkeypatch.setattr(unica, "VRAM_RESERVE", 512 * 2**20)
+    monkeypatch.setattr(unica, "free_vram", lambda device: 100 * 2**20)
+    assert unica.heads_per_call(q, k, unica.DEFAULT_KERNEL, {}) == 8
+    monkeypatch.setattr(unica, "free_vram", lambda device: 4 * PER_HEAD)
+    assert unica.heads_per_call(q, k, unica.DEFAULT_KERNEL, {}) == 1
 
 
 def test_the_automatic_reserve_is_a_tenth_of_the_card_or_1_gib(monkeypatch):

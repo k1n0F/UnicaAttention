@@ -57,6 +57,10 @@ LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
 VRAM_RESERVE: int | None = (int(os.environ["UNICA_VRAM_RESERVE_MB"]) * 2**20
                              if "UNICA_VRAM_RESERVE_MB" in os.environ else None)
 LOG_VRAM = os.environ.get("UNICA_LOG_VRAM") == "1"  # print every sizing decision of heads_per_call
+# M4.39: a call whose temporary buffers fit in this fraction of the reserve runs whole, even when the driver's free VRAM
+# is already below the reserve (ComfyUI's dynamic VRAM keeps the card full of staged weights). It takes only a small
+# part of the margin, while pieces of one head cost a launch each: an image model's 24 heads, 24 calls instead of one.
+SMALL_CALL_FRACTION = 4
 # The settings the ComfyUI node runs, and so the only ones an installed package ships cubins for (build_wheel.py):
 # the accurate mode with each of its V scales (M4.23, M4.25) and the fast mode (M4.21). Others need the repository.
 PRESETS = {"per_token": dict(V_TOKEN=1), "per_channel": {}, "outliers": dict(V_OUTLIERS=8),
@@ -165,7 +169,8 @@ def heads_per_call(q: torch.Tensor, k: torch.Tensor, kernel: str, tile: dict) ->
     """How many heads one call can take without its temporary buffers reaching VRAM_RESERVE (M4.31). Past the VRAM,
     Windows does not fail: it moves memory to system RAM over PCIe, one launch takes seconds, and the driver may reset
     the GPU. Per head: the quantized q, k, v and the bf16 output, at most 2 bytes per element of q, k, v; bf16 copies
-    of float16 inputs, 2 more; the fast mode's q̄ · k table, 4 bytes per block of SMOOTH_Q queries and key."""
+    of float16 inputs, 2 more; the fast mode's q̄ · k table, 4 bytes per block of SMOOTH_Q queries and key.
+    A small call (buffers within 1/SMALL_CALL_FRACTION of the reserve, and within the free VRAM) runs whole (M4.39)."""
     batch, heads, n_queries, _ = q.shape
     n_keys = k.shape[2]
     elements = batch * HEAD_DIM * (n_queries + 2 * n_keys)
@@ -174,12 +179,15 @@ def heads_per_call(q: torch.Tensor, k: torch.Tensor, kernel: str, tile: dict) ->
     if kernel == "attention_fp4" and settings["SMOOTH_Q"]:
         padded_keys = math.ceil(n_keys / settings["KEYS_PER_TILE"]) * settings["KEYS_PER_TILE"]
         per_head += batch * math.ceil(n_queries / settings["SMOOTH_Q"]) * padded_keys * 4
-    free = free_vram(q.device)
-    step = max(1, min(heads, (free - vram_reserve(q.device)) // per_head))
+    free, reserve = free_vram(q.device), vram_reserve(q.device)
+    if heads * per_head <= min(reserve // SMALL_CALL_FRACTION, free):
+        step = heads
+    else:
+        step = max(1, min(heads, (free - reserve) // per_head))
     if LOG_VRAM:  # what the sizing saw, to check it against the real VRAM under WDDM (M4.32)
         torch_unused = torch.cuda.memory_reserved(q.device) - torch.cuda.memory_allocated(q.device)
         print(f"[unica vram] tokens {n_queries} heads {heads} {q.dtype} driver_free {free / 2**30:.2f} "
-              f"torch_unused {torch_unused / 2**30:.2f} reserve {vram_reserve(q.device) / 2**30:.2f} "
+              f"torch_unused {torch_unused / 2**30:.2f} reserve {reserve / 2**30:.2f} "
               f"per_head {per_head / 2**30:.3f} GiB -> {step} heads per call", flush=True)
     return step
 

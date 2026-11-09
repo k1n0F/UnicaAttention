@@ -3698,3 +3698,106 @@ it for a finished release.
 (trusted publishing, environment `pypi` with a required reviewer and only `v*` tags allowed). PyPI holds the very
 file checked above: 2 202 215 bytes, sha256 ca1a0919…a0d3f8. `pip install --pre unica-attention` into a clean venv
 with torch 2.14.0+cu132: "tested on this machine", the four presets at 1.58 / 1.67 / 1.66 / 19.26 %.
+
+## M4.39 — small calls run whole: the reserve split image models into one-head pieces
+
+**Where it came from.** An A/B of the native node on the image workflows of the Rigsy site (ComfyUI app's agent; the
+site's own graphs, 1024², seed 42, KSampler time, sdpa / unica / unica / sdpa after a warm-up; accurate, per token,
+reserve auto). SDPA here is ComfyUI's default, the site runs no SageAttention.
+
+| workflow | SDPA, s | unica, s | sage2, s | PSNR unica / sage2 vs SDPA, dB |
+|---|---|---|---|---|
+| Qwen-Image-Edit | 6.77 / 18.60 (desktop in use) | **5.76 / 5.82** | 7.06 | 26.3 / 27.7 |
+| Z-Image, 25 steps | 13.88 / 14.03 | 17.69 / 11.61 | 14.20 | 28.2 / 3.4 (black image) |
+| Z-Image finetune, 8 steps | 5.36 / 4.92 | 5.56 / 5.99 | 5.94 | 26.9 / 32.2 |
+| Z-Image + Fun ControlNet, img2img | 10.64 / 10.71 | 11.02 / 13.36 | 18.21 | 32.8 / 35.4 |
+| Moss, 30 steps | 10.94 / 11.12 | **19.07 / 18.12** | 14.74 | 24.4 / 24.2 |
+
+- Moss 70 % slower, in both renders. M4.26 had it level.
+- Z-Image's two unica renders are bit-identical images, yet 17.7 and 11.6 s; 11.6 s is M4.26's result.
+- sage2 here is `sageattn_qk_int8_pv_fp16_cuda`, and on Z-Image it gave a black image: its P·V accumulates in fp16,
+  and Z-Image's two tokens with extreme V (M4.22) overflow it. Unica per token is the fix for exactly that case.
+- SDXL (heads of 64): every call passed on, as it should. The image differed from SDPA (30.9 dB), but the only SDPA
+  image was the cold first render, and the img2img graph's cold render differs from its own repeats too (32.8 dB).
+  Not settled without a warm SDPA render.
+
+**The explanation.** Moss loses ~7.6 s over ~1260 self-attention calls: ~6 ms per call, ten times what the kernel
+takes on a call this short. `heads_per_call` (M4.31) sizes a call against the driver's free VRAM minus the reserve
+(auto: 1.6 GiB). ComfyUI's dynamic VRAM keeps the card filled with staged weights, so the free VRAM can sit below the
+reserve, and then a call runs one head at a time: 24 calls of quantization, kernel and Python instead of one. That
+fits the scatter too: the same math, a different number of launches, set by what happened to be free.
+
+But the reserve is there for WAN's big calls (2.3 GB of buffers at 75 k tokens), not for these: a Moss call holds
+~150 MB, a fifth of what splitting is meant to keep free.
+
+**The change.** A call whose temporary buffers fit in a quarter of the reserve (`SMALL_CALL_FRACTION`, 400 MB on
+16 GB) and in the free VRAM runs whole. Bigger calls are sized as before; a call that does not fit in what is free
+still goes in pieces. Option chosen over a smaller automatic reserve, which would weaken the guard for WAN as well.
+`tests/test_pieces.py` checks both sides of the rule; `bench/pieces_cost.py tokens heads batch` times a shape whole
+against one-head pieces.
+
+**Hypothesis, before measuring:**
+1. Microbench, Moss-sized call (2 × 4096 tokens, 24 heads), per token: one-head pieces cost +4…6 ms per call over
+   the whole call (~0.2–0.25 ms per extra piece).
+2. With `UNICA_LOG_VRAM=1` on the old code, most of Moss's calls on the site graph run at fewer than 24 heads, with
+   the driver's free VRAM below ~1.7 GiB.
+3. Moss on the site graph with the change: 18.6 → ≤ 11 s, level with SDPA or better; Z-Image's two unica renders
+   both near 11.6 s.
+
+**Microbench** (`bench/pieces_cost.py`, fp16 in ComfyUI's layout, ComfyUI idle on the same card; median of 4 rounds
+× 5): the whole call against pieces of one head.
+
+| shape | per token | per channel | outliers | fast |
+|---|---|---|---|---|
+| 2 × 4096, 24 heads (Moss-sized) | 2.58 → 6.13 ms (**+3.55**) | 2.45 → 7.88 (+5.43) | 2.97 → 18.63 (+15.66) | 2.45 → 27.87 (+25.42) |
+| 2 × 4128, 30 heads (Z-Image) | 3.18 → 7.20 (+4.01) | 3.15 → 9.15 (+6.00) | 3.77 → 21.84 (+18.08) | 3.09 → 33.29 (+30.20) |
+
+- Hypothesis 1 missed low: +3.55 ms per call, not +4…6 (~0.15 ms per extra piece, not 0.2–0.25). Over Moss's ~1260
+  calls that is ~4.5 s of the 7.6 s lost, if every call was split and the site's calls have this shape; how many
+  calls Moss makes per step (one batch of 2 for CFG, or two of 1) is not known here. The render test decides.
+- Splitting costs far more in fast and outliers: per piece they launch more (fast's q̄ · k table, outliers' top-k), up
+  to 10× the whole call.
+- `tests/test_pieces.py`: 12 passed on the GPU.
+
+**Renders on the site graphs** (ComfyUI app's agent, ComfyUI restarted on this branch with `UNICA_LOG_VRAM=1`;
+1024², seed 42, KSampler time, sdpa / unica / unica / sdpa after a warm-up):
+
+| workflow | SDPA, s | unica before, s | unica now, s |
+|---|---|---|---|
+| Moss | 10.72 / 10.70 | 19.07 / 18.12 | **11.34 / 11.34** |
+| Z-Image | 12.94 / 13.71 | 17.69 / 11.61 | **11.71 / 11.62** |
+| SDXL (raehoshi) | 10.09 / 10.10 | — | 10.10 |
+
+What the sizing log showed:
+
+- **Moss**: 2640 calls per render. The self-attention calls are 4131 and 4117 tokens, 1260 of each, so 30 steps ×
+  42 blocks run twice: CFG goes as two batches of 1. The driver's free VRAM in them was 1.26–1.62 GiB, median 1.48,
+  against a reserve of 1.59. **The old code would have split all 2520**, and now none are split.
+- **Z-Image**: free VRAM ~3.1 GiB (2.96–4.59), so the old code would have split **0 of 1600**.
+
+Against the hypothesis:
+
+1. The microbench missed low (above). With the call count now known, the render agrees with it: −7.3 s over 2520
+   calls of batch 1 is 2.9 ms per call, against +3.55 ms measured for a call of batch 2.
+2. **Held.** Moss ran in pieces in every call, and the free VRAM sat just under the reserve, as predicted.
+3. **Half held.**
+   - Moss 18.6 → 11.3 s, the scatter gone. But the hypothesis was ≤ 11 s and level with SDPA. It is still +6 %
+     slower than SDPA. That fits M4.26 (Moss +3 %): its calls are short, batch 1 and ~4.1 k tokens, and the
+     quantization around the kernel does not pay off there.
+   - Z-Image: both renders near 11.6 s (11.71 / 11.62), 12 % faster than SDPA. **But the explanation was wrong
+     for Z-Image.** Its calls were never split, so the earlier 17.7 s render came from something else, most likely
+     the desktop in use during that run (SDPA's 18.6 s on Qwen came from the same run).
+
+SDXL settled: warm SDPA and unica are bit-identical, and every call passed on with `head size 64`. The 30.9 dB earlier
+was the cold reference render.
+
+**Result:** on the site's image models unica is faster than SDPA on Qwen-Image-Edit (−15 %) and Z-Image (−12 %),
+slower on Moss (+6 %), and level on the Z-Image finetune and img2img (single-render scatter there, not re-run). SDXL
+is untouched.
+
+**0.1.0b2.** The change goes out as the second beta: version 0.1.0b2 and the README by signature (the measured models
+described by tokens × heads and what sets their values apart, the names left to bench/comfyui/models.md). The wheel
+was built fresh by build_wheel.py, the four cubins as before. It was checked from a clean venv outside the repository,
+with torch 2.14.0+cu132 and nvcc off PATH: "tested on this machine", the four presets at 1.58 / 1.67 / 1.66 / 19.26 %,
+the same as b1. 2 202 803 bytes, sha256 9d3f2f2c…c4548d. The cubins' line info names the source folder on the build
+drive and the CUDA toolkit's folder, but no user folder.
