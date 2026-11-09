@@ -16,7 +16,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import unica  # noqa: E402
-from emulate import TODAY, block_scaled, emulate, errors, quant, reference, rope, wan_rope_table  # noqa: E402
+from emulate import block_scaled, emulate, errors, quant, reference, rope, wan_rope_table  # noqa: E402
 from test_fp4 import E2M1_VALUES, KERNEL_CONFIG  # noqa: E402
 
 # a small latent of WAN's shape: 3 frames of 7 × 9 tokens = 189, past a tile edge and a stats block

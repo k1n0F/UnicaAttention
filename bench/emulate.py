@@ -296,7 +296,7 @@ def emulate(
 
     scale = q.shape[-1] ** -0.5 * LOG2E
     m = torch.full((*q.shape[:-1], 1), -torch.inf, device=q.device)
-    l = torch.zeros_like(m)
+    denominator = torch.zeros_like(m)  # the softmax row sums (flash attention's l)
     o = torch.zeros_like(q)
     overflow = torch.zeros((), dtype=torch.bool, device=q.device)
     for j in range(0, k.shape[-2], bc):
@@ -319,7 +319,7 @@ def emulate(
             rows = negligible.shape[-1]
             blocks = F.pad(negligible, (0, -rows % SKIP_ROWS), value=True).unflatten(-1, (-1, SKIP_ROWS)).all(-1)
             skipped = blocks.repeat_interleave(SKIP_ROWS, -1)[..., :rows, None]
-            keep = (~skipped).float()  # a skipped tile leaves m, l and o as they were: its max is below m already
+            keep = (~skipped).float()  # a skipped tile leaves m, the denominator and o as they were: its max is below m already
             if stats is not None:
                 stats["skipped"] = stats.get("skipped", 0) + blocks.sum().item()
                 stats["pairs"] = stats.get("pairs", 0) + blocks.numel()
@@ -340,7 +340,7 @@ def emulate(
             weights = inv_s[..., None, j : j + bc] if v_token == "rounded" else 1.0
             if v_token != "float":
                 row_sum = (p * weights).sum(-1, keepdim=True) / p_mul
-        l = l * alpha + row_sum * beta * keep
+        denominator = denominator * alpha + row_sum * beta * keep
         vt = v[..., j : j + bc, :]
         if len(p_parts) > 1 or len(vt) > 1:
             inner = sum(pi @ vj for i, pi in enumerate(p_parts) for jv, vj in enumerate(vt) if p1_v1 or i + jv < 2)
@@ -354,12 +354,12 @@ def emulate(
         else:
             inner = p @ vt[0]
         m, o = m_new, o * alpha + inner * beta * keep
-    if outliers is not None:  # their part of P·V, exactly, against the final max; their P̂ is already in l
+    if outliers is not None:  # their part of P·V, exactly, against the final max; their P̂ is already in the denominator
         picked, v_out = outliers
         rows = picked[..., None].expand(*picked.shape, k.shape[-1])
         s_out = (q @ k.gather(-2, rows).transpose(-1, -2)) * (sq * sk.gather(-2, picked[..., None]).transpose(-1, -2)) * scale
         o = o + (torch.exp2(s_out - m) * p_mul) @ (v_out / sv)
-    o = o * (sv / p_mul) / l + v_mean
+    o = o * (sv / p_mul) / denominator + v_mean
     if overflow:
         print("  FP16 accumulator overflowed")
     return o.bfloat16().float() if out_bf16 else o

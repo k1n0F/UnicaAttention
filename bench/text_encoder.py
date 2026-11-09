@@ -11,6 +11,9 @@ REPEATS times; on the GPU the first time includes uploading the weights. The err
 against the render's path (CPU, fp16 weights).
 """
 
+# pyright: reportMissingImports=false
+# ComfyUI's modules (comfy, cv2, the frame-interpolation node...) exist only in ComfyUI's Python, which runs this file
+
 import json
 import sys
 import time

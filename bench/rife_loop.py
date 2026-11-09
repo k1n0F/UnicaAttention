@@ -8,6 +8,9 @@ The video is the hires pass before Nomos (768 × 1360). Its first frames go thro
 RIFE; times per frame and per pair scale to the render's 113 frames and 112 pairs.
 """
 
+# pyright: reportMissingImports=false
+# ComfyUI's modules (comfy, cv2, the frame-interpolation node...) exist only in ComfyUI's Python, which runs this file
+
 import gc
 import math
 import sys
@@ -155,8 +158,7 @@ def main() -> None:
             other, seconds = timed(lambda dtype=dtype: nomos_whole(nomos, image, dtype))
             print(f"Nomos, whole frames, {str(dtype)[6:]}: {seconds / n:6.3f} s per frame, PSNR against the node "
                   f"{psnr(other, up):.1f} dB")
-        nomos.to(torch.float32)
-        del nomos
+        nomos = None  # frees its VRAM for RIFE; `del` would leave the lambdas above a name that no longer exists
         torch.cuda.empty_cache()
 
         rife = IFNet(arch_ver="4.7")

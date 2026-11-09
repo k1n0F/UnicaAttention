@@ -24,6 +24,9 @@ Install: a directory junction from ComfyUI/custom_nodes/UnicaAttention to this f
 already be built (run the tests once): ComfyUI's shell has no nvcc.
 """
 
+# pyright: reportMissingImports=false
+# ComfyUI's modules (comfy, cv2, the frame-interpolation node...) exist only in ComfyUI's Python, which runs this file
+
 from __future__ import annotations
 
 import collections

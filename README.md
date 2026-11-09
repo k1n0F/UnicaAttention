@@ -28,23 +28,23 @@
 | **accurate** | INT8 Q·Kᵀ · u8 × s8 P·V | SageAttention 2 | below it in 135 of 136 real calls | level at 118 K tokens, 4–8 % slower on a 4-step WAN render |
 | **fast** | NVFP4 Q·Kᵀ and P·V, Q smoothed | SageAttention 3 | below it in 131 of 136 real calls | faster on long calls, slower on short ones; runs where SageAttention 3 runs out of VRAM |
 
-The kernel is not tied to WAN. It runs any self-attention with 128-dimensional heads, and the native ComfyUI node routes it for every model that uses ComfyUI's attention: video (WAN 2.2, LTX-2.3) and image (Qwen-Image-Edit, Z-Image, Moss) are measured below. WAN 2.2 is the main test because it is the heaviest one: 34 K tokens per call for a short clip and 118 K for a hires pass, where attention takes most of the time and a kernel's speed and error show the most.
+The kernel is not tied to WAN. It runs any self-attention with 128-dimensional heads, and the native ComfyUI node routes it for every model that uses ComfyUI's attention. What decides how it does is not the model's name but the signature of its calls: how many tokens, how many heads, and how the values are spread. Five signatures are measured below, from 3.5 K-token image calls to 34 K-token video calls. WAN 2.2 is the main test because it is the heaviest one: 34 K tokens per call for a short clip and 118 K for a hires pass, where attention takes most of the time and a kernel's speed and error show the most.
 
 ## Results
 
 Everything is measured on one RTX 5080. Every step started with a written prediction, and the result is recorded even when the prediction failed: [LOG.md](https://github.com/k1n0F/UnicaAttention/blob/main/LOG.md).
 
-### Five models in ComfyUI, real activations
+### Five call signatures in ComfyUI, real activations
 
-Error of self-attention against FP32 on the Q, K, V of real renders (median rel L2, and in how many measured calls it is below the rival). The graphs, seeds and models are in [bench/comfyui/](https://github.com/k1n0F/UnicaAttention/tree/main/bench/comfyui), so the run can be repeated (`bench/comfyui_models.py`).
+Error of self-attention against FP32 on the Q, K, V of real renders (median rel L2, and in how many measured calls it is below the rival). A signature is tokens × heads per call (batch 1 in all of them) and what sets its values apart: channel spread is the largest channel's RMS over the median one's (1 = even). The graphs, seeds and the models behind each signature are in [bench/comfyui/](https://github.com/k1n0F/UnicaAttention/tree/main/bench/comfyui), so the run can be repeated (`bench/comfyui_models.py`).
 
-| Model | SageAttention 2 | **accurate** | SageAttention 3 | **fast** |
-|---|---|---|---|---|
-| WAN 2.2 14B, image to video | 1.51 % | **0.78 %**, 21 / 22 | 8.60 % | **8.16 %**, 22 / 22 |
-| LTX-2.3 | 0.58 % | **0.42 %**, 20 / 20 | 3.44 % | **3.10 %**, 17 / 20 |
-| Qwen-Image-Edit | 1.81 % | **1.14 %**, 20 / 20 | 12.37 % | **10.94 %**, 20 / 20 |
-| Z-Image | 2.07 % | **1.05 %**, 34 / 34 | 15.29 % | **12.13 %**, 32 / 34 |
-| Moss | 2.08 % | **1.10 %**, 40 / 40 | 13.18 % | **11.73 %**, 40 / 40 |
+| Signature | What sets it apart | SageAttention 2 | **accurate** | SageAttention 3 | **fast** |
+|---|---|---|---|---|---|
+| 34 020 × 40, video | even channels (Q, K spread 2.2–2.4) | 1.51 % | **0.78 %**, 21 / 22 | 8.60 % | **8.16 %**, 22 / 22 |
+| 3 520 and 14 080 × 32, video with audio | audio heads of 64 pass on | 0.58 % | **0.42 %**, 20 / 20 | 3.44 % | **3.10 %**, 17 / 20 |
+| 8 393 × 24, image with a reference image | text and both images in one sequence | 1.81 % | **1.14 %**, 20 / 20 | 12.37 % | **10.94 %**, 20 / 20 |
+| 4 128 × 30, image | two V tokens 65–250× the rest | 2.07 % | **1.05 %**, 34 / 34 | 15.29 % | **12.13 %**, 32 / 34 |
+| 3 850–3 874 × 24, image | uneven K channels (spread 10.5) | 2.08 % | **1.10 %**, 40 / 40 | 13.18 % | **11.73 %**, 40 / 40 |
 
 A whole WAN 2.2 render (81 frames, 4 steps, 34 020 tokens; median of three rounds):
 
@@ -52,7 +52,7 @@ A whole WAN 2.2 render (81 frames, 4 steps, 34 020 tokens; median of three round
 |---|---|---|---|---|---|
 | render | 45.9 s | 46.6 s | 47.9 s | 49.4 s | **44.6 s** |
 
-On error, UnicaAttention wins on every model. On time, fast is the fastest mode on WAN, and the accurate modes are 4–8 % behind SageAttention 2 there. On the image models, whose calls are short and where attention is not what takes the time, all kernels are within a few tenths of a second, and fast is the slower of the two 4-bit kernels.
+On error, UnicaAttention wins on every signature. On time, fast is the fastest mode on WAN, and the accurate modes are 4–8 % behind SageAttention 2 there. On the short signatures (3.5–8.4 K tokens), where attention is not what takes the time, all kernels are within a few tenths of a second, and fast is the slower of the two 4-bit kernels.
 
 ### A long video: 118 320 tokens
 
@@ -102,14 +102,14 @@ The three videos part ways because their arithmetic differs, not because one of 
 | M3.17 | **76 ms** | tiles by TMA, V stored in the order the MMA reads it: accurate mode, 10× M1 |
 | M4.8–15 | 46.5 ms at 34 020 tokens | NVFP4 Q·Kᵀ and P·V, each tile one bulk copy: SageAttention 3's error class |
 | M4.21 | 57.3 ms at 34 020 tokens | Q smoothed per 512 queries: fast mode, below SageAttention 3's error |
-| M4.23 | | V with one scale per token: Z-Image 9.1 % → 1.1 % |
+| M4.23 | | V with one scale per token: the signature with two outlier V tokens 9.1 % → 1.1 % |
 | M4.31–32 | | calls split by heads to stay in the VRAM: 118 320 tokens on 16 GB |
 
 ## How it works
 
 - **INT8 Q·Kᵀ** with one scale per 128 queries and per 64 keys. K is smoothed (its mean over tokens subtracted, which softmax cancels). The int32 result is exact, so dequantization is one factor folded into the softmax.
 - **P·V as u8 × s8.** P is taken against the max of its own 64-key tile, so every tile uses all 256 steps of u8, and a factor corrects it when the tile is added in. The denominator is summed over the rounded P̂ (`IDP4A`), the same P the MMA uses.
-- **V with one scale per token** (the default). Some models have a few V tokens 65–250× larger than the rest (Z-Image: two of them), and one scale per channel then crushes everything else. A per-token scale cannot stay outside a sum over tokens, so it goes into P instead: log₂ of the scale is added to the score before the exponent, and the denominator is corrected by it.
+- **V with one scale per token** (the default). Some models have a few V tokens 65–250× larger than the rest (in one measured image signature, two of them), and one scale per channel then crushes everything else. A per-token scale cannot stay outside a sum over tokens, so it goes into P instead: log₂ of the scale is added to the score before the exponent, and the denominator is corrected by it.
 - **The fast mode** runs both products in NVFP4 (4-bit values, one FP8 scale per 16), twice the INT8 rate. Q is smoothed per 512 queries: their mean is subtracted before quantizing, and its product with K, computed in higher precision, is added back as the starting value of the Q·Kᵀ accumulator.
 - **TMA and bulk copies** load each tile; one thread issues the copy, an mbarrier says when it has landed. In the accurate mode the TMA box is 16 bytes wider than a row, so tiles land padded and `ldmatrix` reads them without bank conflicts.
 - **The Q·Kᵀ of tile t + 1 is issued before the softmax of tile t**, so the tensor cores have work while the exponents run.
@@ -176,7 +176,7 @@ out = unica.attention(q, k, v)  # [batch, heads, tokens, 128] bf16, like SDPA's 
 
 **ComfyUI.** Link the `comfyui` folder into `ComfyUI/custom_nodes` (a directory junction on Windows):
 
-- **Unica Attention (native)**: for ComfyUI's own models (WAN, LTX, Qwen, Z-Image, Moss). Put it after `PathchSageAttentionKJ`: self-attention goes to UnicaAttention, everything else, including cross-attention to the text, stays where it was.
+- **Unica Attention (native)**: for any of ComfyUI's own models that call ComfyUI's attention. Self-attention with heads of 128 goes to UnicaAttention; everything else (other head sizes, masks, cross-attention to the text) stays where it was. Put it after `PathchSageAttentionKJ`, or that patch overwrites it.
 - **Unica Attention (WanVideo)**: for ComfyUI-WanVideoWrapper, between the model loader and the sampler.
 - **RIFE VFI (Unica)**: a drop-in for comfyui-frame-interpolation's RIFE node, with its models and the same frames (PSNR 98 dB), and a rebuilt loop: each frame uploaded once, a pair's middle frames in one batch, no `gc.collect()` per pair. In a WAN render's ×5 interpolation of 113 frames at 1536 × 2720: 138 s → 41 s.
 

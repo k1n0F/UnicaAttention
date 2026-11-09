@@ -11,6 +11,9 @@ gc.collect (called by the loop after every pair) and torch.zeros (the output) ar
 timings, both loops run ACCURACY_FRAMES frames and their outputs are compared.
 """
 
+# pyright: reportMissingImports=false
+# ComfyUI's modules (comfy, cv2, the frame-interpolation node...) exist only in ComfyUI's Python, which runs this file
+
 import gc
 import math
 import sys
