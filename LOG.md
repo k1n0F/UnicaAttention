@@ -4313,3 +4313,84 @@ ran, every tile:
   tile (two stages), so most of the 7–11 % per-warp wait, and part of the common 6–11 %, could go. Upper bound
   ~10 %; costs: the empty-barrier arrivals (M3.19: +30 instructions per tile with the try_wait rounds), 232 registers
   instead of 235. A rewrite of the kernel's loop, so it needs its own decision.
+
+## M4.46 — Moss's real attention call, and whether its sampler waits for the CPU
+
+M4.45 A2 left two questions: Moss's real call (a bench call of 24 heads × 4131 tokens takes SDPA 5.3 ms, which over
+2520 calls would not fit in the 10.7 s sampler), and whether unica's 0.92 ms of CPU per call (SDPA: 0.02 ms) costs
+Moss its last 6 %. One render each way, through the ComfyUI agent, logging every attention call's signature and the
+GPU's busy share.
+
+Hypotheses, written before the renders:
+- H1: the real self-attention call is smaller than the bench's (fewer heads, or batch and heads arranged otherwise),
+  such that SDPA takes ≤ 2.5 ms per call there (≤ 6.3 s of the 10.7 s).
+- H2: with unica the sampler is CPU-bound and with SDPA it is not: GPU busy ≤ 85 % during unica's KSampler, ≥ 90 %
+  during SDPA's. Then cutting unica's host time per call is the lever (option c), and a graph (A2) is not needed.
+- H3 (the alternative): both are GPU-bound (≥ 90 %); then the 6 % is GPU work around the kernel (the fp16 → bf16
+  copies, the quantization: 0.5 of unica's 1.34 ms per call in the bench), not the CPU.
+
+**Result** (ComfyUI agent; a probe wrapping torch's SDPA and the unica node's entry, counting per signature; the
+Moss site graph as in M4.39, warm-up, then sdpa / unica / unica / sdpa; `build/m446_*`):
+
+**Moss's "SDPA" is not SDPA.** Its checkpoint carries `layers.N.comfy_attention.config = {"attention":
+"comfy_kitchen_int8"}` for all 42 layers: ComfyUI then sends their self-attention to comfy_kitchen 0.2.40's INT8
+attention (NVIDIA, Apache-2.0, "Pure INT8 scaled dot-product attention for NVIDIA tensor-core GPUs":
+`prequantize_int8_attention` + `int8_attention_from_prequantized`), unless an attention override such as the unica
+node is set, which wins. So M4.39's Moss row compared unica with another quantized INT8 kernel, not with SDPA.
+
+| render | calls through torch SDPA | through unica | KSampler | GPU busy, mean / median |
+|---|---|---|---|---|
+| "sdpa" 1 | 121 (60 × 35 tokens, 60 × 21, the VAE's 1); the 2520 big ones go to comfy_kitchen (inferred, not counted) | — | 10.99 s | 93.0 / 98 % |
+| unica 2 (first in the process) | 1 (VAE) | 2640 | 20.74 s | 54.4 / 98 % |
+| unica 3 | 1 (VAE) | **1260 × 4131 + 1260 × 4117 tokens**, 60 × 35, 60 × 21; all 1 × T × 24 × 128 **bf16**, [batch, tokens, heads, 128] | **11.32 s** | **94.1** / 98 % |
+| "sdpa" 4 | as 1 | — | 11.10 s | (39 samples only) |
+
+- H1 **wrong**: the call is the bench's, 24 heads × 4131 tokens, batch 1. What the bench got wrong is the dtype (bf16,
+  not fp16) and the rival (comfy_kitchen, not torch's SDPA). In bf16 the call skips `in_pieces` and its copies, where
+  half of A2's 0.92 ms of CPU went.
+- H2 **wrong**, H3 **held**: both samplers keep the GPU busy (93–94 % mean, 98 % median); neither waits for the CPU.
+  Option (c), cutting unica's host time, would not move Moss.
+- Warm unica is +2.5 % against comfy_kitchen INT8 (11.32 against 11.05 s mean), not +6 % against SDPA. The next
+  question is the kernels themselves: comfy_kitchen INT8 against unica on this call and on WAN's, time and error.
+
+## M4.47 — comfy_kitchen INT8 attention against unica, head to head
+
+comfy_kitchen 0.2.40 (NVIDIA, Apache-2.0, in ComfyUI's venv) ships `int8_attention`: signed INT8 Q, K, V and unsigned
+INT8 P, FP32 softmax, the same design as unica's accurate mode, plus a fused block-Hadamard rotation of Q and K
+(H128 for d = 128; unica's M4.5 / M4.7 H6 measured it in the emulator and did not build it) and a "representative
+key" subtracted from K when it helps (unica subtracts K's mean). Its V scale is not documented here.
+
+Hypotheses, written before measuring (one process, ComfyUI's venv, kernels in alternating rounds; random bf16 inputs
+for time, the dumps for error):
+- time: at Moss's call (1 × 4131 × 24 × 128, bf16) comfy_kitchen is 2–4 % faster than unica per token (the render
+  gap was 2.5 %); at WAN's (1 × 34,020 × 40) within ±5 %.
+- error: within ±0.3 pp of unica per token on WAN, LTX, Qwen and Moss (the rotation buys about what the token scale
+  buys); on Z-Image, if its V scale is per channel, ≥ 1 pp worse (V's outlier tokens, M4.25).
+
+**Result** (`bench/kitchen.py`, `build/m447_kitchen.txt`):
+
+| | Moss's call (1 × 4131 × 24) | WAN's call (1 × 34,020 × 40) |
+|---|---|---|
+| comfy_kitchen int8 | **0.861 ms** (0.901 × per token) | **82.19 ms** (0.920 ×) |
+| unica per token | 0.955 ms | 89.35 ms |
+| unica per channel | 0.922 ms (0.965 ×) | 82.34 ms (0.922 ×) |
+
+| rel L2 against FP32, median of 6 dumped calls | comfy_kitchen | unica per token | unica per channel | SageAttention 2 |
+|---|---|---|---|---|
+| WAN | 0.996 % | **0.774** | 0.939 | 1.078 |
+| Z-Image | **12.14 %** | **1.144** | 12.18 | 2.517 |
+| LTX | 0.524 % | **0.434** | 0.451 | 0.577 |
+| Qwen | 1.293 % | **1.217** | 1.465 | 2.035 |
+| Moss | 1.218 % | **1.134** | 1.407 | 2.136 |
+
+- **Time: missed, the gap is larger.** comfy_kitchen is 10 % faster than per token at Moss's call (predicted 2–4 %) and
+  8 % at WAN's (predicted within ±5 %). It runs at per channel's speed (82.19 against 82.34 ms at WAN's call; 7 %
+  ahead at Moss's short call). The render's 2.5 % is this 10 % on attention's share of Moss's sampler.
+- **Error: held.** Within +0.08…+0.22 pp of per token on WAN, LTX, Qwen and Moss, and per token is lower on all
+  five models' medians. On Z-Image comfy_kitchen fails as per channel does, 12.1 % against per token's 1.14 % and
+  SageAttention 2's 2.5 %: its V scale is per channel, and V's outlier tokens (M4.25) break it. Its Hadamard rotation
+  shows where it should: better than unica per channel on Qwen and Moss (1.29 / 1.22 against 1.47 / 1.41 %), worse on
+  WAN and LTX.
+- **Where unica stands:** per token is the most accurate of the four on every model and the only quantized one that
+  holds on Z-Image, at +8…+10 % time. The 8 % is per token's arithmetic (M4.41: an FFMA and an FADD per key; the data
+  no longer waits). comfy_kitchen is per channel with a rotation; it buys its speed with Z-Image's failure.
