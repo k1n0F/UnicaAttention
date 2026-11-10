@@ -4225,3 +4225,91 @@ WAN 1.009 (0.981 … 1.039), Z-Image 0.997 (0.895 … 1.047), LTX 1.022 (1.005 �
   only where it skips more than ~20–25 % of the work on average; the real calls skip 4–15 % (blocks) or 11–21 %
   (warps, with the barrier eating half). Both stay as options, default 0. The next lever is not another place for
   the branch but a call that knows in advance: a whole head or call that is sharp could take a separate build.
+
+## M4.45 — three more hypotheses: the V scale chosen per call, CUDA graphs for short calls, the barrier's wait
+
+Brought from outside the log and checked against it before measuring. Per token passed 135 of the 136 dumped calls
+against SageAttention 2 (M4.26: WAN 21 of 22); per channel is ~7 % faster (M4.33: 84.2 against 90.4 ms at 34,020)
+but breaks on Z-Image's outlier tokens (M4.25). Moss is still +6 % against SDPA (M4.39: 11.34 against 10.71 s over
+2520 self-attention calls of ~4.1 k tokens, ~0.25 ms per call). The block's barrier is ~10 % of the stall cycles
+(M3.18, M4.41), and H1 / H5 of M4.44 lost half their gain to it.
+
+| # | hypothesis | prediction | test |
+|---|---|---|---|
+| A1 | a statistic of V alone tells, per call, whether per channel is safe: R_V = max_j ‖v_j‖∞ / median_j ‖v_j‖∞ (outlier tokens), or ε_V = the rel L2 of V's own per-channel quantization | Spearman ρ ≥ 0.7 between the statistic and (per channel − per token) error; a threshold set on half of the calls (even) lets no unsafe call through on the other half (odd), "safe" = per channel ≤ SageAttention 2 and ≤ per token + 0.2 pp; ≥ 50 % of WAN's, LTX's and Qwen's calls go to per channel, ~0 % of Z-Image's | the 136 dumps: their rows hold both errors from the run; the statistics from their V |
+| A2 | Moss's remaining +6 % is launch overhead that a CUDA graph of the whole call (quantization and kernel) removes | uncertain. In a loop the CPU runs ahead and the GPU stays busy, so in a microbench the graph saves ≤ 0.02 ms per call; if the eager call is CPU-bound (wall time per call > GPU time by ≥ 0.1 ms), it saves ≥ 0.1 ms | Moss's signature (batch 1, 24 heads, 4131 tokens), eager against graph replay, GPU time and wall time per call; the call's parts separately |
+| A3 | warps that move on without the block's barrier gain what the barrier costs | the trace on a real WAN call: a warp waits 5–10 % of its tile time at the barrier, and with two blocks per SM at most half of it leaves the tensor pipe idle: ≤ 5 % to win. Below 3 % not pursued | `TRACE=1` and bench/timeline.py on a WAN dump: per warp and tile, arrival and release at the barrier |
+
+**A1, result** (`build/m445_a1.txt`). 102 of the 136 dumps carry both errors (Z-Image's run measured per token only).
+By the rule written above (per channel ≤ SageAttention 2 and ≤ per token + 0.2 pp), per channel is **unsafe in 41 of
+102 calls**: WAN 7 / 22, LTX 2 / 20, Qwen 15 / 20, Moss 17 / 40, nearly always because it lands above SageAttention 2,
+not because it is far above per token (per channel − per token: −0.05 … +0.61 pp).
+
+| statistic | Spearman ρ with (per channel − per token) | threshold from the even calls: odd calls routed to per channel | unsafe among them |
+|---|---|---|---|
+| R_V (outlier tokens) | 0.553 | 4 / 51 | 1 |
+| ε_V (V's per-channel quantization error) | 0.661 | 13 / 51 (LTX 10 / 10, WAN 1, Qwen 2) | 2 |
+| ε_V per channel / per token | 0.704 | 14 / 51 | 2 |
+
+- **Refuted as a per-call switch.** R_V, the statistic proposed, predicts least (ρ 0.55) and routes almost nothing;
+  the best one (the ratio of V's own quantization errors) reaches ρ 0.70, but the threshold that keeps the even half
+  safe still lets 2 unsafe calls through on the odd half (LTX, 0.02–0.03 pp above SageAttention 2), and routes ≥ 50 %
+  only for LTX (predicted: WAN, LTX and Qwen). Per channel's loss is spread over every call by a little, so no
+  statistic of V separates a safe set worth ~7 %.
+- What it leaves: on LTX per channel is within −0.05 … +0.19 pp of per token in every call; a per-model preset
+  (LTX → per channel, ~7 % on its attention) needs no statistic at all. Not changed now: LTX's two marginal calls
+  sit above SageAttention 2.
+
+**A2, result** (`bench/graph_call.py`: 4131 tokens, 24 heads, fp16 in ComfyUI's layout, per token; 5 alternating
+rounds × 200 calls):
+
+| | GPU per call | CPU to issue a call |
+|---|---|---|
+| unica, eager | 1.336 ms | **0.916 ms** |
+| unica, CUDA graph replay | 1.291 ms (−0.045, −3.4 %) | 0.005 ms |
+| the kernel alone (bf16, inputs quantized beforehand) | 0.842 ms | 0.019 ms |
+| SDPA (torch 2.14.0+cu132 on Windows: built without flash attention; the default is the efficient kernel) | 5.33 ms | 0.022 ms |
+
+- **The microbench prediction missed low**: the graph saves 0.045 ms of GPU per call, not ≤ 0.02 (the ~8 launches of
+  a call leave gaps on the GPU even when the CPU runs ahead). Over Moss's 2520 calls: ~0.11 s, a sixth of its 0.63 s
+  gap to SDPA.
+- **What the graph really removes is the CPU**: an eager call costs 0.92 ms of Python and launches, 69 % of its GPU
+  time; SDPA's 0.02 ms. In the loop the GPU stays busy, but in ComfyUI the same thread also issues the rest of the
+  model: if the sampler is CPU-bound there, unica adds up to 2520 × 0.9 ≈ 2.3 s per render. cProfile of the call:
+  0.4 ms in `in_pieces` itself (fp16 input goes through it: the bf16 copies, the slice-assign of the output), 0.15 ms
+  in the three `.to(bfloat16)`, 0.15 ms in the five ctypes launches, 0.1 ms in `rope_stats`.
+- **Not settled: the SDPA it is compared to.** SDPA here takes 5.3 ms per call (the same in ComfyUI's venv; the
+  cuDNN backend 2.4 ms in bf16), against unica's 1.3 ms. If Moss's calls had this signature, SDPA alone would take
+  2520 × 5.3 ≈ 13 s of a 10.7 s sampler. So the signature (24 heads is assumed, "Moss-sized" in M4.39) or ComfyUI's
+  attention path for Moss is not what this bench runs. Before any graph or host-time work, the real call has to be
+  read from a render: heads, dtype, layout, and the GPU's busy share during sampling (CPU-bound or not).
+
+**A3, result** (`build/m445_a3.txt`; attention_int8pv_tma with TRACE=1, whose point 2 now marks P·V done, after the
+flush; the default build's SASS unchanged). Three WAN dumps (2 heads × 34,020) and random data, the 12 blocks SM 0
+ran, every tile:
+
+| call | a warp waits for the block's slowest P·V | median tile / worst tile | all four, from the last P·V to the next tile |
+|---|---|---|---|
+| WAN call 14 | 7.1 % of warp time | 7.5 / 25 % | 10.6 % |
+| WAN call 28 | 10.8 % | 7.6 / 75 % | 6.2 % |
+| WAN call 42 | 6.6 % | 7.6 / 25 % | 6.2 % |
+| random | 8.0 % | 7.6 % | 5.8 % |
+
+- **The wait held** (predicted 5–10 % of a warp's tile time): 6.6–10.8 %. It is the same on random data, whose work
+  is the same in every warp: it is not data-dependent work but warps drifting apart (they share their schedulers
+  with the other block's), which the barrier pulls back together every tile. On top, all four stand together 6–11 %
+  of the time between the last P·V and the next tile (the wait for the copy, the barrier, thread 0's TMA issue).
+- How much the tensor pipe loses to it cannot be read from the trace: the other block's warps use part of it.
+  M3.19 is the experiment that answers it, and it lost: without the barrier the drift came back as waits for data,
+  because thread 0, a computing warp, issues the copies late.
+- **Checked by compiling:** `setmaxnreg` exists on sm_120a (`USETMAXREG.DEALLOC` / `TRY_ALLOC`, as on sm_90a and
+  sm_100a). That is FlashAttention 3's answer to M3.19, and M3.19 ruled it out on registers alone ("a fifth warp at
+  244 registers would leave 1 block per SM"). With it, a block of 256 threads launched at 128 registers each
+  (2 blocks per SM: 2 × 256 × 128 = 64 K) can give its producer warpgroup 24 and its four computing warps 232:
+  128 × 24 + 128 × 232 = 32,768, exactly the block's share. The kernel uses 235 today (231–233 in some builds), so 232
+  is within reach. Not yet checked: that the card runs it, and that ptxas allocates up to 232 after the increase.
+- **A3b, the next hypothesis (not started):** a producer warpgroup issues every copy and waits on per-buffer "empty"
+  barriers; the computing warps wait only on "full" barriers, never on each other. The drift is absorbed up to one
+  tile (two stages), so most of the 7–11 % per-warp wait, and part of the common 6–11 %, could go. Upper bound
+  ~10 %; costs: the empty-barrier arrivals (M3.19: +30 instructions per tile with the try_wait rounds), 232 registers
+  instead of 235. A rewrite of the kernel's loop, so it needs its own decision.

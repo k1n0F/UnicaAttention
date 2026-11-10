@@ -1868,13 +1868,14 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
                 beta[1] = skipped ? 0.0f : beta[1];
             }
             TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
-            TRACE_MARK_AFTER(slot, lane, t, 2, __float_as_uint(beta[0]) ^ __float_as_uint(beta[1]));
             uint32_t p[PV8_STEPS][4];
 #pragma unroll
             for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
             TRACE_MARK_AFTER(slot, lane, t, 3, p[0][0] ^ p[0][1] ^ p[0][2] ^ p[0][3] ^ p[1][0] ^ p[1][1] ^ p[1][2] ^ p[1][3]);
             if constexpr (!UNICA_V_TOKEN) add_row_sum_u8(row_sum, p, alpha, beta);
             if (!skipped) pv_int8<UNICA_V_PAIRS>(out, p, v_tiles[now], alpha, beta, lane);
+            // M4.45 A3: point 2 here is P·V done (out flushed), where the warp heads for the barrier
+            TRACE_MARK_AFTER(slot, lane, t, 2, __float_as_uint(out[0][0]) ^ __float_as_uint(out[D_BLOCKS - 1][3]));
         }
 
         const int next_valid = n_keys - key0 - KEYS_PER_TILE;  // ≤ 0 in the last iteration: all masked
