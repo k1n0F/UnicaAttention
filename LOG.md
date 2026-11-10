@@ -3964,3 +3964,55 @@ which the copy already made moot). Hypothesis: 0…+2 % slower, rel L2 the same 
 against 91.5 ms, inside that run's 6 % spread), rel L2 1.58 % in both: held, no gain. Not kept.
 
 The shipped per-token cubin (unica/cubins) is from before this change; the next wheel rebuilds it.
+
+## M4.42 — frame-wide tiles for the hires decode, in the render
+
+M4.40 measured the hires decode apart from ComfyUI: whole, it needs 15.15 GiB and overflows a 16 GiB card that also
+holds a desktop; two frame-wide tiles take ~29 s at 11.3 GiB, three take ~32 s at 7.7 GiB, both at 55–57 dB against
+the whole decode. Now the same in the render, by the ComfyUI agent, "wan stable work" as in M4.37's clean A/B
+(encoder on the GPU, RIFE VFI (Unica)), the workflow file untouched (981's settings set in memory).
+
+Plan:
+1. One full render, untiled, to warm the process up; then the same graph queued again with only 981's settings
+   changed: untiled, two tiles (896 / 768 px, stride 464 / 752), three tiles (896 / 512, stride 464 / 424), untiled
+   again. ComfyUI's cache reruns only 981 and what follows it. For each: 981's time, the VRAM in use and the WDDM
+   shared memory at its start and at peak, the GPU's power; frames 0, 56 and 112 of 981's output saved as PNG.
+2. Two full renders with the tiling chosen from step 1, in the same process.
+
+Hypotheses, written before the runs:
+- H1: the untiled 981 is fast (≤ 35 s) only when the free VRAM at its start covers its 15.15 GiB peak, and slow
+  (≥ 60 s) when ≥ 0.5 GiB of it lands in shared memory; its time follows that overflow, not the age of the process.
+- H2: two tiles: 29 ± 4 s in every run, three tiles 32 ± 4 s, shared memory flat during 981.
+- H3: the tiled frames against the untiled ones (PNG, 8 bits): PSNR ≥ 50 dB (M4.40: 54.8–57.0 over the video).
+- H4: Nomos, RIFE and VideoCombine take the same time within their run-to-run noise: 981's output is the same size.
+- H5: in the two full renders 981 takes ≤ 33 s, and each render is 0–55 s shorter than an untiled one of the same
+  process (0 when the untiled decode happened to fit, ~55 s when it did not).
+
+**Step 1** (ComfyUI agent, seed 42, suffix r6; W a full render, then U1, T2, T3, U2 re-queued with only 981
+changed; VRAM is nvidia-smi's, desktop included, ~1.4 GiB idle; files build/m442_*):
+
+| run | 981 | VRAM start → peak | shared start → peak | power mean / max | Nomos | RIFE | VideoCombine |
+|---|---|---|---|---|---|---|---|
+| W, untiled, full render | 28.0 s | 14.98 → 15.54 GiB | 21.65 → 23.25 GiB | 219 / 265 W | 21.3 s | 54.4 s | 28.9 s |
+| U1, untiled | 25.7 s | 1.74 → 15.39 | 21.21 → 21.21 | 226 / 252 | 18.3 | 38.4 | 39.7 |
+| T2, two tiles | 31.5 s | 3.72 → 13.59 | flat | 238 / 253 | 16.0 | 28.4 | 25.1 |
+| T3, three tiles | 34.8 s | 3.69 → 9.92 | flat | 239 / 251 | 16.5 | 27.2 | 22.7 |
+| U2, untiled again | **47.5 s** | 3.67 → 15.48 | 21.20 → **22.85** | **155** / 188 | 19.8 | 28.1 | 24.2 |
+
+PSNR against U1 (frames 0 / 56 / 112): W and U2 bit-identical; T2 55.8 / 53.2 / 52.7 dB; T3 54.4 / 51.4 / 51.2 dB.
+In U1 the high-noise sampler 934 ran again after 981 (likely dropped from the cache under RAM pressure, RSS 47.5 GiB);
+981's numbers are not touched by it.
+
+- H1 half held. The untiled decode fits in ComfyUI more often than M4.40 implied: it peaked at 15.4–15.5 GiB of the
+  card with the desktop, so its own need in ComfyUI is ~14 GiB, not 15.15 (the bench's figure is torch's reserved
+  peak under the default allocator; ComfyUI's allocator and the smaller desktop of this run leave it under the
+  card). It is close to the edge either way: U2, the same decode as U1 to the bit, spilled 1.65 GiB and took 47.5 s
+  at 155 W. Shared growth alone does not mark a slow run: in W it grew by 1.6 GiB and 981 still took 28.0 s at
+  219 W, so WDDM moved something else out (staged weights) and the decode stayed in the VRAM. What decides is whose
+  memory is demoted, not the age of the process.
+- H2 held: two tiles 31.5 s, three 34.8 s, shared flat, power 238–239 W.
+- H3 held: 52.7–55.8 and 51.2–54.4 dB.
+- H4 held: Nomos, RIFE and VideoCombine move with the run, not with the tiling (RIFE 54 s in W, 27–38 s after).
+
+Every untiled 981 measured so far (M4.36–M4.42): 80.8, 88.6, 83.6, 69.1, 26.4, 33.8, 31.0, 41.6, 28.0, 25.7, 47.5 s;
+mean 50.6 s, half of them ≥ 41 s. Two tiles cost 4–6 s when the untiled decode fits and save 16–57 s when it does not.
