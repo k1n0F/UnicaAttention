@@ -62,6 +62,12 @@ constexpr int MMA_K = 16;
 #define UNICA_SKIP_TILES 0
 #endif
 static_assert(!(UNICA_SKIP_TILES && UNICA_V_TOKEN), "SKIP_TILES is measured for V per channel only");
+// M4.44 H5: n > 0 lets the whole block of attention_int8pv_tma skip a tile (all but its Q·Kᵀ) when every row of all
+// its warps lies below its running max by more than n, decided a tile ahead. 0 skips nothing. V per channel only.
+#ifndef UNICA_SKIP_BLOCKS
+#define UNICA_SKIP_BLOCKS 0
+#endif
+static_assert(!(UNICA_SKIP_BLOCKS && (UNICA_V_TOKEN || UNICA_SKIP_TILES)), "SKIP_BLOCKS: V per channel, not with SKIP_TILES");
 
 constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 128;                      // WAN 2.2
@@ -1008,7 +1014,37 @@ __device__ __forceinline__ void online_softmax_u8(float scores[KEY_BLOCKS][4], f
 
 // M4.44: a skipped tile (UNICA_SKIP_TILES) leaves the denominator as it is, which needs it gathered by add_row_sum_u8
 // after packing, not by online_softmax_u8 before the skip is decided.
-static_assert(!UNICA_SKIP_TILES || UNICA_SUM_ROUNDED, "SKIP_TILES needs SUM_ROUNDED");
+static_assert(!(UNICA_SKIP_TILES || UNICA_SKIP_BLOCKS) || UNICA_SUM_ROUNDED, "SKIP_* needs SUM_ROUNDED");
+
+// M4.44 H5: the tile max of both rows, scaled to log2 units, as online_softmax_u8 takes it.
+__device__ __forceinline__ void tile_max_log2(const float scores[KEY_BLOCKS][4], float tile_max[2], float scale_log2) {
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        tile_max[half] = -CUDART_INF_F;
+#pragma unroll
+        for (int block = 0; block < KEY_BLOCKS; ++block)
+            tile_max[half] = fmaxf(tile_max[half], fmaxf(scores[block][2 * half], scores[block][2 * half + 1]));
+        tile_max[half] = quad_max(tile_max[half]) * scale_log2;
+    }
+}
+
+// M4.44 H5: online_softmax_u8 (SUM_ROUNDED) with the tile max taken a tile earlier, by tile_max_log2. A copy, so that
+// the default build keeps its SASS.
+__device__ __forceinline__ void online_softmax_u8_premax(float scores[KEY_BLOCKS][4], const float tile_max[2],
+                                                         float row_max[2], float alpha[2], float beta[2], float scale_log2) {
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const float new_max = fmaxf(row_max[half], tile_max[half]);
+        alpha[half] = exp2_ftz(row_max[half] - new_max);
+        beta[half] = exp2_ftz(tile_max[half] - new_max);
+        const float offset = LOG2_255 - tile_max[half];
+#pragma unroll
+        for (int block = 0; block < KEY_BLOCKS; ++block)
+#pragma unroll
+            for (int i = 2 * half; i < 2 * half + 2; ++i) scores[block][i] = exp2_ftz(fmaf(scores[block][i], scale_log2, offset));
+        row_max[half] = new_max;
+    }
+}
 
 // M3.15: row_sum = row_sum · alpha + (Σ P̂) · beta over the rounded u8 P̂ the mma uses, after packing. IDP4A adds
 // four bytes at once, exact in int32: registers 0 and 2 of a step hold this lane's part of row r, 1 and 3 of
@@ -1771,6 +1807,13 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     qk_scores_int8_q_smem(scores[0], q_tiles[warp], k_tiles[0], lane);
     if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
     [[maybe_unused]] const int slot = TRACE_SLOT(lane);
+    // M4.44 H5: next_max is the tile max of the tile in scores[t % 2], taken when its Q·Kᵀ was done. negligible[t % 2]
+    // holds each warp's vote on tile t, written in iteration t − 1, read after iteration t's barrier; the slot is
+    // written again for t + 2 only after the next barrier, when every warp has read it.
+    [[maybe_unused]] float next_max[2];
+    __shared__ __align__(4) uint8_t negligible[2][WARPS_PER_BLOCK];
+    static_assert(!UNICA_SKIP_BLOCKS || WARPS_PER_BLOCK == 4, "the four votes are read as one word");
+    if constexpr (UNICA_SKIP_BLOCKS > 0) tile_max_log2(scores[0], next_max, q_scale_log2 * k_scale[0]);
 
     // As in attention_int8pv_pipe. Iteration t reads K(t + 1) and V(t), issued in iteration t − 1 (or the
     // prologue), and issues K(t + 2) into the K buffer of t and V(t + 1) into the other V buffer.
@@ -1788,45 +1831,62 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         }
 
         TRACE_MARK(slot, lane, t, 0);
-        float alpha[2], beta[2];
-        bool skipped = false;  // M4.44: stays false unless UNICA_SKIP_TILES
-        [[maybe_unused]] float4 tok[KEY_BLOCKS];
-        if constexpr (UNICA_V_TOKEN && !TOKEN_TILES) {  // from L2: every block of the head reads the same
-            const float4* pairs = v_token + (size_t(blockIdx.y) * v8_tokens(n_keys) + key0 + col) / 2;
+        bool skip_block = false;  // M4.44 H5: all four warps voted tile t negligible
+        if constexpr (UNICA_SKIP_BLOCKS > 0)
+            skip_block = t > 0 && *reinterpret_cast<const uint32_t*>(negligible[now]) == 0x01010101u;
+        if (skip_block) {
+            qk_scores_int8_q_smem(scores[later], q_tiles[warp], k_tiles[later], lane);
+        } else {
+            float alpha[2], beta[2];
+            bool skipped = false;  // M4.44: stays false unless UNICA_SKIP_TILES
+            [[maybe_unused]] float4 tok[KEY_BLOCKS];
+            if constexpr (UNICA_V_TOKEN && !TOKEN_TILES) {  // from L2: every block of the head reads the same
+                const float4* pairs = v_token + (size_t(blockIdx.y) * v8_tokens(n_keys) + key0 + col) / 2;
 #pragma unroll
-            for (int block = 0; block < KEY_BLOCKS; ++block) tok[block] = __ldg(pairs + block * MMA_N / 2);
-        }
-        qk_scores_int8_q_smem(scores[later], q_tiles[warp], k_tiles[later], lane);  // stale in the last iteration
-        if constexpr (TOKEN_TILES)  // M4.41: landed with V(t), in this tile's buffer
-            online_softmax_u8_token<MMA_N / 2>(scores[now], row_max, row_sum, alpha, beta,
-                                               q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], &tok_tiles[now][lane % 4]);
-        else if constexpr (UNICA_V_TOKEN)
-            online_softmax_u8_token<1>(scores[now], row_max, row_sum, alpha, beta,
-                                       q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], tok);
-        else
-            online_softmax_u8(scores[now], row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
-        // M4.44: beta = 2^(tile max − running max) < 2^−n in both rows means the tile did not move the max (alpha is 1)
-        // and weighs < 2^−n: the warp skips its P·V and the flush, and beta = 0 makes add_row_sum_u8 add nothing. The
-        // only branch is the one before P·V, where pv_int8's rescale vote has one already: a branch earlier splits the
-        // softmax from Q·Kᵀ(t + 1) into separate basic blocks, and ptxas no longer interleaves the two (+3…5 % with
-        // nothing skipped, measured).
-        if constexpr (UNICA_SKIP_TILES > 0) {
-            skipped = __all_sync(0xffffffff, beta[0] < 0x1p0f / (1 << UNICA_SKIP_TILES) &&
-                                                 beta[1] < 0x1p0f / (1 << UNICA_SKIP_TILES));
-            beta[0] = skipped ? 0.0f : beta[0];
-            beta[1] = skipped ? 0.0f : beta[1];
-        }
-        TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
-        TRACE_MARK_AFTER(slot, lane, t, 2, __float_as_uint(beta[0]) ^ __float_as_uint(beta[1]));
-        uint32_t p[PV8_STEPS][4];
+                for (int block = 0; block < KEY_BLOCKS; ++block) tok[block] = __ldg(pairs + block * MMA_N / 2);
+            }
+            qk_scores_int8_q_smem(scores[later], q_tiles[warp], k_tiles[later], lane);  // stale in the last iteration
+            if constexpr (TOKEN_TILES)  // M4.41: landed with V(t), in this tile's buffer
+                online_softmax_u8_token<MMA_N / 2>(scores[now], row_max, row_sum, alpha, beta,
+                                                   q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], &tok_tiles[now][lane % 4]);
+            else if constexpr (UNICA_V_TOKEN)
+                online_softmax_u8_token<1>(scores[now], row_max, row_sum, alpha, beta,
+                                           q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], tok);
+            else if constexpr (UNICA_SKIP_BLOCKS > 0)
+                online_softmax_u8_premax(scores[now], next_max, row_max, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
+            else
+                online_softmax_u8(scores[now], row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
+            // M4.44: beta = 2^(tile max − running max) < 2^−n in both rows means the tile did not move the max (alpha is 1)
+            // and weighs < 2^−n: the warp skips its P·V and the flush, and beta = 0 makes add_row_sum_u8 add nothing. The
+            // only branch is the one before P·V, where pv_int8's rescale vote has one already: a branch earlier splits the
+            // softmax from Q·Kᵀ(t + 1) into separate basic blocks, and ptxas no longer interleaves the two (+3…5 % with
+            // nothing skipped, measured).
+            if constexpr (UNICA_SKIP_TILES > 0) {
+                skipped = __all_sync(0xffffffff, beta[0] < 0x1p0f / (1 << UNICA_SKIP_TILES) &&
+                                                     beta[1] < 0x1p0f / (1 << UNICA_SKIP_TILES));
+                beta[0] = skipped ? 0.0f : beta[0];
+                beta[1] = skipped ? 0.0f : beta[1];
+            }
+            TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
+            TRACE_MARK_AFTER(slot, lane, t, 2, __float_as_uint(beta[0]) ^ __float_as_uint(beta[1]));
+            uint32_t p[PV8_STEPS][4];
 #pragma unroll
-        for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
-        TRACE_MARK_AFTER(slot, lane, t, 3, p[0][0] ^ p[0][1] ^ p[0][2] ^ p[0][3] ^ p[1][0] ^ p[1][1] ^ p[1][2] ^ p[1][3]);
-        if constexpr (!UNICA_V_TOKEN) add_row_sum_u8(row_sum, p, alpha, beta);
-        if (!skipped) pv_int8<UNICA_V_PAIRS>(out, p, v_tiles[now], alpha, beta, lane);
+            for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
+            TRACE_MARK_AFTER(slot, lane, t, 3, p[0][0] ^ p[0][1] ^ p[0][2] ^ p[0][3] ^ p[1][0] ^ p[1][1] ^ p[1][2] ^ p[1][3]);
+            if constexpr (!UNICA_V_TOKEN) add_row_sum_u8(row_sum, p, alpha, beta);
+            if (!skipped) pv_int8<UNICA_V_PAIRS>(out, p, v_tiles[now], alpha, beta, lane);
+        }
 
         const int next_valid = n_keys - key0 - KEYS_PER_TILE;  // ≤ 0 in the last iteration: all masked
         if (next_valid < KEYS_PER_TILE) mask_scores(scores[later], col, next_valid);
+        if constexpr (UNICA_SKIP_BLOCKS > 0) {  // the vote on tile t + 1, against the running max after tile t
+            if (t + 1 < n_tiles) {
+                tile_max_log2(scores[later], next_max, q_scale_log2 * k_scale[(key0 + KEYS_PER_TILE) / K_SCALE_BLOCK]);
+                const bool low = next_max[0] < row_max[0] - UNICA_SKIP_BLOCKS && next_max[1] < row_max[1] - UNICA_SKIP_BLOCKS;
+                const bool all = __all_sync(0xffffffff, low);
+                negligible[later][warp] = all;  // every lane the same byte: no branch, no reconvergence
+            }
+        }
     };
 
     int t = 0;

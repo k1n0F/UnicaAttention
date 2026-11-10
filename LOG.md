@@ -4183,3 +4183,45 @@ it (`build/m444_h3_emulator.txt`):
   tile's largest P' to a few steps or to 0, and the denominator multiplies that back by its large 1 / s_j: the
   rounding error grows by the same factor. Per channel has no such factor. This is why M4.23 summed in float.
 - Predicted "within ±0.01 pp": wrong by up to 40×, and over the +0.2 pp budget on Z-Image, LTX and Qwen. Not built.
+
+**H5 (from H1's result): the whole block skips, decided a tile ahead.** H1 lost to two costs: the warp that skips
+waits at the block's barrier, and the branch in the middle of the tile costs +3 %. Both go if the block of 64 rows
+decides together, before the tile starts. Q·Kᵀ(t + 1) is computed in iteration t, so its tile max can be taken
+there; each warp writes "negligible" to shared memory before the barrier that iteration t + 1 has anyway, and after
+it the whole block either runs the tile or branches over all of it (exponents, packing, P·V, flush), at the top of
+the iteration, where the branch does not split the body. Hypotheses, written before the emulator:
+- the share of (64-row block, tile) pairs negligible at 2⁻¹⁰ is about half of H1's per-warp share (M4.7 at 2⁻¹²: 3.1
+  against 6.1 % mean): WAN ~5 %, Qwen ~8 %, Z-Image ~10 %, Moss ~10 %, LTX 0;
+- a skipped block-tile saves ~55 % of its time (all but Q·Kᵀ and the barrier), with no cost when nothing is skipped:
+  kernel WAN −2…−3 %, Qwen, Z-Image and Moss −4…−6 %, LTX 0 ± 0.5 %;
+- the error rises less than H1's (fewer tiles skipped).
+
+H5, the emulator (`build/m444_h5.txt`, the same 30 calls, blocks of 64 rows): share of block-tiles skipped at 2⁻¹⁰,
+median (mean), and the worst error rise: WAN 0.7 (4.1) %, +0.025 pp; Z-Image 0.0 (14.9) %, +0.011 pp (two calls carry
+it); LTX 0 %; Qwen 8.9 (8.5) %, +0.002 pp; Moss 10.1 (11.7) %, +0.002 pp. At 2⁻¹²: WAN 1.4, Z-Image 11.2, Qwen 4.3, Moss
+6.5 % (means). **The share held** (predicted WAN ~5, Qwen ~8, Z-Image ~10, Moss ~10 %), and the error rises 3–15× less
+than per warp. By the 55 % per skipped tile: WAN −2 %, Qwen −5 %, Moss −6 %, Z-Image −8 % on average (0 on most of its
+calls, ~−30 % on the sharp ones). On to the kernel.
+
+**H5 in the kernel** (`SKIP_BLOCKS=n`, default 0, whose build is bit for bit the shipped one). The tile max of tile
+t + 1 is taken in iteration t, right after its Q·Kᵀ and mask (moved, not added: the softmax then takes it as
+given); each warp votes, every lane writes the warp's byte, and after iteration t + 1's barrier the block reads the
+four bytes as one word and either runs the tile as before or does only Q·Kᵀ(t + 2). 231 registers, no spill; the
+running path keeps the `QEQEEQ…` interleave. tests/test_attention.py covers both SKIP settings.
+
+`bench/skip_tiles.py 10 6 12 SKIP_BLOCKS` (`build/m444_h5_kernel_24heads.txt`), on / off, mean (best … worst):
+WAN 1.009 (0.981 … 1.039), Z-Image 0.997 (0.895 … 1.047), LTX 1.022 (1.005 … 1.036), Qwen 0.997 (0.975 … 1.025), Moss
+0.996 (0.955 … 1.025). The errors rise by ≤ 0.026 pp (WAN call 70), 3× less than H1's.
+
+- **Wrong where it mattered:** "no cost when nothing is skipped" did not hold. The calls with nothing skipped are
+  +2.4…+4.7 % (LTX, Z-Image's flat calls, WAN calls 7, 14, 28), as with H1. The loop per tile gains ~7 MOV (the
+  registers of `scores[later]` brought together after the two paths), a BSSY / BSYNC pair (the reconvergence of the
+  if / else itself; writing the vote from every lane instead of lane 0 removed only 2 ISETP), the LDS and compare of
+  the vote, address arithmetic: ~15–20 instructions on 467.
+- A skipped block-tile saves what was predicted: Z-Image call 630 −10.5 % with ~4.7 % over it, i.e. ~15 % for the
+  share it skips; but the average share (4–15 %) does not pay the 3 % toll.
+- **What H1 and H5 say together:** in this kernel (231–238 of 255 registers), a data-dependent branch inside the tile
+  loop costs ~3 % on its own, through the register moves ptxas adds around it, whichever place it sits. Skipping wins
+  only where it skips more than ~20–25 % of the work on average; the real calls skip 4–15 % (blocks) or 11–21 %
+  (warps, with the barrier eating half). Both stay as options, default 0. The next lever is not another place for
+  the branch but a call that knows in advance: a whole head or call that is sharp could take a separate build.

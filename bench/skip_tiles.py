@@ -1,8 +1,8 @@
-"""M4.44 H1: attention_int8pv_tma with SKIP_TILES=0 and =N on real q, k, v (build/dumps/), the kernel alone on its own
+"""M4.44 H1 / H5: attention_int8pv_tma with SKIP_TILES (or SKIP_BLOCKS) =0 and =N on real q, k, v (build/dumps/), the kernel alone on its own
 inputs, the two settings taking turns in one process. For each dumped call: the median time of each setting, their
 ratio, and the rel L2 of each against FP32.
 
-    uv run python bench/skip_tiles.py [N=10] [calls per model=6] [head copies=1]
+    uv run python bench/skip_tiles.py [N=10] [calls per model=6] [head copies=1] [SKIP_TILES | SKIP_BLOCKS]
 
 The dumps hold 2 heads: a small model's call is then less than one wave of blocks, and a warp that skips frees issue
 slots no other block can take. Head copies > 1 repeats them, for a real call's number of blocks; the error is taken on
@@ -24,6 +24,7 @@ MODELS = ["wan_call", "zimage_call", "ltx23_call", "qwen_edit_call", "moss_call"
 SKIP = int(sys.argv[1]) if len(sys.argv) > 1 else 10
 PER_MODEL = int(sys.argv[2]) if len(sys.argv) > 2 else 6
 COPIES = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+SETTING = sys.argv[4] if len(sys.argv) > 4 else "SKIP_TILES"
 ROUNDS, CALLS = 6, 20
 KERNEL = "attention_int8pv_tma"
 
@@ -43,7 +44,7 @@ def timed(q, k, v, inputs, **tile) -> float:
 
 def main():
     files = sorted(os.listdir(DUMPS))
-    print(f"SKIP_TILES={SKIP}, {ROUNDS} alternating rounds × median of {CALLS}, heads × {COPIES}")
+    print(f"{SETTING}={SKIP}, {ROUNDS} alternating rounds × median of {CALLS}, heads × {COPIES}")
     print(f"{'call':26} {'tokens':>7} {'off ms':>8} {'on ms':>8} {'on/off':>7} {'err off':>8} {'err on':>8}", flush=True)
     ratios = {}
     for prefix in MODELS:
@@ -52,13 +53,13 @@ def main():
             dump = torch.load(DUMPS / f, map_location="cpu")
             q, k, v = (dump[x].cuda().bfloat16() for x in "qkv")
             ref = reference(q.float(), k.float(), v.float())
-            err = {s: errors(unica.attention(q, k, v, KERNEL, SKIP_TILES=s).float(), ref)["rel_l2"] for s in (0, SKIP)}
+            err = {s: errors(unica.attention(q, k, v, KERNEL, **{SETTING: s}).float(), ref)["rel_l2"] for s in (0, SKIP)}
             q, k, v = (x.repeat(1, COPIES, 1, 1) for x in (q, k, v))
             inputs = unica.kernel_inputs(q, k, v, KERNEL)
             times = {0: [], SKIP: []}
             for round_ in range(ROUNDS):
                 for s in ((0, SKIP) if round_ % 2 == 0 else (SKIP, 0)):
-                    times[s].append(timed(q, k, v, inputs, SKIP_TILES=s))
+                    times[s].append(timed(q, k, v, inputs, **{SETTING: s}))
             off, on = statistics.median(times[0]), statistics.median(times[SKIP])
             ratios.setdefault(prefix, []).append(on / off)
             print(f"{f[:26]:26} {q.shape[2]:7} {off:8.3f} {on:8.3f} {on / off:7.3f} {100 * err[0]:8.3f} "

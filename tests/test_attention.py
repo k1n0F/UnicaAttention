@@ -163,26 +163,28 @@ def test_both_denominators_match_their_emulator():
 
 
 def test_skipped_tiles_are_the_emulators():
-    # M4.44: random attention has no negligible tile, so SKIP_TILES leaves it bit for bit. Sharp attention whose 16 rows
-    # of a warp are alike (q · 8, one query per warp plus noise) has many: the kernel skips them as the emulator does.
+    # M4.44: random attention has no negligible tile, so SKIP_TILES (a warp alone) and SKIP_BLOCKS (the block of 64
+    # rows) leave it bit for bit. Sharp attention whose rows are alike in groups of 16 or 64 (q · 8, one query per
+    # group plus noise) has many: the kernel skips them as the emulator does.
     import emulate as emulator
     torch.manual_seed(9)
     q, k, v = (torch.randn(1, 2, 1000, 128, device="cuda") for _ in range(3))
     q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
     inputs = unica.kernel_inputs(q, k, v, "attention_int8pv_tma")
     plain = unica.attention(q, k, v, "attention_int8pv_tma", inputs)
-    assert torch.equal(unica.attention(q, k, v, "attention_int8pv_tma", inputs, SKIP_TILES=10), plain)
+    for setting, rows in (("SKIP_TILES", 16), ("SKIP_BLOCKS", 64)):
+        assert torch.equal(unica.attention(q, k, v, "attention_int8pv_tma", inputs, **{setting: 10}), plain), setting
 
-    sharp = ((q.float()[:, :, ::16].repeat_interleave(16, 2)[:, :, :1000] + 0.1 * q.float()) * 8).bfloat16()
-    stats, rows = {}, emulator.SKIP_ROWS
-    emulator.SKIP_ROWS = 16  # a warp decides alone
-    try:
-        emulated = emulate(sharp, k, v, **EMULATED["attention_int8pv_tma"], skip_below=2**-10, stats=stats)
-    finally:
+        sharp = ((q.float()[:, :, ::rows].repeat_interleave(rows, 2)[:, :, :1000] + 0.1 * q.float()) * 8).bfloat16()
+        stats, block_rows = {}, emulator.SKIP_ROWS
         emulator.SKIP_ROWS = rows
-    assert stats["skipped"] > 0.1 * stats["pairs"], stats
-    out = unica.attention(sharp, k, v, "attention_int8pv_tma", SKIP_TILES=10)
-    assert errors(out.float(), emulated)["rel_l2"] < MAX_FROM_EMULATOR
+        try:
+            emulated = emulate(sharp, k, v, **EMULATED["attention_int8pv_tma"], skip_below=2**-10, stats=stats)
+        finally:
+            emulator.SKIP_ROWS = block_rows
+        assert stats["skipped"] > 0.1 * stats["pairs"], (setting, stats)
+        out = unica.attention(sharp, k, v, "attention_int8pv_tma", **{setting: 10})
+        assert errors(out.float(), emulated)["rel_l2"] < MAX_FROM_EMULATOR, setting
 
 
 def test_trace_build_changes_nothing_but_time():
