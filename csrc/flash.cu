@@ -55,6 +55,13 @@ constexpr int MMA_K = 16;
 #ifndef UNICA_SUM_ROUNDED
 #define UNICA_SUM_ROUNDED 1
 #endif
+// M4.44: n > 0 lets a warp of attention_int8pv_tma skip P·V (and the packing and row sum before it) of a tile in which
+// every one of its 16 rows has its tile max below its running max by more than n (log2): every p < 2^−n of the row's largest.
+// 0 skips nothing. V per channel only: with V_TOKEN the denominator Σ P' / s is not bounded by the max of P'.
+#ifndef UNICA_SKIP_TILES
+#define UNICA_SKIP_TILES 0
+#endif
+static_assert(!(UNICA_SKIP_TILES && UNICA_V_TOKEN), "SKIP_TILES is measured for V per channel only");
 
 constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 128;                      // WAN 2.2
@@ -999,6 +1006,10 @@ __device__ __forceinline__ void online_softmax_u8(float scores[KEY_BLOCKS][4], f
     }
 }
 
+// M4.44: a skipped tile (UNICA_SKIP_TILES) leaves the denominator as it is, which needs it gathered by add_row_sum_u8
+// after packing, not by online_softmax_u8 before the skip is decided.
+static_assert(!UNICA_SKIP_TILES || UNICA_SUM_ROUNDED, "SKIP_TILES needs SUM_ROUNDED");
+
 // M3.15: row_sum = row_sum · alpha + (Σ P̂) · beta over the rounded u8 P̂ the mma uses, after packing. IDP4A adds
 // four bytes at once, exact in int32: registers 0 and 2 of a step hold this lane's part of row r, 1 and 3 of
 // row r + 8. The float P are then dead once packed, where the FADD of their sum kept 32 of them alive into
@@ -1778,6 +1789,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
 
         TRACE_MARK(slot, lane, t, 0);
         float alpha[2], beta[2];
+        bool skipped = false;  // M4.44: stays false unless UNICA_SKIP_TILES
         [[maybe_unused]] float4 tok[KEY_BLOCKS];
         if constexpr (UNICA_V_TOKEN && !TOKEN_TILES) {  // from L2: every block of the head reads the same
             const float4* pairs = v_token + (size_t(blockIdx.y) * v8_tokens(n_keys) + key0 + col) / 2;
@@ -1793,6 +1805,17 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
                                        q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK], tok);
         else
             online_softmax_u8(scores[now], row_max, row_sum, alpha, beta, q_scale_log2 * k_scale[key0 / K_SCALE_BLOCK]);
+        // M4.44: beta = 2^(tile max − running max) < 2^−n in both rows means the tile did not move the max (alpha is 1)
+        // and weighs < 2^−n: the warp skips its P·V and the flush, and beta = 0 makes add_row_sum_u8 add nothing. The
+        // only branch is the one before P·V, where pv_int8's rescale vote has one already: a branch earlier splits the
+        // softmax from Q·Kᵀ(t + 1) into separate basic blocks, and ptxas no longer interleaves the two (+3…5 % with
+        // nothing skipped, measured).
+        if constexpr (UNICA_SKIP_TILES > 0) {
+            skipped = __all_sync(0xffffffff, beta[0] < 0x1p0f / (1 << UNICA_SKIP_TILES) &&
+                                                 beta[1] < 0x1p0f / (1 << UNICA_SKIP_TILES));
+            beta[0] = skipped ? 0.0f : beta[0];
+            beta[1] = skipped ? 0.0f : beta[1];
+        }
         TRACE_MARK_AFTER(slot, lane, t, 1, __float_as_uint(alpha[0]) ^ __float_as_uint(alpha[1]));
         TRACE_MARK_AFTER(slot, lane, t, 2, __float_as_uint(beta[0]) ^ __float_as_uint(beta[1]));
         uint32_t p[PV8_STEPS][4];
@@ -1800,7 +1823,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         for (int step = 0; step < PV8_STEPS; ++step) p_fragment_u8(p[step], scores[now], step);
         TRACE_MARK_AFTER(slot, lane, t, 3, p[0][0] ^ p[0][1] ^ p[0][2] ^ p[0][3] ^ p[1][0] ^ p[1][1] ^ p[1][2] ^ p[1][3]);
         if constexpr (!UNICA_V_TOKEN) add_row_sum_u8(row_sum, p, alpha, beta);
-        pv_int8<UNICA_V_PAIRS>(out, p, v_tiles[now], alpha, beta, lane);
+        if (!skipped) pv_int8<UNICA_V_PAIRS>(out, p, v_tiles[now], alpha, beta, lane);
 
         const int next_valid = n_keys - key0 - KEYS_PER_TILE;  // ≤ 0 in the last iteration: all masked
         if (next_valid < KEYS_PER_TILE) mask_scores(scores[later], col, next_valid);

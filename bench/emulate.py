@@ -223,10 +223,11 @@ def emulate(
     smooth_q  None | "head" | n: subtract the mean of Q over the head's queries ("head") or over each block of n
               queries before quantizing it, and add q̄ · k back to the scores, exactly (float, unquantized k): it
               varies along the keys, so softmax does not cancel it. With "head" it is one vector per key (M4.20)
-    v_token   None | "rounded" | "float": V (v_fmt) with one scale s_j per token over its channels instead of one per
-              channel, folded into P as log2 s_j added to key j's scores, so P' = p · s_j goes into the MMA; the
-              denominator weighs P' back by 1 / s_j, summing it rounded (as sum_rounded) or in float before rounding
-              (M4.22: V's outlier tokens in Z-Image)
+    v_token   None | "rounded" | "rounded16" | "float": V (v_fmt) with one scale s_j per token over its channels instead
+              of one per channel, folded into P as log2 s_j added to key j's scores, so P' = p · s_j goes into the MMA;
+              the denominator weighs P' back by 1 / s_j, summing it rounded (as sum_rounded) or in float before rounding
+              (M4.22: V's outlier tokens in Z-Image). "rounded16": rounded, with 1 / s_j itself in 16 bits against the
+              largest of its tile (M4.44)
     v_group   with v_token: one scale per group of this many neighbouring keys instead of per key (M4.24)
     v_outliers  T: the T keys of each head with the largest max |v| leave V before it is quantized (the channel
               scales come from the others); in the loop their P̂ still goes into the denominator, and their part of
@@ -337,7 +338,10 @@ def emulate(
         elif p_fmt:
             p = p_parts[0] = to_fmt(p, p_fmt)
         if sum_rounded:
-            weights = inv_s[..., None, j : j + bc] if v_token == "rounded" else 1.0
+            weights = inv_s[..., None, j : j + bc] if v_token in ("rounded", "rounded16") else 1.0
+            if v_token == "rounded16":  # M4.44 H3: 1 / s as u16 against the tile's largest, as dp2a takes it
+                top = weights.amax(-1, keepdim=True).clamp_min(1e-30)
+                weights = torch.round(weights / top * 65535) * (top / 65535)
             if v_token != "float":
                 row_sum = (p * weights).sum(-1, keepdim=True) / p_mul
         denominator = denominator * alpha + row_sum * beta * keep

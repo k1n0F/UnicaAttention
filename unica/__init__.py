@@ -47,9 +47,11 @@ DEFAULT_KERNEL = "attention_int8pv_tma"
 # per copy. V_TOKEN=1 (attention_int8pv_tma): V with one scale per token, folded into P (M4.23, V's outlier tokens).
 # V_OUTLIERS=T (attention_int8pv_tma, T ≤ 8): V per channel without each head's T largest keys, added exactly (M4.25).
 # TOKEN_COPY=0 (with V_TOKEN=1): the token scales read from L2 in the tile that uses them, not copied with V (M4.41).
+# SKIP_TILES=n (attention_int8pv_tma, V per channel): a warp skips P·V of a tile whose every p is below 2^−n of its row's
+# largest (M4.44); 0 skips nothing.
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
         "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0, "STAGES": 2, "BULK_COPY": 1, "SMOOTH_Q": 0, "BIAS_CHUNK": 32, "V_TOKEN": 0, "V_OUTLIERS": 0,
-        "TOKEN_COPY": 1}
+        "TOKEN_COPY": 1, "SKIP_TILES": 0}
 # M4.17: kernels that read q, k, v and write the output in the caller's layout (TokenLayout), e.g. ComfyUI's
 # [batch, tokens, heads, 128] seen as [batch, heads, tokens, 128] through a transpose. The others get contiguous copies.
 LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}

@@ -4016,3 +4016,170 @@ In U1 the high-noise sampler 934 ran again after 981 (likely dropped from the ca
 
 Every untiled 981 measured so far (M4.36–M4.42): 80.8, 88.6, 83.6, 69.1, 26.4, 33.8, 31.0, 41.6, 28.0, 25.7, 47.5 s;
 mean 50.6 s, half of them ≥ 41 s. Two tiles cost 4–6 s when the untiled decode fits and save 16–57 s when it does not.
+
+## M4.43 — the hand's blur in motion: SageAttention 2 instead of unica, and RIFE at scale 0.5
+
+In r6 of M4.42 the hand blurs while it moves. Is it the kernel (quantized attention), RIFE ×5, or WAN itself? The
+ComfyUI agent rendered "wan stable work" as W in M4.42 (seed 42, prompt r6, 981 untiled, RIFE VFI (Unica) rife49,
+×5, fast_mode, no ensemble) with only the attention changed: the loaders' "sageattn" (SageAttention 2.2.0), the
+unica node off. Then the same graph re-queued with RIFE's scale_factor 0.5. Sharpness is the variance of the
+Laplacian over a 320 px crop around the strongest motion of a frame pair.
+
+Hypotheses, written before the runs:
+- H1: the hand's sharpness with SA2 is within ±10 % of U1's (unica): the blur is WAN's. SA2 > 15 % sharper would
+  mean the kernel adds blur.
+- H2: with scale_factor 0.5 the in-betweens lose ≤ 12 % sharpness against their end frames instead of 20–25 %, and
+  RIFE takes no longer.
+
+| | U1 (unica) | SA2 | SA2 / U1 |
+|---|---|---|---|
+| frames 73 / 74, U1's crop | 692 / 717 | 740 / 810 | 1.07 / 1.13 |
+| U1's 20 strongest-motion crops, pairwise | | | median 1.13 (0.99 … 1.26) |
+| whole frame, every 8th frame, median | 654 | 650 | **0.99** |
+| the static third of the frame | 16.5 | 15.0 | 0.91 |
+
+The two videos are different renders (PSNR 24.7 dB between them): another attention changes the sampling path.
+
+- H1: **neither held nor refuted by the number.** In the moving crops SA2 reads 13 % higher, between the two
+  thresholds; over the whole frame the two are level (0.99), in the static part SA2 is lower (0.91). The crops show
+  why the moving number is not sharpness: both hands are smeared the same way, and SA2's smear has streaks (high
+  frequencies, which raise the Laplacian). The blur is in SA2's frames as much as in unica's: it comes from WAN
+  (16 fps, 4 lightx2v steps), not from the kernel. Files: build/m443_hand_U1_vs_SA2.png (U1 73, 74, SA2 73, 74).
+- H2: **wrong.** The in-betweens lose 24.7 % at scale 1 and 22.1 % at 0.5 (median of the 20 strongest-motion pairs);
+  the end frames themselves are already blurred, and RIFE interpolates between blurred frames.
+  build/m443_rife_*.png. The in-betweens of the two scales differ by 33.5 dB.
+- RIFE took 101.5 s at scale 1 and 25.2 s at 0.5, but step 1 ran with the system RAM full (63.1 of 63.5 GiB,
+  ComfyUI's RSS 47.6 GiB, up to 175k page reads per second); in M4.42 scale 1 took 27–41 s. The RAM also evicted
+  ComfyUI's cache again: in step 2 the high-noise sampler 934 and the decode 981 ran again (981 87 / 83 s against
+  25.7 s in U1). The times of this run are not comparable; scale 0.5's speed needs its own A/B.
+
+## M4.44 — hypotheses for less arithmetic at the same error (written before any of them is tested)
+
+Where the kernel stands (accurate, per channel, 40 × 34,020): ~81.5 ms against a tensor floor of ~53.5 ms
+(2 × 11.85 TOP of INT8 at 443 TOPS). M3.8: every FMA- or ALU-pipe instruction past ~4 per IMMA takes ~0.7–0.9 cycle
+from the tensor pipe; I2FP and MUFU are free. Executed per warp and tile (M3.18): 467, of them 64 IMMA, 98 FFMA (32
+for the exponent's argument, 64 for the flush `out += β · acc`), 38 FMNMX, 16 F2IP, 8 IDP. The flush cannot be thinned
+in the kernel as it is: P is quantized against each tile's own max (every tile gets all 256 steps), so every tile has
+its own β, and int32 accumulators kept across tiles would need 64 more registers at a 255 cap (M3.21).
+
+Correction to M4.41: the loop body holds **3** tiles, not 4 (192 IMMA, 64 per tile: 32 for Q·Kᵀ, 32 for P·V). Its
+per-tile static counts were divided by 4: per channel 770 static instructions per tile, not 578; per token +95, not
++63. The M3.9 model then explains +3.0 % of the +12.6 %, not +2.2 %: still about a quarter. The static count is larger
+than the 467 executed because the masking (32 FSEL) and the rescale (64 FMUL) sit in branches a tile usually skips.
+
+**Checked at once by compiling (sm_120a, nvcc 13.2):**
+- C1: Blackwell's packed FP32 (`fma.rn.f32x2`, `add.rn.f32x2`, `mul.rn.f32x2`), which would halve the 98 FFMA. PTX
+  accepts them for sm_120a, but ptxas emits two scalar FFMA / FADD / FMUL each; sm_100a gets FFMA2 / FADD2 / FMUL2.
+  **Not on this card**, like the three-input `max.f32` (M3.18).
+- C2: a three-input integer max (`max.s32 d, a, b, c`) for the tile max on the int32 scores: rejected by ptxas for
+  sm_120a and sm_100a alike. Not in PTX.
+
+The error budget: "at the same error" means each model's real median stays below SageAttention 2's (M4.26: WAN 1.51,
+LTX 0.58, Qwen 1.81, Z-Image 2.07, Moss 2.08 %) and at most +0.2 pp above today's kernel on the same dumps.
+
+| # | hypothesis | attacks | prediction | test |
+|---|---|---|---|---|
+| H1 | a warp skips the softmax and P·V of a tile when all its 16 rows' tile max lies below their running max by more than log₂ τ (M4.7's H2, now at coarser τ = 2⁻⁶, 2⁻⁸, 2⁻¹⁰ and per warp, not per block of 64) | tensor pipe (the P·V half), FMA pipe (flush, exponent), SFU | very uncertain. M4.7 at τ = 2⁻¹², 16 rows: median 0.86 %, mean 6.1 % of the pairs. At 2⁻⁶: mean **10–25 %** of warp-tiles on WAN, error +0.05…+0.3 pp. A skipped warp-tile saves ~55 % of its issue: kernel −3…−10 % where the share holds | `negligible_tiles` for the shares, `emulate(skip_below=τ)` for the error, on the dumps of all five models |
+| H2 | a block-sparse mask predicted from pooled Q and K (the mean of a block's 64 queries · the mean of a tile's 64 keys) skips Q·Kᵀ as well, as SpargeAttn does | all three pipes for the skipped pairs | unlikely on this data: M4.7 found 0.05 % of (64-row block, tile) pairs negligible at 2⁻¹² (median). An oracle (exact scores, the row's final max) bounds any predictor: if it gives < 15 % at 2⁻⁸ on WAN, H2 is not pursued | the oracle share first; the pooled predictor's recall only if the oracle passes |
+| H3 | per token: the denominator weighted by 1 / s with `dp2a` (two u16 weights × two u8 P̂ per instruction, 16 per tile), not 32 FFMA | FMA pipe | −32 FFMA, +16 IDP, +2 LDS per tile: per token **−1.5…−3 %** (89.5 → 87–88 ms); rel L2 within ±0.01 pp on random data and on Z-Image's outlier tokens (weights scaled per tile: 2⁻¹⁷ steps) | compare.py, 6 alternating rounds; tests/test_v_token.py; SASS: FFMA −32, IDP +16 per tile, no LDL |
+| H4 | measure only: the share of warp-tiles whose β < 2⁻⁴ in all 16 rows, i.e. tiles that weigh ≤ 1/16 of the row and could take a cheaper P·V (FP4, 2× the rate) | tensor pipe | 10–30 %. Below 25 % not worth it: a second V format per stage costs ~9 KB of shared memory, and the second block per SM (47 KB each now) | the same pass as H1 |
+
+Order: H1, H2's oracle and H4 in one offline pass over the dumps (the emulator, no ComfyUI). H3 independently, in
+the kernel.
+
+**H1, H2 (oracle), H4 measured** (the emulator as the kernel, `TODAY` = per channel, a warp of 16 rows deciding
+alone; 6 dumped calls per model spread over its run, 2 heads each; `build/m444_skip.txt`). Shares are of warp-tiles,
+median (mean) over the calls; the error column is the median rel L2 and, in brackets, the worst rise over today on
+any call:
+
+| model | today | SA2 | τ = 2⁻⁶ | τ = 2⁻⁸ | **τ = 2⁻¹⁰** | β < 2⁻⁴ (H4) | oracle, 64 rows, 2⁻⁸ (H2) |
+|---|---|---|---|---|---|---|---|
+| WAN | 0.933 | 1.078 | 22 (27) %, 1.743 (+4.21) | 9 (18) %, 1.062 (+0.71) | **3 (11) %, 0.962 (+0.08)** | 32 % | 6.1 % |
+| Z-Image | 12.18 | 2.517 | 8 (28) %, 12.42 (+0.42) | 2 (23) %, 12.24 (+0.10) | **0.3 (18) %, 12.19 (+0.02)** | 21 % | 0.04 % |
+| LTX | 0.451 | 0.577 | 0.2 (2) %, 0.751 (+0.71) | 0 (1) %, 0.451 (+0.03) | **0 (0.3) %, 0.451 (+0.003)** | 4 % | 0 % |
+| Qwen | 1.465 | 2.035 | 52 (46) %, 2.349 (+8.89) | 32 (30) %, 1.636 (+1.72) | **18 (17) %, 1.479 (+0.03)** | 69 % | 21 % |
+| Moss | 1.407 | 2.136 | 35 (36) %, 1.548 (+0.15) | 28 (29) %, 1.446 (+0.04) | **20 (21) %, 1.414 (+0.007)** | 44 % | 42 % |
+
+(Z-Image's "today" is per channel, which its outlier tokens break, M4.25; the shipped preset for it is per token or
+outliers. The skip's own rise is what this table compares.)
+
+- **H1: held at τ = 2⁻¹⁰, wrong at 2⁻⁶.** Predicted 10–25 % of WAN's warp-tiles at 2⁻⁶ for +0.05…+0.3 pp: the share
+  came (27 %), the error did not (+4.2 pp worst). Each skipped tile weighs < τ of the row, but hundreds of them add
+  up: the bound that matters is the skipped mass of a row, not of a tile. At 2⁻¹⁰ every model stays inside the budget
+  (worst +0.08 pp, WAN), and a warp skips 11 % (WAN), 17 % (Qwen), 18 % (Z-Image), 21 % (Moss) of its tiles on average,
+  0.3 % on LTX. **The image models skip as much as video, and more evenly** (Qwen and Moss: median ≈ mean); WAN's
+  skips sit in a few very sharp calls (call 42: 41 %, call 70: 21 %, most others ≤ 6 %).
+- M4.7 closed this idea on WAN at 2⁻¹² per block of 64 rows (median 0.05 %). Per warp, at 2⁻¹⁰ and on all models it is
+  open. In the kernel a warp that skips still meets the tile's barrier; the gain counts only if the other block on
+  the SM (2 per SM) takes the issue slots it frees. That is the kernel test.
+- **H2: not pursued.** The oracle (exact scores, the final max) at 2⁻⁸ gives WAN 6.1 %, below the 15 % set before
+  measuring; and 2⁻⁸ is already too coarse for the error by H1. Moss (42 %) and Qwen (21 %) would pass the share, at a
+  τ that H1 shows is unsafe.
+- **H4: above the predicted 10–30 %** on WAN (32 %), Qwen (69 %) and Moss (44 %). Not built now: a second V format per
+  stage costs the second block per SM; noted for later.
+
+**H1 in the kernel** (`SKIP_TILES=n`, default 0; attention_int8pv_tma, V per channel). After the tile max of both
+rows, a warp votes; if every lane's two rows lie below their running max by more than n, it skips the exponents,
+the packing, the row sum, P·V and its flush, and leaves row_max, row_sum and out as they are (the emulator's
+`skip_below` exactly). Q·Kᵀ(t + 1) is already issued above it, so the overlap stays. A copy of online_softmax_u8,
+not a flag inside it: the default build's SASS is bit for bit the shipped one (checked). With n = 10: 233 registers
+(235 before), no spill; the loop gains per tile 2 FADD, 2 FSETP, 1 VOTE, 1 BRA (static +26 over 3 tiles).
+tests/test_attention.py: random data bit for bit with and without; sharp data (> 10 % skipped) within 1e-3 of the
+skipping emulator.
+
+Hypotheses, written before timing (the dumps of the table above, the kernel alone on its own inputs, SKIP_TILES 0 / 10
+alternating in one process):
+- the time follows the skipped share at ~55 % of a tile each: Moss −6…−11 %, Qwen −5…−9 %, Z-Image's sharp calls
+  −10…−25 % (its others ~0), WAN −3…−6 % over its calls (most near 0, calls 42 and 70 −10…−20 %), LTX +0.5…+1.5 % (the
+  vote with nothing skipped);
+- if the per-tile barrier makes a skipping warp wait for the block's slowest, the gains come out at about half: that
+  is the finding to look for, not to explain away;
+- the kernel's rel L2 rises as the emulator's did, ≤ +0.08 pp on every call.
+
+**H1 in the kernel, result** (`bench/skip_tiles.py 10 6 12`: the dumps' 2 heads repeated to 24, so that a call has a
+real call's number of blocks; 6 alternating rounds × median of 20; `build/m444_skip_kernel_24heads.txt`):
+
+| model | on / off, mean (best … worst) | calls with nothing skipped | the most skipping call |
+|---|---|---|---|
+| WAN | 1.000 (0.925 … 1.032) | +2.8…+3.2 % | call 42, 41 % skipped: −7.5 % |
+| Z-Image | 0.986 (0.872 … 1.034) | +3.1…+3.4 % | call 630, 61 %: −12.8 % |
+| LTX | 1.032 (1.028 … 1.036) | +2.8…+3.6 % (all) | — |
+| Qwen | 0.988 (0.954 … 1.028) | +2.1…+2.8 % | call 228, 31 %: −4.6 % |
+| Moss | 0.983 (0.952 … 1.008) | — | call 1260, 31 %: −4.8 % |
+
+The errors are the emulator's: the kernel's rel L2 rises by ≤ +0.08 pp (WAN call 56: 1.043 → 1.124 %; call 70: 0.638 →
+0.715 %), 0 on LTX. With 2 heads instead of 24 the small models gained nothing (Moss +2.3 %): less than one wave of
+blocks, so the slots a skipping warp frees have no other block to go to.
+
+- **The hypothesis was wrong twice.** (1) With nothing skipped the kernel is **+3 %** slower, not +0.5…+1.5 %. The first
+  build voted before the exponents, and the SASS showed why it cost: the branch split the softmax from Q·Kᵀ(t + 1) into
+  two basic blocks, and ptxas issued all 32 IMMA of Q·Kᵀ(t + 1) before the exponents instead of between them (the
+  order of IMMA and MUFU in the loop: `QEQEEQEEQ…` by default, `QQQ…QVEEEEEE…` with the vote). Moving the vote after the
+  softmax (beta < 2⁻ⁿ in both rows is the same test) restored that interleave and changed nothing in time: the cost
+  is elsewhere, in +9 MOV per tile (ptxas moves registers around the branch before P·V, 232 → 238 registers) and the
+  vote itself, ~17 instructions on 467. (2) A skipped warp-tile saves **~26 %** of a tile, not 55 % (the most skipping
+  calls: 61 % skipped → −12.8 % + 3 % = 15.8 %; 41 % → 10.5 %; 31 % → 7.8 %). Half of the gap is that only P·V and its
+  flush are skipped now; the other half is the barrier: the warp that skips waits for the block's others.
+- **Net: a tie.** −1.2…−1.7 % on the image models, 0 on WAN, +3.2 % on LTX. Not a default (option a of the plan); it stays
+  as `SKIP_TILES=n`, default 0, whose default build is bit for bit the shipped one.
+- The lever it leaves: the skip pays only when it skips together. A block of 64 rows that skips as a whole (M4.7's
+  shares, smaller) frees the barrier too, and a branch that costs nothing when not taken would remove the +3 %.
+
+**H3, emulator first: refuted before the kernel.** `dp2a` needs the denominator over the rounded u8 P̂' (as per channel
+sums it since M3.15), with 1 / s_j in 16 bits. The emulator got that as `v_token="rounded16"` (1 / s_j rounded to 16
+bits against the largest of its tile); 6 dumped calls per model, per token as the kernel (`v_token="float"`) against
+it (`build/m444_h3_emulator.txt`):
+
+| model | float (today), median | rounded16, median | rounded16 − float, per call |
+|---|---|---|---|
+| WAN | 0.775 % | 0.804 % | −0.03 … +0.11 pp |
+| Z-Image | 1.144 % | 1.345 % | +0.01 … **+0.43** pp |
+| LTX | 0.434 % | 0.532 % | −0.00 … +0.31 pp |
+| Qwen | 1.217 % | 1.306 % | −0.01 … +0.28 pp |
+| Moss | 1.134 % | 1.209 % | −0.05 … +0.08 pp |
+
+- The 16-bit weights cost nothing: `rounded16` equals `rounded` (float 1 / s_j, rounded P̂') to 0.001 pp on every call.
+  What costs is rounding P' before the sum. A key with a small s_j has a small P' = p · s_j, rounded against the
+  tile's largest P' to a few steps or to 0, and the denominator multiplies that back by its large 1 / s_j: the
+  rounding error grows by the same factor. Per channel has no such factor. This is why M4.23 summed in float.
+- Predicted "within ±0.01 pp": wrong by up to 40×, and over the +0.2 pp budget on Z-Image, LTX and Qwen. Not built.

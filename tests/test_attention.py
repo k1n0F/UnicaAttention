@@ -162,6 +162,29 @@ def test_both_denominators_match_their_emulator():
                 assert from_emulator < MAX_FROM_EMULATOR, (kernel, sharp, rounded, from_emulator)
 
 
+def test_skipped_tiles_are_the_emulators():
+    # M4.44: random attention has no negligible tile, so SKIP_TILES leaves it bit for bit. Sharp attention whose 16 rows
+    # of a warp are alike (q · 8, one query per warp plus noise) has many: the kernel skips them as the emulator does.
+    import emulate as emulator
+    torch.manual_seed(9)
+    q, k, v = (torch.randn(1, 2, 1000, 128, device="cuda") for _ in range(3))
+    q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
+    inputs = unica.kernel_inputs(q, k, v, "attention_int8pv_tma")
+    plain = unica.attention(q, k, v, "attention_int8pv_tma", inputs)
+    assert torch.equal(unica.attention(q, k, v, "attention_int8pv_tma", inputs, SKIP_TILES=10), plain)
+
+    sharp = ((q.float()[:, :, ::16].repeat_interleave(16, 2)[:, :, :1000] + 0.1 * q.float()) * 8).bfloat16()
+    stats, rows = {}, emulator.SKIP_ROWS
+    emulator.SKIP_ROWS = 16  # a warp decides alone
+    try:
+        emulated = emulate(sharp, k, v, **EMULATED["attention_int8pv_tma"], skip_below=2**-10, stats=stats)
+    finally:
+        emulator.SKIP_ROWS = rows
+    assert stats["skipped"] > 0.1 * stats["pairs"], stats
+    out = unica.attention(sharp, k, v, "attention_int8pv_tma", SKIP_TILES=10)
+    assert errors(out.float(), emulated)["rel_l2"] < MAX_FROM_EMULATOR
+
+
 def test_trace_build_changes_nothing_but_time():
     torch.manual_seed(3)
     q, k, v = (torch.randn(1, 2, 1000, 128, device="cuda").bfloat16() for _ in range(3))
