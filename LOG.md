@@ -4569,3 +4569,115 @@ Against comfy_kitchen (`bench/kitchen.py time`, the whole call with quantization
 - On long calls per channel is now ahead of comfy_kitchen at the same error class, and per token, the most accurate
   of them (M4.47), is 3.5 % behind instead of 8.7 %.
 - Moss's short call stays 5 % behind: one wave of blocks, where the quantization and the launch weigh more.
+
+## M4.50 — where the per channel kernel still loses time (an audit, no change)
+
+`ncu --set full --import-source yes` on the per channel preset (PRODUCER + RECOMPUTE, 4 × 32,760;
+`build/m450_full.ncu-rep`), the SASS page with its warp stall samples (657 K samples, `build/m450_stalls.txt`).
+
+**Not the limit:**
+
+| | |
+|---|---|
+| DRAM | 2.9 % (L2 hit rate 99.1 %) |
+| shared memory | 44 % of its wavefronts; bank conflicts 0.65 M of 632 M |
+| FMA / ALU pipes | 9.8 / 12.7 % |
+| issue slots | 36 % busy |
+| branches | 100 % efficient |
+
+**What is close to one:**
+
+- **The tensor pipe, 79.8 %**, and its stalls: IMMA takes half of the computing warps' samples, 62 % of them `math`
+  (the pipe busy: the right kind of waiting) and 22 % `wait` (the fixed latency of the accumulating chain).
+- **L2 at 65.9 % of its throughput** (`lts__throughput`): every block of 64 query rows reads all of its head's K and
+  V from L2. The next limit after the tensor pipe.
+- **No eligible warp in 62 % of the cycles**: 2.46 warps per scheduler, two of them computing. The kernel is latency
+  bound; the other block's warps hide what they can.
+
+**Waiting loops: 17 % of the executed instructions.** The producer's retries on `freed` are 10.8 % of everything
+executed (92 M rounds of `TRYWAIT` + `BRA`): it waits most of the time, as it should, but it spins through it. The
+computing warps' retries on `landed` are 6.4 % (74 M rounds, ~35 per warp and tile), ~4 % of their stall samples:
+the data of a tile is not always there when they come. With the card at its power limit under full load (M3.22),
+instructions that only spin are energy the IMMAs do not get.
+
+**One computing warp's tile, 454 instructions** (+ 35 retries):
+
+| | per tile | what |
+|---|---|---|
+| I2FP | 98 | 32 scores int → float, 64 for the P·V flush |
+| FFMA | 98 | 32 for the softmax, 64 for the flush |
+| IMMA | 64 | 32 Q·Kᵀ, 32 P·V |
+| FMNMX | 38 | the row max |
+| LDSM | 36 | K and V fragments |
+| MUFU.EX2 | 36 | the exponents |
+| F2IP | 16 | P to u8 |
+| FMUL | 13 | |
+| other | 55 | |
+
+**Candidates, each its own step with its own prediction:**
+
+- (a) **Fewer spinning rounds:** a suspend-time hint on `mbarrier.try_wait` (the thread sleeps until the phase
+  completes or the hint runs out, so a longer hint should not delay the wake-up), or a back-off for the producer.
+  Up to −17 % of the issued instructions; worth time only when the power limit binds.
+- (b) **Separate K and V barriers:** today K(t + 2) and V(t + 1) share one `landed` and one `freed`. K's buffer is
+  free after Q·Kᵀ, half a tile before V's: K could be issued earlier, and V waited for only before P·V. Attacks the
+  ~4 % of the computing warps' samples spent waiting for data.
+- (c) **FlashAttention 3's layout:** one block per SM, two computing warpgroups (128 query rows) + the producer, (232 ·
+  2 + 24) · 128 = 62,464 registers. L2 traffic per query row halves, and the shared memory left (~54 KB used of 99)
+  allows 3–4 stages. A rewrite: its own milestone.
+- (d) **The flush every 128 keys** (M3.21: rejected on registers, then 235): −32 I2FP −32 FFMA per tile. Per channel
+  is at 206 now. Still costs the Q·Kᵀ / softmax overlap on half the tiles.
+
+## M4.51 — waiting asleep: a suspend-time hint on mbarrier.try_wait (prediction, before implementation)
+
+**What it attacks:** M4.50's waiting loops, 17 % of the executed instructions. The dependency stays: the producer has to
+wait until a buffer is free, a computing warp until its tile has landed. What can go is the cost of the wait. Today
+the retry is `YIELD` + `SYNCS.PHASECHK.TRANS64.TRYWAIT` + `BRA`, an issued instruction per check: ~88 rounds per
+producer wait. With the hint operand (`mbarrier.try_wait.parity ... p, [bar], parity, hint`) ptxas emits
+`NANOSLEEP.SYNCS hint` in the retry (compiled and checked on sm_120a): the thread sleeps until a barrier event wakes it
+or the hint runs out.
+
+**Change** (`UNICA_WAIT_HINT`, nanoseconds, default 0 = no hint, the SASS unchanged): every `mbarrier_wait` takes the
+hint. Measured at 1 µs and at 10 ms (0x989680, the value CUTLASS uses).
+
+**Measure** (new `bench/energy_ab.py`): kernel alone, alternating rounds, and the energy of each variant's calls from
+NVML's counter (`nvmlDeviceGetTotalEnergyConsumption`, mJ), with the mean power and SM clock.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | bit for bit |
+| executed instructions (ncu) | 2.054 G → **1.75–1.80 G (−12…−15 %)** |
+| energy per call | **−1…−3 %**: the spinning instructions are cheap next to an IMMA, but 17 % of the issue |
+| time, kernel alone | −1…−2 % if the power limit binds during the run, 0…−1 % if not |
+| 10 ms against 1 µs | the same, if the wake-up is the barrier event; slower if the thread really sleeps to the end |
+
+## M4.51 — result: the waits sleep, and nothing changes; M4.50's 17 % was the profiler's
+
+Bit for bit (the M4.48 test, now with `PRODUCER=1, WAIT_HINT=1000` too). WAIT_HINT=0 leaves the SASS unchanged; with
+a hint the 5 retry loops of the kernel get `NANOSLEEP.SYNCS`, 2888 → 2904 instructions, no spills.
+
+| `bench/energy_ab.py`, 34,020 × 40, 10 alternating rounds × 10 calls (`build/m451_energy.txt`) | time | energy per call | power, SM clock |
+|---|---|---|---|
+| PRODUCER | 78.86 ms | 27.46 J | 348 W, 2572 MHz |
+| PRODUCER, hint 1 µs | 78.99 ms (1.002) | 27.73 J (1.010) | 351 W, 2564 MHz |
+| PRODUCER, hint 10 ms | 78.89 ms (1.000) | 27.75 J (1.011) | 352 W, 2584 MHz |
+
+| ncu, 4 × 32,760 (`build/m451_ncu.txt`) | executed | stalls per instruction: long scoreboard / sleeping | tensor pipe |
+|---|---|---|---|
+| PRODUCER | 2.054 G | 0.98 / 0 | 79.8 % |
+| hint 1 µs | 1.989 G (−3.2 %) | 0.36 / 0.92 | 79.0 % |
+| hint 10 ms | 1.986 G (−3.3 %) | 0.33 / 0.96 | 79.0 % |
+
+- **Missed:** instructions −3.3 %, not −12…−15 %; energy +1 % (noise), not −1…−3 %; time unchanged. The power limit
+  did bind in this run (348–352 W, 2.57 GHz of 3.09), so it is not that the condition was absent.
+- **Why the prediction was wrong: M4.50's 17 % came from the profiler, not from the kernel.** The source page's
+  "Instructions Executed" (2.30 G in total, against 2.05 G of `smsp__inst_executed` in a plain run) is counted by
+  patching the SASS, and the patched kernel runs slower. A wait that lasts a time instead of a number of rounds then
+  runs more rounds: the producer's spinning grew with the instrumentation. In a plain run the retries are ~3 % of
+  the executed instructions, and the hint takes them away, as it should. Their energy is small next to the IMMAs'.
+  **Lesson: count waiting loops with `smsp__inst_executed` with and without the change, not on the source page.**
+  The stall samples (PC sampling, no patching) stand.
+- The hint does not delay the wake-up (10 ms runs as fast as 1 µs): the thread wakes on the barrier's event.
+- The wait itself is the dependency, and it stays: WAIT_HINT remains an option, default 0.

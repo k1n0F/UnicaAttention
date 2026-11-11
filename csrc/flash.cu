@@ -91,6 +91,10 @@ static_assert(!UNICA_PRODUCER || UNICA_CTA_COPIES, "with .shared::cluster ptxas 
 #ifndef UNICA_RECOMPUTE
 #define UNICA_RECOMPUTE 1
 #endif
+// M4.51: a suspend-time hint for every mbarrier wait, in nanoseconds (see mbarrier_wait); 0: none
+#ifndef UNICA_WAIT_HINT
+#define UNICA_WAIT_HINT 0
+#endif
 static_assert(!(UNICA_PRODUCER && UNICA_SKIP_BLOCKS), "SKIP_BLOCKS shares votes through the per-tile barrier");
 
 constexpr int WARP_SIZE = 32;
@@ -1684,13 +1688,22 @@ __device__ __forceinline__ void mbarrier_arrive(uint64_t* barrier) {
 }
 
 // Waits until the phase with parity `phase` of the barrier has completed.
+// M4.51: UNICA_WAIT_HINT > 0 (nanoseconds) adds the suspend-time hint: the retry becomes NANOSLEEP.SYNCS, the thread
+// sleeps until a barrier event or the hint runs out, instead of issuing a check after every YIELD.
 __device__ __forceinline__ void mbarrier_wait(uint64_t* barrier, int phase) {
     uint32_t done = 0;
-    while (!done)
-        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                     : "=r"(done)
-                     : "r"(smem_address(barrier)), "r"(phase)
-                     : "memory");
+    while (!done) {
+        if constexpr (UNICA_WAIT_HINT > 0)
+            asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2, %3; selp.u32 %0, 1, 0, p; }"
+                         : "=r"(done)
+                         : "r"(smem_address(barrier)), "r"(phase), "n"(UNICA_WAIT_HINT)
+                         : "memory");
+        else
+            asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                         : "=r"(done)
+                         : "r"(smem_address(barrier)), "r"(phase)
+                         : "memory");
+    }
 }
 
 // One box of a 2D tensor map, starting at element x of row y, into shared memory (128-byte aligned); its bytes

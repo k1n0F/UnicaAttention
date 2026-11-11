@@ -54,9 +54,11 @@ DEFAULT_KERNEL = "attention_int8pv_tma"
 # CTA_COPIES=0: the copies land in .shared::cluster, as before M4.48 (a driver call per copy in the SASS, never taken).
 # RECOMPUTE=0 (attention_int8pv_tma): the thread index not read again for the tail mask and the store; 1 (M4.49) keeps
 # lane, row0 and n_rows from living across the tile loop: per token −2.4 %, PRODUCER −0.5 %, nothing slower.
+# WAIT_HINT=ns: mbarrier waits sleep (NANOSLEEP.SYNCS) instead of spinning between checks (M4.51); 0: no hint.
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
         "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0, "STAGES": 2, "BULK_COPY": 1, "SMOOTH_Q": 0, "BIAS_CHUNK": 32, "V_TOKEN": 0, "V_OUTLIERS": 0,
-        "TOKEN_COPY": 1, "SKIP_TILES": 0, "SKIP_BLOCKS": 0, "PRODUCER": 0, "CTA_COPIES": 1, "RECOMPUTE": 1}
+        "TOKEN_COPY": 1, "SKIP_TILES": 0, "SKIP_BLOCKS": 0, "PRODUCER": 0, "CTA_COPIES": 1, "RECOMPUTE": 1,
+        "WAIT_HINT": 0}
 # M4.17: kernels that read q, k, v and write the output in the caller's layout (TokenLayout), e.g. ComfyUI's
 # [batch, tokens, heads, 128] seen as [batch, heads, tokens, 128] through a transpose. The others get contiguous copies.
 LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
