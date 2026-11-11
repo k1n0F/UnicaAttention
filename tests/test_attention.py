@@ -199,7 +199,8 @@ def test_producer_warps_change_nothing_but_time():
             inputs = unica.kernel_inputs(q, k, v, "attention_int8pv_tma", **scale)
             plain = unica.attention(q, k, v, "attention_int8pv_tma", inputs, **scale)
             for setting in ({"PRODUCER": 1}, {"RECOMPUTE": 0}, {"PRODUCER": 1, "RECOMPUTE": 0},  # M4.49 too
-                            {"PRODUCER": 1, "WAIT_HINT": 1000}):  # and M4.51
+                            {"PRODUCER": 1, "WAIT_HINT": 1000},  # and M4.51
+                            {"PRODUCER": 1, "WARPS_PER_BLOCK": 8}):  # and M4.53: two warpgroups share K and V
                 for _ in range(3):
                     other = unica.attention(q, k, v, "attention_int8pv_tma", inputs, **setting, **scale)
                     assert torch.equal(other, plain), (setting, scale, n_queries, n_keys)

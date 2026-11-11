@@ -4728,3 +4728,83 @@ again, to tell the two halves of the change apart.
   not issued late. What is left is the time a copy takes (L2 at 66 %, M4.50), which candidate (c) attacks: fewer
   bytes from L2 per query row.
 - Reverted: the code would only carry a slower option.
+
+## M4.53 — two computing warpgroups share every K and V tile (prediction, before measuring)
+
+**The idea:** stop serving 64 query rows with one independent block, and let two computing warpgroups share one load
+of K and V. M4.50 found L2 at 66 % of its throughput, and M4.52 found that the waits for data are not copies issued
+late: they are the time a copy takes. Every block of 64 rows reads all of its head's K and V; a block of 128 rows
+reads them once for twice the rows, so L2 serves half the bytes per query row. This is FlashAttention 3's layout.
+
+**Change** (no new option: PRODUCER with `WARPS_PER_BLOCK=8`, which M4.48 refused by a static_assert): a block of
+8 computing warps (two warpgroups, 128 rows) + the producer warpgroup, 384 threads, 1 block per SM. Compiled:
+
+| | 4 computing warps (now) | 8 computing warps |
+|---|---|---|
+| launch registers (ptxas) | 128 | **168** |
+| computing warps after `setmaxnreg.inc` | 232 | **240**: (168 − 24) · 128 = 18,432 = (240 − 168) · 256 |
+| local loads / stores, per channel / per token | 0 / 49 (82 before M4.49) | 3 / **5** |
+| shared memory per block | 46 KB, 2 blocks per SM | 55 KB, 1 block per SM |
+| computing warps per SM | 8 | 8 |
+
+The SASS of the 4-warp PRODUCER build is unchanged.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | bit for bit against the 4-warp build (the arithmetic of a row does not change) |
+| L2 throughput (ncu) | 66 % → **33–40 %** |
+| the computing warps' waits for data (long scoreboard) | 0.98 → **≤ 0.6** |
+| time, per channel, kernel alone, 34,020 × 40 | **−2…−5 %** against the 4-warp PRODUCER |
+| energy per call | −2…−4 % (half the L2 traffic) |
+| per token with PRODUCER at 240 registers | from +3.5 % (M4.49, 232) to **−1…−4 %** against per token without |
+| risk | one block per SM: a block's start and end are no longer hidden under another block's loop (~0.5–1 %) |
+
+## M4.53 — result: half the L2 traffic; faster on long calls, through the power limit, slower on Z-Image
+
+Bit for bit against the 4-warp build (the M4.48 test, now with `PRODUCER=1, WARPS_PER_BLOCK=8`, both V scales). A
+block of 55 KB static shared memory launches.
+
+| ncu, 4 × 32,760 (`build/m453_ncu.txt`) | PRODUCER, 4 warps | 8 warps | per token, no PRODUCER | per token, 8 warps |
+|---|---|---|---|---|
+| L2 bytes | 20.7 GB | **10.5 GB** | 21.3 GB | 11.1 GB |
+| L2 throughput | 66.0 % | **31.6 %** | 61.4 % | 29.8 % |
+| long scoreboard | 0.98 | **0.63** | 0.08 | 0.55 |
+| executed | 2.054 G | 1.971 G (−4 %) | 2.209 G | 2.289 G |
+| tensor pipe | 79.9 % | 77.5 % | 72.1 % | 69.0 % |
+| elapsed cycles | 16.96 M | 18.10 M (**+6.7 %**) | 18.78 M | 20.28 M |
+
+| kernel alone, `bench/energy_ab.py` | time | energy | power, clock |
+|---|---|---|---|
+| 34,020 × 40, PRODUCER, 4 warps | 79.82 ms | 28.40 J | 356 W, 2662 MHz |
+| 34,020 × 40, 8 warps | **77.52 ms (0.971)** | **27.83 J (0.980)** | 359 W, 2614 MHz |
+| 34,020 × 40, per token (preset) | 86.95 ms | 31.02 J | 357 W, 2775 MHz |
+| 34,020 × 40, per token, 8 warps | **86.00 ms (0.989)** | 31.25 J (1.007) | 363 W, 2714 MHz |
+| 32,760 × 4, PRODUCER, 4 warps | 7.14 ms | 2.99 J | 419 W, 2715 MHz |
+| 32,760 × 4, 8 warps | 7.25 ms (**1.014**) | 2.91 J (0.972) | 402 W, 2715 MHz |
+
+ncu at WAN's shape (40 × 34,020): 181.4 M cycles at 1.92 GHz against 185.6 M (+2.3 %) at 2.08 GHz.
+
+Real calls (`build/m453_dumps*.txt`; 6 dumped calls per model, heads × 12, alternating rounds), 8 warps / 4 warps:
+
+| | WAN, 34,020 | LTX, 3,520 / 14,080 | Qwen, 8,393 | Moss, ~3,860 | Z-Image, 4,128 |
+|---|---|---|---|---|---|
+| per channel (PRODUCER both) | **0.965** | 0.995 (0.986–0.997 at 14,080) | 0.992 | 0.996 | **1.037** |
+| per token (8 warps against the preset) | **0.987** | 1.017 (1.004–1.012 at 14,080) | 1.007 | 1.019 | **1.060** |
+
+- **The mechanism held:** L2 throughput 66 → 31.6 % (predicted 33–40 %), the bytes exactly halved; the waits for
+  data 0.98 → 0.63 (predicted ≤ 0.6).
+- **But it costs cycles, not saves them:** +2.3 % at WAN's shape, +6.7 % at 4 heads (predicted a risk of
+  0.5–1 %). One block per SM: its start, its end and its slowest warp are no longer hidden under another block's
+  loop, and the tensor pipe drops 2–3 points.
+- **The time comes from the power limit, as in M3.22:** 2 % less energy per call (half the L2 traffic). Where the
+  card sits at 360 W, that buys clock: −2.9 % on WAN's shape, −3.5 % on WAN's real calls (predicted −2…−5 %), per
+  token −1.1…−1.3 % (predicted −1…−4 %). Where a call is too short for the limit to bind (7 ms at 4 heads, 419 W),
+  the cycles decide and it is slower.
+- **Z-Image loses: +3.7 % per channel, +6 % per token.** Not predicted. Its 4,128 tokens make 33 blocks of 128 per
+  head, the last one a quarter full, and Z-Image's rows are the most uneven of the five (M4.25's outlier tokens):
+  with one block per SM, the SM waits for the slowest of 8 warps at every block's end. That reading is a
+  hypothesis, not measured.
+- So the layout pays where calls are long (WAN, and per channel a little on LTX's and Qwen's longer calls) and costs
+  on short ones. A rule by call length is the natural use; the threshold is the author's call.

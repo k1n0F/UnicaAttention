@@ -55,9 +55,10 @@ def main():
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, args.heads, args.tokens, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
     inputs = {spec: unica.kernel_inputs(q, k, v, KERNEL, **tile) for spec, tile in tiles.items()}
-    reference = unica.attention(q, k, v, KERNEL, inputs[args.variants[0]], **tiles[args.variants[0]])
-    for spec, tile in tiles.items():  # cubins load; and every variant must give the first one's output
-        assert torch.equal(unica.attention(q, k, v, KERNEL, inputs[spec], **tile), reference), spec
+    references = {}  # cubins load; and every variant must give the output of the first one with its V scale
+    for spec, tile in tiles.items():
+        out = unica.attention(q, k, v, KERNEL, inputs[spec], **tile)
+        assert torch.equal(references.setdefault(tile.get("V_TOKEN", 0), out), out), spec
 
     ms, joules, clocks = ({spec: [] for spec in tiles} for _ in range(3))
     for r in range(args.rounds):

@@ -1789,12 +1789,16 @@ __device__ __forceinline__ void add_v_outliers(float out[D_BLOCKS][4], const flo
 // (UNICA_V_PAIRS, uint16 rows of 2 · HEAD_DIM bytes, box V8_STRIDE bytes × KEYS_PER_TILE / 2) or layout 1 (as
 // k_map). Q, scales, grid and block as attention_int8pv. The maps come first: TMA needs them 64-byte aligned,
 // and a map after the 8-byte Q8 lands at offset 8 of the parameters (cudaErrorMisalignedAddress, M3.17).
-// M4.48: with UNICA_PRODUCER the producer warpgroup's 128 threads come after the computing warps, and the block
-// launches at 128 registers per thread (2 blocks per SM) to leave room for the 232 the computing warps take.
+// M4.48: with UNICA_PRODUCER the producer warpgroup's 128 threads come after the computing warps. 4 computing warps:
+// the block launches at 128 registers per thread (2 blocks per SM), the computing warps take 232. M4.53, 8 computing
+// warps (two warpgroups, 128 query rows sharing every K and V tile): 1 block per SM at 168 per thread, and the
+// producer's (168 − 24) · 128 = 18,432 registers give the 256 computing threads 240 each.
 constexpr int PRODUCER_THREADS = UNICA_PRODUCER ? 128 : 0;
-static_assert(!UNICA_PRODUCER || WARPS_PER_BLOCK == 4, "setmaxnreg works on whole warpgroups: 4 computing warps");
+constexpr int COMPUTING_REGISTERS = WARPS_PER_BLOCK == 8 ? 240 : 232;
+static_assert(!UNICA_PRODUCER || WARPS_PER_BLOCK == 4 || WARPS_PER_BLOCK == 8,
+              "setmaxnreg works on whole warpgroups: 4 or 8 computing warps");
 extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK + PRODUCER_THREADS,
-                                             UNICA_PRODUCER ? 2 : UNICA_MIN_BLOCKS_PER_SM)
+                                             UNICA_PRODUCER ? 8 / WARPS_PER_BLOCK : UNICA_MIN_BLOCKS_PER_SM)
     attention_int8pv_tma(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
                          const int8_t* Q8, const float* q_scale, const float* k_scale, const float* v_scale,
                          const float4* v_token, const int8_t* K8, const int* out_idx, const float* out_v,
@@ -1876,7 +1880,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK + PRODUCER_THREAD
             }
             return;
         }
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" ::: "memory");
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(COMPUTING_REGISTERS) : "memory");
     } else if (threadIdx.x == 0) {
         prologue_copies();
     }
