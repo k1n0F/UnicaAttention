@@ -68,6 +68,24 @@ static_assert(!(UNICA_SKIP_TILES && UNICA_V_TOKEN), "SKIP_TILES is measured for 
 #define UNICA_SKIP_BLOCKS 0
 #endif
 static_assert(!(UNICA_SKIP_BLOCKS && (UNICA_V_TOKEN || UNICA_SKIP_TILES)), "SKIP_BLOCKS: V per channel, not with SKIP_TILES");
+// M4.48: 1 gives attention_int8pv_tma a producer warpgroup: 4 more warps, which drop to 24 registers (setmaxnreg) while
+// the 4 computing warps rise to 232; one producer thread issues every copy, and the computing warps never wait for
+// each other (no __syncthreads per tile). The host launches 4 more warps.
+#ifndef UNICA_PRODUCER
+#define UNICA_PRODUCER 0
+#endif
+// M4.48: 0 brings back .shared::cluster as the destination of the TMA and bulk copies, to measure the difference in
+// one run (with it ptxas adds a driver call to every copy, and ignores setmaxnreg: see tma_load_2d)
+#ifndef UNICA_CTA_COPIES
+#define UNICA_CTA_COPIES 1
+#endif
+#if UNICA_CTA_COPIES
+#define COPY_DESTINATION "shared::cta"
+#else
+#define COPY_DESTINATION "shared::cluster"
+#endif
+static_assert(!UNICA_PRODUCER || UNICA_CTA_COPIES, "with .shared::cluster ptxas ignores setmaxnreg");
+static_assert(!(UNICA_PRODUCER && UNICA_SKIP_BLOCKS), "SKIP_BLOCKS shares votes through the per-tile barrier");
 
 constexpr int WARP_SIZE = 32;
 constexpr int HEAD_DIM = 128;                      // WAN 2.2
@@ -1646,6 +1664,11 @@ __device__ __forceinline__ void mbarrier_expect_bytes(uint64_t* barrier, int byt
                  : "memory");
 }
 
+// This thread's arrival alone; it releases the thread's earlier reads and writes to whoever waits on the phase.
+__device__ __forceinline__ void mbarrier_arrive(uint64_t* barrier) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_address(barrier)) : "memory");
+}
+
 // Waits until the phase with parity `phase` of the barrier has completed.
 __device__ __forceinline__ void mbarrier_wait(uint64_t* barrier, int phase) {
     uint32_t done = 0;
@@ -1657,17 +1680,19 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t* barrier, int phase) {
 }
 
 // One box of a 2D tensor map, starting at element x of row y, into shared memory (128-byte aligned); its bytes
-// count towards `barrier`. Elements outside the tensor arrive as zeros.
+// count towards `barrier`. Elements outside the tensor arrive as zeros. M4.48: the destination is .shared::cta. With
+// .shared::cluster ptxas checks whether the address is another block's and, if so, calls a driver routine
+// (__cuda_syscall_cp_async_bulk_*): never taken here, but an extern call in a kernel makes ptxas ignore setmaxnreg.
 __device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap& map, int x, int y, uint64_t* barrier) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+        "cp.async.bulk.tensor.2d." COPY_DESTINATION ".global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
         ::"r"(smem_address(dst)), "l"(&map), "r"(x), "r"(y), "r"(smem_address(barrier))
         : "memory");
 }
 
 // `bytes` (a multiple of 16) from global memory into shared memory (both 16-byte aligned), counted on `barrier`
 __device__ __forceinline__ void bulk_load(void* dst, const void* src, int bytes, uint64_t* barrier) {
-    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+    asm volatile("cp.async.bulk." COPY_DESTINATION ".global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                  ::"r"(smem_address(dst)), "l"(src), "r"(bytes), "r"(smem_address(barrier)) : "memory");
 }
 
@@ -1737,7 +1762,12 @@ __device__ __forceinline__ void add_v_outliers(float out[D_BLOCKS][4], const flo
 // (UNICA_V_PAIRS, uint16 rows of 2 · HEAD_DIM bytes, box V8_STRIDE bytes × KEYS_PER_TILE / 2) or layout 1 (as
 // k_map). Q, scales, grid and block as attention_int8pv. The maps come first: TMA needs them 64-byte aligned,
 // and a map after the 8-byte Q8 lands at offset 8 of the parameters (cudaErrorMisalignedAddress, M3.17).
-extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS_PER_SM)
+// M4.48: with UNICA_PRODUCER the producer warpgroup's 128 threads come after the computing warps, and the block
+// launches at 128 registers per thread (2 blocks per SM) to leave room for the 232 the computing warps take.
+constexpr int PRODUCER_THREADS = UNICA_PRODUCER ? 128 : 0;
+static_assert(!UNICA_PRODUCER || WARPS_PER_BLOCK == 4, "setmaxnreg works on whole warpgroups: 4 computing warps");
+extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK + PRODUCER_THREADS,
+                                             UNICA_PRODUCER ? 2 : UNICA_MIN_BLOCKS_PER_SM)
     attention_int8pv_tma(const __grid_constant__ CUtensorMap k_map, const __grid_constant__ CUtensorMap v_map,
                          const int8_t* Q8, const float* q_scale, const float* k_scale, const float* v_scale,
                          const float4* v_token, const int8_t* K8, const int* out_idx, const float* out_v,
@@ -1782,16 +1812,46 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
     };
     constexpr int V_BYTES = V_TILE_BYTES + (TOKEN_TILES ? TOK_TILE_BYTES : 0);  // what one load_v delivers
 
+    // M4.48: freed[p] completes when all computing warps are done with the K and V that the copies of iterations
+    // t ≡ p (mod 2) overwrite: those of iteration t − 1 (for t = 0, K(0) of the prologue's Q·Kᵀ)
+    [[maybe_unused]] __shared__ __align__(8) uint64_t freed[2];
+    auto release = [&](int p) {
+        __syncwarp();
+        if (lane == 0) mbarrier_arrive(&freed[p]);
+    };
     if (threadIdx.x == 0) {
         for (int i = 0; i < 3; ++i) mbarrier_init(&landed[i], 1);
+        if constexpr (UNICA_PRODUCER)
+            for (int i = 0; i < 2; ++i) mbarrier_init(&freed[i], WARPS_PER_BLOCK);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    auto prologue_copies = [&] {
         mbarrier_expect_bytes(&landed[2], (n_tiles > 1 ? 2 : 1) * K_TILE_BYTES + V_BYTES);
         load_k(0, 0, &landed[2]);
         load_v(0, 0, &landed[2]);
         if (n_tiles > 1) load_k(1, 1, &landed[2]);
+    };
+    if constexpr (UNICA_PRODUCER) {
+        if (warp >= WARPS_PER_BLOCK) {  // the producer warpgroup: one thread issues, the others leave
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 24;" ::: "memory");
+            if (threadIdx.x == THREADS_PER_BLOCK) {
+                prologue_copies();
+                // the copies of iteration t: K(t + 2) and V(t + 1), into the buffers iteration t − 1 read
+                for (int t = 0; t + 1 < n_tiles; ++t) {
+                    mbarrier_wait(&freed[t % 2], t / 2 % 2);
+                    // ldmatrix read these buffers through the generic proxy; TMA writes them through the async one
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    mbarrier_expect_bytes(&landed[t % 2], (t + 2 < n_tiles ? K_TILE_BYTES : 0) + V_BYTES);
+                    if (t + 2 < n_tiles) load_k(t % 2, t + 2, &landed[t % 2]);
+                    load_v(1 - t % 2, t + 1, &landed[t % 2]);
+                }
+            }
+            return;
+        }
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" ::: "memory");
+    } else if (threadIdx.x == 0) {
+        prologue_copies();
     }
     load_q8_async(q_tiles[warp], Q8 + q_offset, Q8, n_rows, lane);
     cp_async_commit();
@@ -1802,10 +1862,14 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
 
     cp_async_wait();
     mbarrier_wait(&landed[2], 0);
-    __syncthreads();  // the Q tiles of the other lanes
+    if constexpr (UNICA_PRODUCER)
+        __syncwarp();  // the Q tiles of the other lanes (each warp has its own)
+    else
+        __syncthreads();  // the Q tiles of the other lanes
     float scores[2][KEY_BLOCKS][4];  // tile t in scores[t % 2]; Q·Kᵀ(t + 1) writes the other
     qk_scores_int8_q_smem(scores[0], q_tiles[warp], k_tiles[0], lane);
     if (n_keys < KEYS_PER_TILE) mask_scores(scores[0], col, n_keys);
+    if constexpr (UNICA_PRODUCER) release(0);  // done with K(0)
     [[maybe_unused]] const int slot = TRACE_SLOT(lane);
     // M4.44 H5: next_max is the tile max of the tile in scores[t % 2], taken when its Q·Kᵀ was done. negligible[t % 2]
     // holds each warp's vote on tile t, written in iteration t − 1, read after iteration t's barrier; the slot is
@@ -1821,13 +1885,15 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
         constexpr int now = decltype(parity)::value, later = 1 - now;
         const int key0 = t * KEYS_PER_TILE;
         if (t > 0) mbarrier_wait(&landed[later], (t - 1) / 2 % 2);  // its ((t − 1) / 2)-th phase
-        __syncthreads();  // every warp is done with K(t) and V(t − 1)
-        if (threadIdx.x == 0 && t + 1 < n_tiles) {
-            // ldmatrix read these buffers through the generic proxy; TMA writes them through the async one
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            mbarrier_expect_bytes(&landed[now], (t + 2 < n_tiles ? K_TILE_BYTES : 0) + V_BYTES);
-            if (t + 2 < n_tiles) load_k(now, t + 2, &landed[now]);
-            load_v(later, t + 1, &landed[now]);
+        if constexpr (!UNICA_PRODUCER) {
+            __syncthreads();  // every warp is done with K(t) and V(t − 1)
+            if (threadIdx.x == 0 && t + 1 < n_tiles) {
+                // ldmatrix read these buffers through the generic proxy; TMA writes them through the async one
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                mbarrier_expect_bytes(&landed[now], (t + 2 < n_tiles ? K_TILE_BYTES : 0) + V_BYTES);
+                if (t + 2 < n_tiles) load_k(now, t + 2, &landed[now]);
+                load_v(later, t + 1, &landed[now]);
+            }
         }
 
         TRACE_MARK(slot, lane, t, 0);
@@ -1888,6 +1954,7 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK, UNICA_MIN_BLOCKS
                 negligible[later][warp] = all;  // every lane the same byte: no branch, no reconvergence
             }
         }
+        if constexpr (UNICA_PRODUCER) release(later);  // done with K(t + 1) and V(t): the copies of iteration t + 1 may come
     };
 
     int t = 0;

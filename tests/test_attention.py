@@ -187,6 +187,22 @@ def test_skipped_tiles_are_the_emulators():
         assert errors(out.float(), emulated)["rel_l2"] < MAX_FROM_EMULATOR, setting
 
 
+def test_producer_warps_change_nothing_but_time():
+    # M4.48: a producer warpgroup issues the copies and the computing warps stop waiting for each other: the same
+    # arithmetic, so bit for bit, for each V scale, 1 to many tiles, partial ones, cross-attention. Three runs each,
+    # since a wrong barrier phase shows only in some.
+    torch.manual_seed(11)
+    for batch, heads, n_queries, n_keys in SHAPES + [(1, 2, 100, 64), (1, 2, 100, 129), (1, 2, 1000, 1000)]:
+        q = torch.randn(batch, heads, n_queries, 128, device="cuda").bfloat16()
+        k, v = (torch.randn(batch, heads, n_keys, 128, device="cuda").bfloat16() for _ in range(2))
+        for scale in ({}, {"V_TOKEN": 1}):
+            inputs = unica.kernel_inputs(q, k, v, "attention_int8pv_tma", **scale)
+            plain = unica.attention(q, k, v, "attention_int8pv_tma", inputs, **scale)
+            for _ in range(3):
+                by_producer = unica.attention(q, k, v, "attention_int8pv_tma", inputs, PRODUCER=1, **scale)
+                assert torch.equal(by_producer, plain), (scale, n_queries, n_keys)
+
+
 def test_trace_build_changes_nothing_but_time():
     torch.manual_seed(3)
     q, k, v = (torch.randn(1, 2, 1000, 128, device="cuda").bfloat16() for _ in range(3))
@@ -228,6 +244,8 @@ if __name__ == "__main__":
     test_bare_exp2_changes_nothing_but_time()
     test_lazy_rescale_changes_nothing_but_time()
     test_both_denominators_match_their_emulator()
+    test_skipped_tiles_are_the_emulators()
+    test_producer_warps_change_nothing_but_time()
     test_trace_build_changes_nothing_but_time()
     test_rejects_what_the_kernel_cannot_take()
     print("attention ok")

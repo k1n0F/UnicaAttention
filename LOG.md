@@ -4394,3 +4394,96 @@ for time, the dumps for error):
 - **Where unica stands:** per token is the most accurate of the four on every model and the only quantized one that
   holds on Z-Image, at +8…+10 % time. The 8 % is per token's arithmetic (M4.41: an FFMA and an FADD per key; the data
   no longer waits). comfy_kitchen is per channel with a rotation; it buys its speed with Z-Image's failure.
+
+## M4.48 — a producer warpgroup with setmaxnreg: the copies get warps of their own (prediction, before implementation)
+
+**Step 0, feasibility** (a probe kernel, no change to the kernel; `nvcc -gencode arch=compute_120a,code=sm_120a`: a
+plain `-arch=sm_120a` also embeds `compute_120` PTX, which rejects `setmaxnreg`):
+
+- **The card runs it.** 256 threads under `__launch_bounds__(256, 2)`, so 128 registers at launch; warpgroup 0 drops
+  to 24 (`USETMAXREG.DEALLOC.CTAPOOL 0x18`), warpgroup 1 rises to 232 (`USETMAXREG.TRY_ALLOC.CTAPOOL 0xe8`, a retry
+  loop until the pool has them) and keeps 192 floats alive. Bit for bit the same as the same math in a kernel without
+  a cap, 2 blocks per SM.
+- **ptxas allocates past the launch count.** It reports `Used 128 registers` (the launch count), but the code after
+  the increase uses up to R199 with no spills; the same code without `setmaxnreg` spills 808 bytes.
+- **The kernel fits in 232** (`-maxrregcount` is ignored where `__launch_bounds__` is given; capped with
+  `__maxnreg__(232)` instead): per channel 231 registers, the same 2680 instructions, no spills. **Per token uses 255
+  today** (not 235: that is per channel); at 232 it gets 3 spill stores in the prologue and 2 loads and a store in the
+  loop body (3 tiles), +32 instructions. The 7 `STL.64 [R1], RZ` of every build are a zeroed 8-byte local, not spills.
+
+**What it attacks:** the per-tile wait for the block's slowest warp (M4.45 A3: 7–11 % of each warp's time, the same on
+random data, so drift, not uneven work). M3.19 removed the barrier and lost (+6.5 %): the fast warps then waited for
+copies that thread 0, a computing warp itself, issued late. A producer warpgroup takes that role away from the
+computing warps.
+
+**Change** (`UNICA_PRODUCER`, default 0, `attention_int8pv_tma`; the default build's SASS unchanged): 8 warps per
+block, launched at 128 registers each (2 blocks per SM, 2 × 256 × 128 = 64 K). Warps 0–3 compute as now and raise to
+232; warps 4–7 drop to 24, and one thread of warp 4 issues every copy. Two "freed" mbarriers, 4 arrivals each (one per
+computing warp, after `__syncwarp`): a warp arrives when it is done with the K and V of a tile, and the producer waits
+on that before it overwrites them. The computing warps wait only on `landed`, never on each other: the
+`__syncthreads` per tile goes. Two stages, as now (a third does not fit: 2 × 46 KB of shared memory per SM already),
+so a fast warp can run up to one tile ahead of the slowest.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | **identical bit for bit** (the arithmetic does not change) |
+| registers | launch 128; the computing warps ≤ 232, no spills (per channel) |
+| SASS of a computing warp, per tile | −1 `BAR.SYNC`, −thread 0's issue branch; +`WARPSYNC` and an arrive: about −5 instructions |
+| barrier stalls (ncu) | → ~0; some come back as `long scoreboard` on `landed`, less than in M3.19 (the copies are issued on time) |
+| kernel time, WAN's call (34,020 × 40, per channel) | **−4 … −7 %** (~3.5–6 ms of ~82): the 7–11 % per warp, less what the other block's warps already cover |
+
+Below −2 % would mean the drift is not what holds the tensor pipe back, and that is recorded as the finding.
+
+## M4.48 — result: −3…−4 % for V per channel, a loss for V per token; and a driver call hidden in every TMA copy
+
+**The first build ignored setmaxnreg.** ptxas: `(C7506) Potential Performance Loss: 'setmaxnreg' ignored to maintain
+compatibility into 'extern' call`. The kernel had one: with `.shared::cluster` as the destination,
+`cp.async.bulk.tensor` and `cp.async.bulk` compile to a check whether the address is another block's in the cluster,
+the hardware copy (`UTMALDG.2D`, `UBLKCP`) if not, and otherwise a call into the driver
+(`__cuda_syscall_cp_async_bulk_tensor_2d_tile_unicast`, `..._bulk_unicast`; `LEPC` + `CALL.ABS.NOINC`, the
+cubin lists them as `EIATTR_EXTERNS`). Never taken here, but it is there in every build since M3.17: the 7
+`STL.64 [R1], RZ` and the 8-byte stack of M4.48 step 0 are its argument block. The probe had no copy, so it did not
+show. With `.shared::cta` (PTX 8.6) the check and the call go: **2680 → 2504 instructions, 235 → 231 registers, no
+stack** (per channel; per token 3000 → 2768). `CTA_COPIES=0` brings the old form back, SASS identical to before.
+
+**Then:** launch 128, the computing warps up to R229. Not quite without spills (predicted none): 24 local loads and
+stores, about 5 `LDL` per tile in the loop (the code needs ~231–235 registers and gets 232; moving the split before
+every other value did not help, 28, reverted). Per token (255 registers) spills more: 82.
+
+**Output: bit for bit** (`test_producer_warps_change_nothing_but_time`: both V scales, 1 to 16 tiles, partial ones,
+cross-attention, 3 runs each).
+
+**Time.** The card ran power-capped in this session (throttle reason SW power cap at ~348 W, ~94 ms where M4.47 had
+82): the absolute times are higher, the ratios come from alternating rounds in one process.
+
+| kernel alone, 34,020 × 40, 10 alternating rounds (`build/m448_ab_*.txt`) | per channel | per token |
+|---|---|---|
+| `.shared::cluster` (before) | 93.93 ms | 98.69 ms |
+| `.shared::cta` | 93.49 ms (−0.5 %) | 97.58 ms (−1.1 %) |
+| `.shared::cta` + PRODUCER | **90.19 ms (−4.0 %)** | 100.42 ms (**+1.7 %**) |
+
+Real calls (`bench/skip_tiles.py 1 6 12 PRODUCER`, per channel, 6 dumped calls per model, heads × 12,
+`build/m448_dumps.txt`): **WAN 0.963, Z-Image 0.974, LTX 0.968, Qwen 0.982, Moss 0.969** (PRODUCER / without; 29
+of 30 calls faster, one Qwen call 1.012). Errors identical to the last digit.
+
+| ncu, 4 × 32,760 (`build/m448_ncu*.txt`) | `.shared::cluster` | `.shared::cta` | + PRODUCER |
+|---|---|---|---|
+| elapsed cycles | 18.08 M | 18.13 M | **17.49 M (−3.3 %)**; second run 18.33 → 17.36 M (−5.3 %) |
+| executed instructions | 1.960 G | 1.950 G | 2.073 G (+6 %: the spills, the producer's waits) |
+| tensor pipe | | 75.0 % | **79.3 %** |
+| stalls per instruction: barrier / long scoreboard / wait | | 0.40 / 0.11 / 1.50 | **0.00** / 1.00 / 1.51 |
+| active warps per SM | 7.88 | 7.88 | 9.83 (the producer warps; three of four leave at once) |
+
+- **The hypothesis held at its lower edge** (predicted −4…−7 %): −4.0 % on WAN's shape, −1.8…−3.7 % on the real calls
+  of five models. The barrier stall is gone, the tensor pipe gained 4 points.
+- **Instructions predicted −5 per tile; +6 % instead.** The producer's waits on `freed` and the spills come on top.
+  Each warp no longer waits for the slowest, and that is worth more than the extra instructions.
+- **Not M3.19 again.** There the barrier came back as a wait for data (long scoreboard 0.09 → 0.61, +6.5 % time). Here
+  long scoreboard rises too (0.11 → 1.00, including the producer's own waits and the spills), but the copies are
+  issued as soon as the slowest warp is done, by a warp that does nothing else, and the time goes down.
+- **Per token loses** (+1.7 %): it needs 255 registers, gets 232, and spills in the loop. It stays without PRODUCER
+  until it fits.
+- **The `.shared::cta` form alone** is within noise in time (−0.5 / −1.1 %), −176 instructions per build; it is what
+  makes setmaxnreg possible at all, and it is the correct form for a block's own shared memory.
