@@ -85,6 +85,12 @@ static_assert(!(UNICA_SKIP_BLOCKS && (UNICA_V_TOKEN || UNICA_SKIP_TILES)), "SKIP
 #define COPY_DESTINATION "shared::cluster"
 #endif
 static_assert(!UNICA_PRODUCER || UNICA_CTA_COPIES, "with .shared::cluster ptxas ignores setmaxnreg");
+// M4.49: 1 (the default) makes attention_int8pv_tma read the thread index again for the tail tile's mask and the
+// output's store, so that the lane, row, column, row0 and n_rows derived from it do not live (and spill) across
+// the tile loop. 0 keeps them, to measure the difference in one run.
+#ifndef UNICA_RECOMPUTE
+#define UNICA_RECOMPUTE 1
+#endif
 static_assert(!(UNICA_PRODUCER && UNICA_SKIP_BLOCKS), "SKIP_BLOCKS shares votes through the per-tile barrier");
 
 constexpr int WARP_SIZE = 32;
@@ -208,6 +214,14 @@ __device__ __forceinline__ void load_q(uint32_t q[Q_STEPS][4], const __nv_bfloat
 }
 
 // Keys at or past n_keys score -inf, so p = 2^(-inf) = 0. In D, the lane's col picks the key.
+// M4.49: threadIdx.x read where it is used. asm volatile: ptxas can neither hoist the read out of its branch nor
+// merge it with an earlier one, so values derived from it are computed there instead of living across a loop.
+__device__ __forceinline__ int fresh_thread_index() {
+    int index;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(index));
+    return index;
+}
+
 __device__ __forceinline__ void mask_scores(float scores[KEY_BLOCKS][4], int col, int n_keys) {
 #pragma unroll
     for (int block = 0; block < KEY_BLOCKS; ++block)
@@ -1945,7 +1959,8 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK + PRODUCER_THREAD
         }
 
         const int next_valid = n_keys - key0 - KEYS_PER_TILE;  // ≤ 0 in the last iteration: all masked
-        if (next_valid < KEYS_PER_TILE) mask_scores(scores[later], col, next_valid);
+        if (next_valid < KEYS_PER_TILE)
+            mask_scores(scores[later], UNICA_RECOMPUTE ? 2 * (fresh_thread_index() % 4) : col, next_valid);
         if constexpr (UNICA_SKIP_BLOCKS > 0) {  // the vote on tile t + 1, against the running max after tile t
             if (t + 1 < n_tiles) {
                 tile_max_log2(scores[later], next_max, q_scale_log2 * k_scale[(key0 + KEYS_PER_TILE) / K_SCALE_BLOCK]);
@@ -1966,7 +1981,14 @@ extern "C" __global__ void __launch_bounds__(THREADS_PER_BLOCK + PRODUCER_THREAD
 
     if constexpr (UNICA_V_OUTLIERS > 0) add_v_outliers(out, row_max, q_tiles[warp], K8, out_idx, out_v, k_scale, q_scale_log2,
                                                        n_keys, lane);
-    store_out(O + o_layout.offset(blockIdx.y, row0), out, row_sum, row, col, n_rows, v_scale, o_layout.token);
+    if constexpr (UNICA_RECOMPUTE) {
+        const int index = fresh_thread_index(), at = index % WARP_SIZE;
+        const int first = blockIdx.x * ROWS_PER_BLOCK + index / WARP_SIZE * ROWS_PER_WARP;  // row0
+        store_out(O + o_layout.offset(blockIdx.y, first), out, row_sum, at / 4, 2 * (at % 4),
+                  min(n_queries - first, ROWS_PER_WARP), v_scale, o_layout.token);
+    } else {
+        store_out(O + o_layout.offset(blockIdx.y, row0), out, row_sum, row, col, n_rows, v_scale, o_layout.token);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------

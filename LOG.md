@@ -4487,3 +4487,85 @@ of 30 calls faster, one Qwen call 1.012). Errors identical to the last digit.
   until it fits.
 - **The `.shared::cta` form alone** is within noise in time (−0.5 / −1.1 %), −176 instructions per build; it is what
   makes setmaxnreg possible at all, and it is the correct form for a block's own shared memory.
+
+## M4.49 — shorter live ranges: the thread's indices read again where they are used (prediction, before implementation)
+
+**What M4.48 left:** with PRODUCER the computing warps need ~231–235 registers and get 232; ptxas spills 6 values
+(`nvdisasm -g`, the source line of every spill): `col` (64-bit slot with its neighbour), `col + 40`, `col + 41`,
+`col + 48` (the key indices of `mask_scores`), `n_rows` and the 64-bit row offset of the output, besides
+`q_scale_log2`. All but the last are cheap functions of the thread index used only in the tail tile's mask or after
+the loop, but ptxas computes them once before the loop (loop-invariant code motion), keeps them across it, and at
+232 spills them and loads them back in every tile: ~5 `LDL` per tile.
+
+**Change** (`UNICA_RECOMPUTE`, `attention_int8pv_tma`): the mask and the output's store take the lane, the row, the
+column, `row0` and `n_rows` from a fresh read of `%tid.x` (`asm volatile`: ptxas can neither hoist it out of the
+branch nor merge it with the read at the start), so none of them lives across the tile loop. A few integer
+instructions in the last tile and after the loop instead of loads in every tile.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | bit for bit |
+| PRODUCER, per channel | 24 local loads/stores → **0–4**, ~5 `LDL` per tile → 0; ≤ 232 registers |
+| without PRODUCER, per channel | 231 → **~224** registers (−7: col, the three mask indices, n_rows, the 64-bit offset); time ±0.5 % (it did not spill) |
+| per token | 255 → ~248; with PRODUCER fewer spills (82 → ~50), still behind without it |
+| time, PRODUCER per channel, against PRODUCER alone | **−0.5…−1 %**: 5 L1 loads of ~490 instructions per tile, their latency partly hidden by the other warps |
+
+## M4.49 — result: the spills gone; −0.5 % on top of PRODUCER, and −2.4 % for V per token
+
+Bit for bit (`test_producer_warps_change_nothing_but_time`, now PRODUCER, RECOMPUTE and both, each V scale). The
+default build (RECOMPUTE=0) SASS unchanged.
+
+| ptxas, `attention_int8pv_tma` | registers | local loads / stores | instructions in the SASS |
+|---|---|---|---|
+| per channel | 231 → **206** | 0 → 0 | 2504 → 2864 |
+| per channel, PRODUCER | ≤ 232 (R228) | **24 → 0** | 2560 → 2888 |
+| per token | 255 → 255 | **8 → 0** | 2768 → 3096 |
+| per token, PRODUCER | ≤ 232 | 82 → 49 | 2840 → 3176 |
+
+The SASS grows by ~330 instructions: the tail tile's mask is a real branch now, in each of the three copies of the loop
+body, but it runs once per warp. Executed instructions go down (ncu: 1.951 → 1.941 G per channel, 2.073 → 2.054 G
+with PRODUCER).
+
+| kernel alone, 34,020 × 40, 10 alternating rounds (`build/m449_ab_*.txt`; this time not power-capped) | ms | against the first |
+|---|---|---|
+| per channel | 82.03 | 1.000 |
+| per channel, RECOMPUTE | 82.06 | 1.000 |
+| per channel, PRODUCER | 79.92 | 0.974 |
+| **per channel, PRODUCER + RECOMPUTE** | **79.49** | **0.969** |
+| per token | 86.87 | 1.000 |
+| **per token, RECOMPUTE** | **84.75** | **0.976** |
+| per token, PRODUCER | 89.93 | 1.035 |
+| per token, PRODUCER + RECOMPUTE | 91.40 | 1.052 |
+
+ncu (4 × 32,760, `build/m449_ncu.txt`): elapsed cycles 18.21 / 17.81 / 17.46 / **17.01 M** for the four per channel
+rows; tensor pipe 75.0 / 75.1 / 79.1 / **79.8 %**.
+
+- **Held:** PRODUCER's spills 24 → 0 (predicted 0–4); time −0.5 % against PRODUCER alone (predicted −0.5…−1 %, the
+  lower edge); without PRODUCER ±0 (predicted ±0.5 %); per token with PRODUCER 82 → 49 spills (predicted ~50), still
+  behind.
+- **Missed, in the good direction:** per channel without PRODUCER fell to 206 registers, not ~224: with the indices
+  gone ptxas re-planned more than the seven values. Per token stays at 255 (predicted ~248) but **its 8 spills in the
+  loop go, and it runs 2.4 % faster**: not predicted. Those 8 (since `.shared::cta`, M4.48) were never
+  looked at: per token was not the target.
+- **Per token with PRODUCER gets worse with RECOMPUTE** (1.035 → 1.052): at 232 it still spills 49, and ptxas placed
+  them differently. Per token needs ~20 more registers before PRODUCER can help it.
+- Best per V scale now: per channel PRODUCER + RECOMPUTE (−3.1 %), per token RECOMPUTE (−2.4 %).
+
+**Defaults, from here:** RECOMPUTE=1 for every build, and the per channel preset runs PRODUCER=1 (per token without).
+Old against new in one run (`build/m449_presets.txt`, kernel alone, 34,020 × 40): per channel 82.16 → **79.48 ms
+(−3.3 %)**, per token 88.70 → **86.56 ms (−2.4 %)**.
+
+Against comfy_kitchen (`bench/kitchen.py time`, the whole call with quantization, ComfyUI's Python,
+`build/m449_kitchen.txt`):
+
+| | WAN's call (1 × 34,020 × 40) | Moss's call (1 × 4131 × 24) |
+|---|---|---|
+| comfy_kitchen int8 | 85.46 ms | **0.858 ms** |
+| unica per channel | **81.90 ms (0.958 × comfy_kitchen)** | 0.901 ms (1.050 ×) |
+| unica per token | 88.46 ms (1.035 ×; M4.47: 1.087 ×) | 0.904 ms (1.054 ×; M4.47: 1.110 ×) |
+
+- On long calls per channel is now ahead of comfy_kitchen at the same error class, and per token, the most accurate
+  of them (M4.47), is 3.5 % behind instead of 8.7 %.
+- Moss's short call stays 5 % behind: one wave of blocks, where the quantization and the launch weigh more.

@@ -52,9 +52,11 @@ DEFAULT_KERNEL = "attention_int8pv_tma"
 # 64 rows agree, decided a tile ahead (M4.44 H5).
 # PRODUCER=1 (attention_int8pv_tma, 4 warps): 4 more warps issue the copies, the computing warps never wait for each other (M4.48).
 # CTA_COPIES=0: the copies land in .shared::cluster, as before M4.48 (a driver call per copy in the SASS, never taken).
+# RECOMPUTE=0 (attention_int8pv_tma): the thread index not read again for the tail mask and the store; 1 (M4.49) keeps
+# lane, row0 and n_rows from living across the tile loop: per token −2.4 %, PRODUCER −0.5 %, nothing slower.
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
         "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0, "STAGES": 2, "BULK_COPY": 1, "SMOOTH_Q": 0, "BIAS_CHUNK": 32, "V_TOKEN": 0, "V_OUTLIERS": 0,
-        "TOKEN_COPY": 1, "SKIP_TILES": 0, "SKIP_BLOCKS": 0, "PRODUCER": 0, "CTA_COPIES": 1}
+        "TOKEN_COPY": 1, "SKIP_TILES": 0, "SKIP_BLOCKS": 0, "PRODUCER": 0, "CTA_COPIES": 1, "RECOMPUTE": 1}
 # M4.17: kernels that read q, k, v and write the output in the caller's layout (TokenLayout), e.g. ComfyUI's
 # [batch, tokens, heads, 128] seen as [batch, heads, tokens, 128] through a transpose. The others get contiguous copies.
 LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
@@ -69,8 +71,9 @@ LOG_VRAM = os.environ.get("UNICA_LOG_VRAM") == "1"  # print every sizing decisio
 # part of the margin, while pieces of one head cost a launch each: an image model's 24 heads, 24 calls instead of one.
 SMALL_CALL_FRACTION = 4
 # The settings the ComfyUI node runs, and so the only ones an installed package ships cubins for (build_wheel.py):
-# the accurate mode with each of its V scales (M4.23, M4.25) and the fast mode (M4.21). Others need the repository.
-PRESETS = {"per_token": dict(V_TOKEN=1), "per_channel": {}, "outliers": dict(V_OUTLIERS=8),
+# the accurate mode with each of its V scales (M4.23, M4.25) and the fast mode (M4.21). Per channel runs with the
+# producer warpgroup (M4.48, −3 %); per token does not, it would spill. Others need the repository.
+PRESETS = {"per_token": dict(V_TOKEN=1), "per_channel": dict(PRODUCER=1), "outliers": dict(V_OUTLIERS=8),
            "fast": dict(kernel="attention_fp4", SMOOTH_Q=512)}
 
 

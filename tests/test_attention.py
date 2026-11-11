@@ -198,9 +198,10 @@ def test_producer_warps_change_nothing_but_time():
         for scale in ({}, {"V_TOKEN": 1}):
             inputs = unica.kernel_inputs(q, k, v, "attention_int8pv_tma", **scale)
             plain = unica.attention(q, k, v, "attention_int8pv_tma", inputs, **scale)
-            for _ in range(3):
-                by_producer = unica.attention(q, k, v, "attention_int8pv_tma", inputs, PRODUCER=1, **scale)
-                assert torch.equal(by_producer, plain), (scale, n_queries, n_keys)
+            for setting in ({"PRODUCER": 1}, {"RECOMPUTE": 0}, {"PRODUCER": 1, "RECOMPUTE": 0}):  # M4.49 too
+                for _ in range(3):
+                    other = unica.attention(q, k, v, "attention_int8pv_tma", inputs, **setting, **scale)
+                    assert torch.equal(other, plain), (setting, scale, n_queries, n_keys)
 
 
 def test_trace_build_changes_nothing_but_time():
