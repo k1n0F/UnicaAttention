@@ -4808,3 +4808,71 @@ Real calls (`build/m453_dumps*.txt`; 6 dumped calls per model, heads × 12, alte
   hypothesis, not measured.
 - So the layout pays where calls are long (WAN, and per channel a little on LTX's and Qwen's longer calls) and costs
   on short ones. A rule by call length is the natural use; the threshold is the author's call.
+
+## M4.54 — why 8 warps lose on Z-Image: the grid or the data (prediction, before measuring)
+
+M4.53 left Z-Image at +3.7 % (per channel) with 8 computing warps, Moss at ±0. M4.53's reading (the slowest of 8 warps
+at every block's end, uneven rows) was a guess, and V's outliers by themselves need not make the run time uneven:
+the kernel does the same work for every row whatever V holds. Two causes are told apart here.
+
+**The grid** (rows 1–3 on random data, the same for every row):
+
+| 24 heads | blocks per head, 8 / 4 warps | rows computed for nothing, 8 / 4 | waves, 8 / 4 warps (last wave filled) |
+|---|---|---|---|
+| 4,096 | 32 / 64 | 0 / 0 | 9.14 (14 %) / 9.14 (14 %) |
+| 4,128 (Z-Image) | 33 / 65 | 2.3 / 0.8 % | 9.43 (43 %) / 9.29 (29 %) |
+| 3,874 (Moss) | 31 / 61 | 2.4 / 0.8 % | 8.86 (86 %) / 8.71 (71 %) |
+
+Moss has nearly Z-Image's grid and loses nothing, so the grid alone predicts the same for both.
+
+**The data** (rows 4–7, Z-Image's own q, k, v, 2 heads × 12): as dumped; with the query rows shuffled (the same values,
+other rows side by side in a warp and a block); with the keys shuffled together with V (the running max grows in
+another order, so the rescales fall elsewhere); and Moss's dump as the control.
+
+**Hypotheses:**
+
+| | 8 warps / 4 warps, predicted |
+|---|---|
+| random 4,096 / 4,128 / 3,874 | all within ±1.5 %: **the grid is not the cause** |
+| Z-Image as dumped | +3…4 % (M4.53 again) |
+| Z-Image, rows shuffled | **≤ +1 %**: if it is the rows of a block being uneven, mixing them evens the blocks out |
+| Z-Image, keys shuffled | +3…4 %: the order of the keys is not it |
+| Moss | ±1 % |
+
+If random 4,128 alone loses, the grid is the cause and the rest is moot.
+
+## M4.54 — result: the grid; the last wave, which one block per SM cannot absorb
+
+`bench/grid_or_data.py` (`build/m454_grid_or_data.txt`), 8 / 4 computing warps, both PRODUCER, bit for bit:
+
+| input, 24 heads | 8 / 4 warps |
+|---|---|
+| random, 4,096 | **1.089** |
+| random, 4,128 | **1.056** |
+| random, 3,874 | 0.990 |
+| Z-Image as dumped (3 calls) | 1.030 / 1.043 / 1.044 |
+| Z-Image, query rows shuffled | 1.049 / 1.057 / 1.063 |
+| Z-Image, keys and V shuffled | 1.037 / 1.046 / 1.050 |
+| Moss as dumped (3 calls) | 0.990 / 0.999 / 1.001 |
+
+- **The grid, not the data.** Random inputs lose as much as Z-Image's (more), shuffling Z-Image's rows or keys changes
+  nothing that the rounds can tell apart, and 4,096 tokens, with no row computed for nothing, lose the most: so not
+  the partial last block either. Predicted "random within ±1.5 %": **missed, and that is the answer.**
+  M4.53's reading (uneven rows) was wrong.
+- **What fits is the last wave.** With one block per SM, the SMs left idle in the last wave have nothing to do, so
+  the time goes as ⌈waves⌉. With two blocks per SM a block that runs alone in the last wave gets the whole SM and
+  finishes sooner: the tail is elastic. ⌈w⌉ / w of the 8-warp grid predicts the loss:
+
+| 24 heads | waves, 8 warps | ⌈w⌉ / w | measured |
+|---|---|---|---|
+| 4,096 | 9.14 | 1.094 | 1.089 |
+| 4,128 | 9.43 | 1.060 | 1.056 (Z-Image 1.03–1.06) |
+| 3,874 | 8.86 | 1.016 | 0.990 |
+
+- **The dumps' 24 heads are not Z-Image's call.** Its real signature is batch 2 × 30 heads (M4.39): 60 heads, 23.57
+  waves, ⌈w⌉ / w = 1.018. Measured there: random **1.010**, Z-Image's data 1.025 / 1.025 / 1.027. M4.53's +3.7 % was
+  mostly the bench's grid. What is left between Z-Image's data and random inputs (−1.5…+1.5 %) changes sign between
+  24 and 60 heads: not separable from the noise here.
+- **For the rule M4.53 asked for:** 8 warps pay where the call is long enough for the power limit to bind and the
+  last wave is a small share: ⌈w⌉ / w close to 1, which is the case at WAN's 126.7 waves, and roughly so for every
+  call with many waves. The rule can be computed from the shape and the number of SMs alone, no model needed.
