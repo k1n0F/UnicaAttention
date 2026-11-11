@@ -55,10 +55,12 @@ DEFAULT_KERNEL = "attention_int8pv_tma"
 # RECOMPUTE=0 (attention_int8pv_tma): the thread index not read again for the tail mask and the store; 1 (M4.49) keeps
 # lane, row0 and n_rows from living across the tile loop: per token −2.4 %, PRODUCER −0.5 %, nothing slower.
 # WAIT_HINT=ns: mbarrier waits sleep (NANOSLEEP.SYNCS) instead of spinning between checks (M4.51); 0: no hint.
+# WAVE_DISPATCH=1 (attention_int8pv_tma): not a build setting but a choice per call, made by attention(): two
+# warpgroups sharing K and V (WARPS_PER_BLOCK=8, PRODUCER=1) where wave_layout() says they pay (M4.55).
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
         "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0, "STAGES": 2, "BULK_COPY": 1, "SMOOTH_Q": 0, "BIAS_CHUNK": 32, "V_TOKEN": 0, "V_OUTLIERS": 0,
         "TOKEN_COPY": 1, "SKIP_TILES": 0, "SKIP_BLOCKS": 0, "PRODUCER": 0, "CTA_COPIES": 1, "RECOMPUTE": 1,
-        "WAIT_HINT": 0}
+        "WAIT_HINT": 0, "WAVE_DISPATCH": 0}
 # M4.17: kernels that read q, k, v and write the output in the caller's layout (TokenLayout), e.g. ComfyUI's
 # [batch, tokens, heads, 128] seen as [batch, heads, tokens, 128] through a transpose. The others get contiguous copies.
 LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
@@ -74,8 +76,9 @@ LOG_VRAM = os.environ.get("UNICA_LOG_VRAM") == "1"  # print every sizing decisio
 SMALL_CALL_FRACTION = 4
 # The settings the ComfyUI node runs, and so the only ones an installed package ships cubins for (build_wheel.py):
 # the accurate mode with each of its V scales (M4.23, M4.25) and the fast mode (M4.21). Per channel runs with the
-# producer warpgroup (M4.48, −3 %); per token does not, it would spill. Others need the repository.
-PRESETS = {"per_token": dict(V_TOKEN=1), "per_channel": dict(PRODUCER=1), "outliers": dict(V_OUTLIERS=8),
+# producer warpgroup (M4.48, −3 %); per token does not, it would spill. Both take 8 computing warps on the calls
+# where they pay (M4.55), so their 8-warp builds ship too. Others need the repository.
+PRESETS = {"per_token": dict(V_TOKEN=1, WAVE_DISPATCH=1), "per_channel": dict(PRODUCER=1, WAVE_DISPATCH=1), "outliers": dict(V_OUTLIERS=8),
            "fast": dict(kernel="attention_fp4", SMOOTH_Q=512)}
 
 
@@ -152,6 +155,8 @@ def attention(
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         out = torch.empty_like(q)
         layout_arg = ()
+    if kernel == "attention_int8pv_tma" and tile.get("WAVE_DISPATCH", TILE["WAVE_DISPATCH"]):
+        tile = {**tile, **wave_layout(batch * heads, n_queries, n_keys, tile.get("V_TOKEN", 0), q.device)}
     defines = build_defines(tile)
     warps = tile.get("WARPS_PER_BLOCK", TILE["WARPS_PER_BLOCK"])
     grid = (math.ceil(n_queries / (warps * ROWS_PER_WARP)), batch * heads)
@@ -221,7 +226,34 @@ def in_pieces(q, k, v, kernel: str, rope, tile: dict) -> torch.Tensor:
 
 def build_defines(tile: dict) -> dict:
     """The -D flags of the cubin that `tile` (overrides of TILE) needs: only what differs from TILE."""
-    return {f"UNICA_{key}": value for key, value in tile.items() if key != "kernel" and TILE[key] != value}
+    return {f"UNICA_{key}": value for key, value in tile.items() if key not in NOT_DEFINES and TILE[key] != value}
+
+
+NOT_DEFINES = {"kernel", "WAVE_DISPATCH"}
+# M4.55: per V scale (V_TOKEN), 8 computing warps where the keys reach the first number and the 8-warp grid's last wave
+# costs at most the second: ⌈w⌉ / w, w = blocks of 128 rows / SMs. 8 warps win only while the card sits at its power
+# limit. A call of ≥ 16K keys runs long enough to put it there by itself (WAN: −3.5 % per channel, −1.9 % per token);
+# a call of 6–14K keys wins too when the card is already at the limit (bench/dispatch_sweep.py) but loses in short
+# bursts (+4.5 % at 24 × 8,393): left at 4 warps until a real sampler's regime is measured.
+WAVE_RULE = {0: (16384, 1.02), 1: (16384, 1.015)}
+EIGHT_WARPS = {"WARPS_PER_BLOCK": 8, "PRODUCER": 1}
+
+
+def sm_count(device: torch.device) -> int:
+    """Read once per device, not at every call."""
+    if device not in _SM_COUNTS:
+        _SM_COUNTS[device] = torch.cuda.get_device_properties(device).multi_processor_count
+    return _SM_COUNTS[device]
+
+
+_SM_COUNTS: dict = {}
+
+
+def wave_layout(heads: int, n_queries: int, n_keys: int, v_token: int, device: torch.device) -> dict:
+    """EIGHT_WARPS if WAVE_RULE says two warpgroups sharing K and V pay for this call (heads = batch · heads), else {}."""
+    min_keys, max_tail = WAVE_RULE[v_token]
+    waves = heads * math.ceil(n_queries / (8 * ROWS_PER_WARP)) / sm_count(device)
+    return EIGHT_WARPS if n_keys >= min_keys and math.ceil(waves) / waves <= max_tail else {}
 
 
 def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str, rope: torch.Tensor | None = None,

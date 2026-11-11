@@ -4876,3 +4876,81 @@ If random 4,128 alone loses, the grid is the cause and the rest is moot.
 - **For the rule M4.53 asked for:** 8 warps pay where the call is long enough for the power limit to bind and the
   last wave is a small share: ⌈w⌉ / w close to 1, which is the case at WAN's 126.7 waves, and roughly so for every
   call with many waves. The rule can be computed from the shape and the number of SMs alone, no model needed.
+
+## M4.55 — a wave-aware choice between 4 and 8 computing warps: the cost model (prediction, before measuring)
+
+**The idea:** choose by the predicted cost of the two layouts, not by a length threshold: T ≈ C / f · F, with C the
+cycles of the work, f the effective clock and F the penalty for filling the waves. A lookup table over a few ranges
+of shape, calibrated in more than one power regime; the clock is not read at every call (latency, and behaviour
+that depends on what the card did a moment ago).
+
+**What M4.53–M4.54 already give, as T₈ / T₄ = (C₈ / C₄) · (F₈ / F₄) · (f₄ / f₈):**
+
+- F₄ ≈ 1 (two blocks per SM: an elastic tail, M4.54); F₈ = ⌈w₈⌉ / w₈, w₈ = blocks of 128 rows / 84 SMs. This also
+  explains M4.53's +6.7 % cycles at 4 × 32,760: 12.19 waves, ⌈w⌉ / w = 1.066. It was the tail, not the layout.
+- C₈ / C₄ ≈ 1.02: WAN's shape, where F₈ = 1.003, had +2.3 % cycles.
+- f₄ / f₈: under the power limit, time ≈ energy / power, so f₄ / f₈ ≈ E₈ / E₄ ≈ 0.97–0.98 (M4.53). Without the
+  limit binding, f₄ / f₈ = 1. The clock needs no model of its own: it is the energy, in the regime where it counts.
+
+**Hypotheses** (`bench/dispatch_sweep.py`: tokens 3,874 / 4,128 / 8,393 / 14,080 / 34,020 × 24 / 40 / 60 heads,
+per channel, 4 and 8 warps, both PRODUCER; *sustained*: a second of calls first, then alternating rounds of ≥ 250 ms,
+the card at its limit; *burst*: one call after 0.3 s idle, as a call between other work would see it):
+
+| | predicted T₈ / T₄ |
+|---|---|
+| sustained | ≈ 0.975 · ⌈w₈⌉ / w₈, within ±1.5 %: 8 warps win while the last wave costs < ~2.5 % |
+| burst | ≈ 1.02 · ⌈w₈⌉ / w₈: 8 warps never win |
+| the rule that follows | 8 warps where ⌈w₈⌉ / w₈ ≤ ~1.02 and the call runs under the limit |
+
+## M4.55 — result: the model holds under the power limit; the regime decides the middle; a conservative rule ships
+
+**Sustained regime** (`bench/dispatch_sweep.py`, `build/m455_sweep_*.txt`), T₈ / T₄ against 0.975 · ⌈w₈⌉ / w₈:
+
+| heads × tokens | w₈ | ⌈w₈⌉ / w₈ | per channel | model | per token (4 warps = its preset, no PRODUCER) |
+|---|---|---|---|---|---|
+| 24 × 3,874 | 8.86 | 1.016 | 0.987 | 0.991 | 1.119 |
+| 40 × 3,874 | 14.76 | 1.016 | 0.994 | 0.991 | 1.004 |
+| 60 × 3,874 | 22.14 | 1.039 | 1.015 | 1.013 | 1.054 |
+| 24 × 4,128 | 9.43 | 1.061 | 1.042 | 1.034 | 1.050 |
+| 40 × 4,128 | 15.71 | 1.018 | 1.018 | 0.993 | 1.029 |
+| 60 × 4,128 (Z-Image) | 23.57 | 1.018 | 1.000 | 0.993 | 1.016 |
+| 24 × 8,393 | 18.86 | 1.008 | 0.972 | 0.982 | 1.000 |
+| 40 × 8,393 | 31.43 | 1.018 | 0.980 | 0.993 | 1.002 |
+| 60 × 8,393 | 47.14 | 1.018 | 0.980 | 0.993 | 0.993 |
+| 24 × 14,080 | 31.43 | 1.018 | 0.986 | 0.993 | 1.011 |
+| 40 × 14,080 | 52.38 | 1.012 | 0.974 | 0.987 | 0.988 |
+| 60 × 14,080 | 78.57 | 1.005 | 0.971 | 0.980 | 0.989 |
+| 24 × 34,020 | 76.00 | 1.000 | 0.967 | 0.975 | 0.991 |
+| 40 × 34,020 (WAN) | 126.67 | 1.003 | 0.963 | 0.978 | 0.988 |
+| 60 × 34,020 | 190.00 | 1.000 | 0.972 | 0.975 | 0.987 |
+
+- **Sustained, per channel: held**, 14 of 15 within ±1.5 % of the model (40 × 4,128: +2.5 %). But F alone does not
+  sort the calls: at the same ⌈w₈⌉ / w₈ = 1.018, 4,128 tokens lose and 8,393 or 14,080 win. C₈ / C₄ has a part that
+  shrinks with the length of the loop: a block's start and end, which nothing hides with one block per SM, weigh
+  more over 65 tiles than over 132. The table needs the number of keys as a second axis.
+- **Per token** gains ~1 % at ≥ 14K tokens and loses below: its 4-warp layout is another one (no PRODUCER), so the
+  per channel model does not carry over.
+- **Burst regime** (one call after 0.3 s idle): too noisy to calibrate (0.92…1.11), the clock's ramp dominates.
+  Predicted ≈ 1.02 · F: **not measurable** this way.
+- **NVML's energy counter** moves in steps too coarse for rounds of ≤ 250 ms (E₈ / E₄ from 0.68 to 1.34; `energy_ab`
+  now sums the energy over all rounds). The energy reading of the model (f₄ / f₈ ≈ E₈ / E₄) is **not confirmed** by
+  it; what holds is the time.
+
+**The regime decides the middle.** With the rule calibrated in the sustained regime (8 warps at ≥ 6,144 keys per
+channel, ≥ 12,288 per token, ⌈w₈⌉ / w₈ ≤ 1.02 / 1.015), `bench/energy_ab.py` (`build/m455_dispatch.txt`; rounds of 10
+calls with a sync between, so short calls never reach the limit) gave, preset with the rule / without:
+
+| | per channel | per token |
+|---|---|---|
+| 40 × 34,020 (WAN) | **0.965** | **0.981** |
+| 24 × 8,393 (8 warps chosen for per channel) | **1.045** | 0.995 |
+| 60 × 4,128, 24 × 3,874 (4 warps chosen) | 1.000 / 0.995 | 0.998 / 0.981 |
+
+A call of 77–83 ms puts the card at its limit by itself, so WAN wins in either regime. A 2.7 ms call wins (−2.8 %)
+when the card is already at the limit and loses (+4.5 %) when it is not. Which one a real sampler's mid-length calls
+see (Qwen's, LTX's) is not something a microbenchmark can tell.
+
+**What ships:** `WAVE_DISPATCH=1` in both presets, with the conservative rule, 8 warps at ≥ 16,384 keys and
+⌈w₈⌉ / w₈ ≤ 1.02 (per channel) / 1.015 (per token): WAN gets them, every other measured call keeps 4. Bit for bit
+either way (`test_wave_dispatch_changes_nothing_but_time`). The clock is never read: the number of SMs once per
+device. Lowering the threshold to 6–12K is for the tests milestone, on real workflows through ComfyUI.

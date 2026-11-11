@@ -73,15 +73,17 @@ def main():
             end.record()
             clocks[spec].append(nvml.sm_clock_mhz())  # while the calls still run
             end.synchronize()
-            joules[spec].append((nvml.energy_mj() - energy) / 1e3 / CALLS)
+            joules[spec].append((nvml.energy_mj() - energy) / 1e3)
             ms[spec].append(start.elapsed_time(end) / CALLS)
 
     first = args.variants[0]
-    base_ms, base_j = statistics.median(ms[first]), statistics.median(joules[first])
+    # energy summed over all rounds: NVML's counter moves in steps that a short round can miss
+    per_call = {spec: sum(joules[spec]) / (args.rounds * CALLS) for spec in args.variants}
+    base_ms, base_j = statistics.median(ms[first]), per_call[first]
     print(f"{KERNEL}, 1 × {args.tokens} × {args.heads} × 128, kernel alone, {args.rounds} alternating rounds × "
           f"{CALLS} calls; medians per call")
     for spec in args.variants:
-        t, j = statistics.median(ms[spec]), statistics.median(joules[spec])
+        t, j = statistics.median(ms[spec]), per_call[spec]
         print(f"  {spec or 'defaults':30} {t:7.2f} ms ({t / base_ms:.3f})  {j:6.2f} J ({j / base_j:.3f})  "
               f"{j / t * 1e3:5.0f} W  {statistics.median(clocks[spec]):5.0f} MHz")
 

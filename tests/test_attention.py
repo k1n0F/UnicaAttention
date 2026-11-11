@@ -206,6 +206,23 @@ def test_producer_warps_change_nothing_but_time():
                     assert torch.equal(other, plain), (setting, scale, n_queries, n_keys)
 
 
+def test_wave_dispatch_changes_nothing_but_time():
+    # M4.55: the presets choose 8 computing warps per call where WAVE_RULE says so (bit for bit the same output, M4.53),
+    # and 4 where the last wave or a short loop would cost
+    device = torch.device("cuda")
+    sms = unica.sm_count(device)
+    assert unica.wave_layout(sms, 128 * 128, 16384, 0, device) == unica.EIGHT_WARPS  # 128 waves exactly, long enough
+    assert unica.wave_layout(sms, 128 * 32, 4096, 0, device) == {}  # too short
+    assert unica.wave_layout(1, 128 * 128, 16384, 0, device) == {}  # 128 blocks: 2 waves, the second 44 / 84 full
+    torch.manual_seed(12)
+    for preset, n in (("per_channel", 16384), ("per_token", 16384)):
+        heads = sms // 4  # with 128-row blocks: n / 128 · heads / sms whole waves
+        q, k, v = (torch.randn(1, heads, n, 128, device="cuda").bfloat16() for _ in range(3))
+        assert unica.wave_layout(heads, n, n, unica.PRESETS[preset].get("V_TOKEN", 0), device), preset
+        settings = unica.PRESETS[preset]
+        assert torch.equal(unica.attention(q, k, v, **settings), unica.attention(q, k, v, **{**settings, "WAVE_DISPATCH": 0}))
+
+
 def test_trace_build_changes_nothing_but_time():
     torch.manual_seed(3)
     q, k, v = (torch.randn(1, 2, 1000, 128, device="cuda").bfloat16() for _ in range(3))
@@ -249,6 +266,7 @@ if __name__ == "__main__":
     test_both_denominators_match_their_emulator()
     test_skipped_tiles_are_the_emulators()
     test_producer_warps_change_nothing_but_time()
+    test_wave_dispatch_changes_nothing_but_time()
     test_trace_build_changes_nothing_but_time()
     test_rejects_what_the_kernel_cannot_take()
     print("attention ok")

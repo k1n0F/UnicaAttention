@@ -12,7 +12,7 @@ import subprocess
 import zipfile
 from pathlib import Path
 
-from unica import PRESETS, build_defines, cuda
+from unica import EIGHT_WARPS, PRESETS, build_defines, cuda
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = "flash"  # every preset's kernel and the quantizers live in csrc/flash.cu
@@ -21,8 +21,10 @@ SOURCE = "flash"  # every preset's kernel and the quantizers live in csrc/flash.
 def main() -> None:
     shutil.rmtree(cuda.SHIPPED, ignore_errors=True)
     cuda.SHIPPED.mkdir()
-    # the quantizers run from the plain build, each preset's kernel from its own
-    combinations = {cuda.cubin_name(SOURCE, d): d for d in [{}, *(build_defines(p) for p in PRESETS.values())]}
+    # the quantizers run from the plain build, each preset's kernel from its own, and with WAVE_DISPATCH its 8-warp
+    # build as well (M4.55)
+    tiles = [*PRESETS.values(), *({**p, **EIGHT_WARPS} for p in PRESETS.values() if p.get("WAVE_DISPATCH"))]
+    combinations = {cuda.cubin_name(SOURCE, d): d for d in [{}, *(build_defines(p) for p in tiles)]}
     for name, defines in combinations.items():
         (ROOT / "build" / name).unlink(missing_ok=True)  # cubin() checks only the .cu's time, not its headers
         (cuda.SHIPPED / name).write_bytes(cuda.cubin(SOURCE, defines))
