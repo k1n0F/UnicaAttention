@@ -4681,3 +4681,50 @@ a hint the 5 retry loops of the kernel get `NANOSLEEP.SYNCS`, 2888 → 2904 inst
   The stall samples (PC sampling, no patching) stand.
 - The hint does not delay the wake-up (10 ms runs as fast as 1 µs): the thread wakes on the barrier's event.
 - The wait itself is the dependency, and it stays: WAIT_HINT remains an option, default 0.
+
+## M4.52 — separate barriers for K and V (prediction, before implementation)
+
+**What it attacks:** the computing warps' waits for data, ~4 % of their stall samples in M4.50 (PC sampling, so not
+M4.51's artefact). Today K(t + 1) and V(t) land on one `landed`, and both buffers are given back on one `freed` at the
+end of an iteration. But they are used at different times: K(t + 1) by Q·Kᵀ(t + 1) at the start of iteration t, V(t)
+by P·V at its end. And K(t)'s buffer is free once Q·Kᵀ(t) is done, about half an iteration before V(t − 1)'s.
+
+**Change** (`UNICA_SPLIT_BARRIERS`, with PRODUCER, V per channel or per token without TOKEN_COPY; default 0, the
+SASS unchanged): `k_landed[2]`, `v_landed[2]`, `k_freed[2]`, `v_freed[2]`, one per buffer. A computing warp waits
+for K(t + 1) at the start of iteration t, gives K(t + 1)'s buffer back and waits for V(t) just before P·V (where
+pv_int8's rescale vote already ends a basic block, M4.44), and gives V(t)'s buffer back after it. The producer issues
+K(t + 2) as soon as every warp's Q·Kᵀ(t) is done, and V(t + 1) when every warp's P·V(t − 1) is.
+
+**Hypotheses:**
+
+| | predicted |
+|---|---|
+| output | bit for bit |
+| registers | +2…4 (more barrier addresses), still ≤ 232, no spills |
+| the computing warps' samples on the waits for data | ~4 % → **≤ 2 %** |
+| time, kernel alone, 34,020 × 40 | **−1…−2 %** |
+
+## M4.52 — result: slower, reverted; the data does not come late for want of an early issue
+
+Both builds bit for bit (the M4.48 test); no spills (R225), +64 instructions in the SASS. A second build,
+SPLIT_BARRIERS=2, keeps the separate barriers and K's early return but waits for V at the start of the iteration
+again, to tell the two halves of the change apart.
+
+| | `bench/energy_ab.py`, 34,020 × 40 (`build/m452_energy.txt`) | ncu cycles | executed | tensor pipe | long scoreboard |
+|---|---|---|---|---|---|
+| PRODUCER | 79.70 ms, 27.91 J | 16.99 M | 2.053 G | 79.8 % | 0.98 |
+| + separate barriers, V waited before P·V | 81.66 ms (**+2.5 %**), 28.08 J | 17.66 M | 2.106 G | 76.9 % | 1.03 |
+| + separate barriers, V waited at the start | 81.12 ms (**+1.8 %**), 28.16 J | 17.58 M | 2.102 G | 77.7 % | 0.98 |
+
+(First run of the first two: 79.72 / 81.88 ms, +2.7 %.)
+
+- **Missed, in the wrong direction** (predicted −1…−2 %). The waits for data did not go down at all (long scoreboard
+  0.98 → 0.98–1.03).
+- **K's early return costs ~1.8 % by itself.** It is a `__syncwarp` and an arrive with a memory clobber in the middle
+  of the iteration, where ptxas interleaves Q·Kᵀ(t + 1) with the softmax of t: no instruction moves across it. The
+  same lesson as M4.44's branches, for a fence this time.
+- **Waiting for V before P·V costs ~0.7 % more:** the `ldmatrix` of V can no longer start under the softmax.
+- **What it says about the waits for data:** issuing K half an iteration earlier changed nothing, so the copies are
+  not issued late. What is left is the time a copy takes (L2 at 66 %, M4.50), which candidate (c) attacks: fewer
+  bytes from L2 per query row.
+- Reverted: the code would only carry a slower option.
