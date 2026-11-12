@@ -31,11 +31,28 @@ def test_unica_mode_runs_unica_and_other_modes_pass_through():
         q, k, v = (torch.randn(1, 300, 4, 128, device="cuda", dtype=torch.float16) for _ in range(3))
         out = fake.attention(q, k, v, k_lens=None, attention_mode=comfyui.MODE, heads=4)
         bhnd = [x.transpose(1, 2).bfloat16().contiguous() for x in (q, k, v)]
-        expected = unica.attention(*bhnd).transpose(1, 2).half()
+        expected = unica.attention(*bhnd, **unica.PRESETS["per_token"]).transpose(1, 2).half()
         assert out.dtype == q.dtype and out.shape == q.shape and torch.equal(out, expected)
+        assert not calls
+        # audit: the settings travel in the mode's name, one per patched model
+        for mode, preset in (("unica_per_channel", "per_channel"), ("unica_fast", "fast")):
+            out = fake.attention(q, k, v, attention_mode=mode)
+            expected = unica.attention(*bhnd, **unica.PRESETS[preset]).transpose(1, 2).half()
+            assert torch.equal(out, expected), mode
+        assert comfyui.mode_name("outliers", "accurate") == "unica_outliers" and comfyui.mode_settings("unica_x") is None
         assert not calls
 
         assert fake.attention(q, k, v, attention_mode="sageattn") is q and calls == ["sageattn"]
+
+        # audit: a call unica cannot take falls back to sdpa, and so does every later one, instead of ending the render
+        original, comfyui.unica_nhd = comfyui.unica_nhd, lambda *x: (_ for _ in ()).throw(ValueError("refused"))
+        try:
+            assert fake.attention(q, k, v, attention_mode=comfyui.MODE) is q and calls[-1] == "sdpa"
+            comfyui.unica_nhd = original
+            assert fake.attention(q, k, v, attention_mode=comfyui.MODE) is q and calls[-1] == "sdpa"
+        finally:
+            comfyui.unica_nhd = original
+            comfyui.FAILED.clear()
     finally:
         del sys.modules[fake.__name__]
 
@@ -43,12 +60,12 @@ def test_unica_mode_runs_unica_and_other_modes_pass_through():
 def test_native_override_takes_self_attention_and_passes_the_rest_on():
     calls = []
     previous = lambda func, q, *args, **kwargs: calls.append(q.shape) or "previous"  # noqa: E731
-    override = comfyui.native_override(previous)
+    override = comfyui.native_override(previous, unica.PRESETS["per_token"])
     torch.manual_seed(1)
     b, s, h = 1, 300, 4
     q, k, v = (torch.randn(b, s, h * 128, device="cuda", dtype=torch.float16) for _ in range(3))
     bhnd = [x.view(b, s, h, 128).transpose(1, 2).bfloat16().contiguous() for x in (q, k, v)]
-    expected = unica.attention(*bhnd)  # [b, h, s, 128]
+    expected = unica.attention(*bhnd, **unica.PRESETS["per_token"])  # [b, h, s, 128]
 
     # ComfyUI's call for self-attention: [b, s, h · 128] in and out, plus its own keyword arguments
     out = override(None, q, k, v, heads=h, transformer_options={}, _inside_attn_wrapper=True)
@@ -67,7 +84,9 @@ def test_native_override_takes_self_attention_and_passes_the_rest_on():
     assert override(None, q, k, v, heads=h, mask=torch.ones(1, device="cuda")) == "previous"
     assert override(None, q, k, v, h, torch.ones(1, device="cuda")) == "previous"  # a mask by position
     assert override(None, q, k, v, h, None, None, False, False, "more") == "previous"  # more than ComfyUI's signature
-    assert len(calls) == 4
+    fewer_heads = torch.randn(b, s, 2 * 128, device="cuda", dtype=torch.float16)  # audit: GQA, k and v with 2 heads
+    assert override(None, q, fewer_heads, fewer_heads, heads=h) == "previous"
+    assert len(calls) == 5
 
     class Patcher:  # the slice of ComfyUI's ModelPatcher the node uses
         def __init__(self, options):
@@ -78,16 +97,18 @@ def test_native_override_takes_self_attention_and_passes_the_rest_on():
 
     node = comfyui.UnicaAttentionNative()
     (once,) = node.patch(Patcher({"optimized_attention_override": previous}), True, 0, 2)
-    (twice,) = node.patch(once, True, 0, 2)
-    assert twice.model_options["transformer_options"]["optimized_attention_override"] is \
-        once.model_options["transformer_options"]["optimized_attention_override"]  # not stacked on itself
+    (twice,) = node.patch(once, True, 0, 2, mode="fast")
+    hook = lambda patcher: patcher.model_options["transformer_options"]["optimized_attention_override"]  # noqa: E731
+    assert hook(twice).previous is previous  # patched again: a new override over the same previous, not stacked
 
-    # the fast mode: the same call on attention_fp4 with Q smoothed (M4.21); v_scale does not apply
-    node.patch(Patcher({}), True, 0, 2, v_scale="outliers", mode="fast")
-    out = override(None, q, k, v, heads=h)
+    # audit: each patched model keeps its own settings, whichever node ran last; the fast mode runs attention_fp4
+    # with Q smoothed (M4.21), v_scale does not apply
+    (fast_model,) = node.patch(Patcher({}), True, 0, 2, v_scale="outliers", mode="fast")
+    (token_model,) = node.patch(Patcher({}), True, 0, 2)
     fast = unica.attention(*bhnd, kernel="attention_fp4", SMOOTH_Q=512)
-    assert torch.equal(out, fast.transpose(1, 2).reshape(b, s, h * 128).half())
-    node.patch(Patcher({}), True, 0, 2)  # back to the default, per token, for the tests after this one
+    assert torch.equal(hook(fast_model)(None, q, k, v, heads=h), fast.transpose(1, 2).reshape(b, s, h * 128).half())
+    assert torch.equal(hook(token_model)(None, q, k, v, heads=h),
+                       expected.transpose(1, 2).reshape(b, s, h * 128).half())
 
 
 def test_measurement_count_runs_per_step_and_block():

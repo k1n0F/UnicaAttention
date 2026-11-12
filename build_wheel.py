@@ -15,7 +15,7 @@ from pathlib import Path
 from unica import EIGHT_WARPS, PRESETS, build_defines, cuda
 
 ROOT = Path(__file__).resolve().parent
-SOURCE = "flash"  # every preset's kernel and the quantizers live in csrc/flash.cu
+SOURCE = "flash"  # every preset's kernel and the quantizers live in csrc/flash.cu (legacy.cu is not shipped)
 
 
 def main() -> None:

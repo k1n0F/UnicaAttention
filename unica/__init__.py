@@ -7,6 +7,7 @@ UnicaAttention: attention kernel made for the RTX 5080 (sm_120).
 from __future__ import annotations
 
 import ctypes
+import functools
 import math
 import os
 import warnings
@@ -60,7 +61,13 @@ DEFAULT_KERNEL = "attention_int8pv_tma"
 TILE = {"WARPS_PER_BLOCK": 4, "KEYS_PER_TILE": 64, "MIN_BLOCKS_PER_SM": 1, "FAST_EXP2": 1, "LAZY_RESCALE": 1,
         "Q_SMEM": 1, "SUM_ROUNDED": 1, "V_PAIRS": 1, "TRACE": 0, "STAGES": 2, "BULK_COPY": 1, "SMOOTH_Q": 0, "BIAS_CHUNK": 32, "V_TOKEN": 0, "V_OUTLIERS": 0,
         "TOKEN_COPY": 1, "SKIP_TILES": 0, "SKIP_BLOCKS": 0, "PRODUCER": 0, "CTA_COPIES": 1, "RECOMPUTE": 1,
-        "WAIT_HINT": 0, "WAVE_DISPATCH": 0}
+        "WAIT_HINT": 0, "WAVE_DISPATCH": 0, "LEGACY": 0}
+# audit: the kernels and settings production does not run are built from csrc/legacy.cu, frozen when production was
+# split off: a legacy kernel, any setting outside PRODUCTION_SETTINGS away from its default, or LEGACY=1 (a legacy
+# setting's test compares against legacy.cu's own default, so that later changes to production do not break it).
+LEGACY_KERNELS = {"attention", "attention_smem", "attention_int8qk", "attention_int8pv", "attention_int8pv_async",
+                  "attention_int8pv_pipe", "attention_fp4pv"}
+PRODUCTION_SETTINGS = {"WARPS_PER_BLOCK", "V_TOKEN", "PRODUCER", "V_OUTLIERS", "SMOOTH_Q"}
 # M4.17: kernels that read q, k, v and write the output in the caller's layout (TokenLayout), e.g. ComfyUI's
 # [batch, tokens, heads, 128] seen as [batch, heads, tokens, 128] through a transpose. The others get contiguous copies.
 LAYOUT_KERNELS = {"attention_int8pv_tma", "attention_fp4pv", "attention_fp4"}
@@ -102,6 +109,20 @@ def readable(x: torch.Tensor) -> torch.Tensor:
 
 
 
+def on_their_device(function):
+    """function(q, ...) with q's device as torch's current one (audit): the kernels launch in that device's context and
+    on its current stream, and torch's own work there goes there too. Before, everything went to the device that was
+    current at the first call, whichever the tensors were on."""
+
+    @functools.wraps(function)
+    def run(q, *args, **kwargs):
+        with torch.cuda.device(q.device):
+            return function(q, *args, **kwargs)
+
+    return run
+
+
+@on_their_device
 def attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -164,7 +185,7 @@ def attention(
     if inputs is None:
         inputs = kernel_inputs(q, k, v, kernel, rope, **tile)
     producer = 4 if kernel == "attention_int8pv_tma" and tile.get("PRODUCER", TILE["PRODUCER"]) else 0  # M4.48
-    module("flash", **defines)[kernel](grid, (warps + producer) * WARP_SIZE, *inputs, out, n_queries, n_keys, scale_log2,
+    module(source(kernel, tile), **defines)[kernel](grid, (warps + producer) * WARP_SIZE, *inputs, out, n_queries, n_keys, scale_log2,
                                        *layout_arg)
     return out
 
@@ -229,7 +250,15 @@ def build_defines(tile: dict) -> dict:
     return {f"UNICA_{key}": value for key, value in tile.items() if key not in NOT_DEFINES and TILE[key] != value}
 
 
-NOT_DEFINES = {"kernel", "WAVE_DISPATCH"}
+NOT_DEFINES = {"kernel", "WAVE_DISPATCH", "LEGACY"}
+
+
+def source(kernel: str, tile: dict) -> str:
+    """The .cu file a call builds: "flash" (production) or "legacy" (see LEGACY_KERNELS)."""
+    settings = TILE | tile
+    legacy = settings["LEGACY"] or kernel in LEGACY_KERNELS or any(
+        settings[key] != TILE[key] for key in TILE.keys() - PRODUCTION_SETTINGS - NOT_DEFINES)
+    return "legacy" if legacy else "flash"
 # M4.55: per V scale (V_TOKEN), 8 computing warps where the keys reach the first number and the 8-warp grid's last wave
 # costs at most the second: ⌈w⌉ / w, w = blocks of 128 rows / SMs. 8 warps win only while the card sits at its power
 # limit. A call of ≥ 16K keys runs long enough to put it there by itself (WAN: −3.5 % per channel, −1.9 % per token);
@@ -256,6 +285,7 @@ def wave_layout(heads: int, n_queries: int, n_keys: int, v_token: int, device: t
     return EIGHT_WARPS if n_keys >= min_keys and math.ceil(waves) / waves <= max_tail else {}
 
 
+@on_their_device
 def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str, rope: torch.Tensor | None = None,
                   **tile: int) -> tuple:
     """The arguments `kernel` takes before its output: q, k, v as they are, or quantized. The quantizers read q, k, v
@@ -282,7 +312,9 @@ def kernel_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kernel: str
             k_mean, k_low, k_high = rope_stats(k, rope)
             q4, q_outer = quantize_fp4_rows(q, None, 1, rope, (q_low, q_high))
             k4, k_outer = quantize_fp4_rows(k, k_mean, keys, rope, (k_low, k_high))
-        qk_outer = (q_outer * k_outer).contiguous()
+        # audit: with one query row and one key both scales are clamped to 1e-30, and their product, 1e-60, is 0 in
+        # float32: the smoothing bias was then 0 / 0. The product's own floor keeps it finite (the scores are 0 there)
+        qk_outer = (q_outer * k_outer).clamp_min(1e-30).contiguous()
         bias = ctypes.c_void_p(0) if q_mean is None else smooth_bias(k, k_mean, q_mean, qk_outer, k4.shape[2], rope)
         v4, v_outer = quantize_v4(v)
         k_map = tensor_map_2d(k4, UINT8, FP4_ROW_BYTES, k4.numel() // FP4_ROW_BYTES, FP4_ROW_BYTES, FP4_ROW_BYTES, keys)
@@ -404,6 +436,10 @@ def quantize_v(v: torch.Tensor, layout: int = 0, per_token: bool = False,
         return v8, scale, token_scales
     if outliers:
         out_v = v.gather(-2, keys[..., None].expand(-1, -1, -1, dim)).float() / scale[..., None, :]
+        # fewer keys than outliers: the kernel reads `outliers` of each per head, so the rest are none (−1) and zeros
+        missing = outliers - keys.shape[-1]
+        keys = torch.nn.functional.pad(keys, (0, missing), value=-1)
+        out_v = torch.nn.functional.pad(out_v, (0, 0, 0, missing))
         return v8, scale, keys.int().contiguous(), out_v.contiguous()
     return v8, scale
 

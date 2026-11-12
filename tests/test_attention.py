@@ -118,7 +118,7 @@ def test_tma_tiles_change_nothing_but_time():
         for tile in ({}, {"KEYS_PER_TILE": 32}):
             copied = unica.attention(q, k, v, "attention_int8pv_pipe", **tile)
             for pairs in (0, 1):
-                by_tma = unica.attention(q, k, v, "attention_int8pv_tma", V_PAIRS=pairs, **tile)
+                by_tma = unica.attention(q, k, v, "attention_int8pv_tma", V_PAIRS=pairs, LEGACY=1, **tile)
                 assert torch.equal(by_tma, copied), (tile, pairs, n_queries, n_keys)
 
 
@@ -171,7 +171,7 @@ def test_skipped_tiles_are_the_emulators():
     q, k, v = (torch.randn(1, 2, 1000, 128, device="cuda") for _ in range(3))
     q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
     inputs = unica.kernel_inputs(q, k, v, "attention_int8pv_tma")
-    plain = unica.attention(q, k, v, "attention_int8pv_tma", inputs)
+    plain = unica.attention(q, k, v, "attention_int8pv_tma", inputs, LEGACY=1)
     for setting, rows in (("SKIP_TILES", 16), ("SKIP_BLOCKS", 64)):
         assert torch.equal(unica.attention(q, k, v, "attention_int8pv_tma", inputs, **{setting: 10}), plain), setting
 
@@ -197,13 +197,27 @@ def test_producer_warps_change_nothing_but_time():
         k, v = (torch.randn(batch, heads, n_keys, 128, device="cuda").bfloat16() for _ in range(2))
         for scale in ({}, {"V_TOKEN": 1}):
             inputs = unica.kernel_inputs(q, k, v, "attention_int8pv_tma", **scale)
-            plain = unica.attention(q, k, v, "attention_int8pv_tma", inputs, **scale)
+            plain = {name: unica.attention(q, k, v, "attention_int8pv_tma", inputs, LEGACY=legacy, **scale)
+                     for name, legacy in (("flash", 0), ("legacy", 1))}
             for setting in ({"PRODUCER": 1}, {"RECOMPUTE": 0}, {"PRODUCER": 1, "RECOMPUTE": 0},  # M4.49 too
                             {"PRODUCER": 1, "WAIT_HINT": 1000},  # and M4.51
                             {"PRODUCER": 1, "WARPS_PER_BLOCK": 8}):  # and M4.53: two warpgroups share K and V
                 for _ in range(3):
                     other = unica.attention(q, k, v, "attention_int8pv_tma", inputs, **setting, **scale)
-                    assert torch.equal(other, plain), (setting, scale, n_queries, n_keys)
+                    base = plain[unica.source("attention_int8pv_tma", {**setting, **scale})]
+                    assert torch.equal(other, base), (setting, scale, n_queries, n_keys)
+
+
+def test_presets_run_production():
+    # audit: every preset, and the 8-warp layout wave_layout gives two of them, builds csrc/flash.cu, never legacy.cu,
+    # whose cubins the package does not ship
+    for name, preset in unica.PRESETS.items():
+        kernel = preset.get("kernel", unica.DEFAULT_KERNEL)
+        tile = {key: value for key, value in preset.items() if key != "kernel"}
+        assert kernel not in unica.LEGACY_KERNELS and unica.source(kernel, tile) == "flash", name
+        if tile.get("WAVE_DISPATCH"):
+            assert unica.source(kernel, {**tile, **unica.EIGHT_WARPS}) == "flash", name
+    assert unica.source(unica.DEFAULT_KERNEL, {"FAST_EXP2": 0}) == unica.source("attention_smem", {}) == "legacy"
 
 
 def test_wave_dispatch_changes_nothing_but_time():
@@ -221,6 +235,21 @@ def test_wave_dispatch_changes_nothing_but_time():
         assert unica.wave_layout(heads, n, n, unica.PRESETS[preset].get("V_TOKEN", 0), device), preset
         settings = unica.PRESETS[preset]
         assert torch.equal(unica.attention(q, k, v, **settings), unica.attention(q, k, v, **{**settings, "WAVE_DISPATCH": 0}))
+
+
+def test_fewer_keys_than_outliers():
+    # audit: V_OUTLIERS=8 with fewer than 8 keys read past the ends of the outlier buffers (an illegal address, which
+    # ends the process's CUDA context); now the missing outliers are none
+    torch.manual_seed(13)
+    for n_keys in (1, 4, 7, 8):
+        q = torch.randn(1, 2, 40, 128, device="cuda").bfloat16()
+        k, v = (torch.randn(1, 2, n_keys, 128, device="cuda").bfloat16() for _ in range(2))
+        out = unica.attention(q, k, v, **unica.PRESETS["outliers"]).float()
+        ref = reference(q.float(), k.float(), v.float())
+        assert errors(out, ref)["rel_l2"] < 0.03, n_keys
+    # audit: the fast mode's smoothing with one query row and one key gave NaN (a scale product of 0)
+    q, k, v = (torch.randn(1, 1, 1, 128, device="cuda").bfloat16() for _ in range(3))
+    assert torch.isfinite(unica.attention(q, k, v, **unica.PRESETS["fast"])).all()
 
 
 def test_trace_build_changes_nothing_but_time():
@@ -266,7 +295,9 @@ if __name__ == "__main__":
     test_both_denominators_match_their_emulator()
     test_skipped_tiles_are_the_emulators()
     test_producer_warps_change_nothing_but_time()
+    test_presets_run_production()
     test_wave_dispatch_changes_nothing_but_time()
+    test_fewer_keys_than_outliers()
     test_trace_build_changes_nothing_but_time()
     test_rejects_what_the_kernel_cannot_take()
     print("attention ok")

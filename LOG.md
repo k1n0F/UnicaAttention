@@ -4954,3 +4954,59 @@ see (Qwen's, LTX's) is not something a microbenchmark can tell.
 ⌈w₈⌉ / w₈ ≤ 1.02 (per channel) / 1.015 (per token): WAN gets them, every other measured call keeps 4. Bit for bit
 either way (`test_wave_dispatch_changes_nothing_but_time`). The clock is never read: the number of SMs once per
 device. Lowering the threshold to 6–12K is for the tests milestone, on real workflows through ComfyUI.
+
+## Audit after M4.55 — the code as a whole, before the release
+
+Each change since M4.43 was checked on its own (bit for bit, its own benchmark); the code as a whole had not been. Four
+parts: synchronization and memory bounds in the kernels, the path from the ComfyUI nodes to the kernel, the package,
+and what production does not need.
+
+**1. The kernels under compute-sanitizer** (every layout the presets launch: per channel with 4 and 8 computing warps,
+per token with 4 and 8, outliers, fast; shapes 1 × 1, 1 query × 200 keys, one full tile so that the producer's loop
+never runs, a second tile of 1 key, 130 × 129, batch 2 × 3 heads × 129 × 1000, 300 queries × 30 keys):
+
+- memcheck and synccheck: **0 errors**. racecheck: still running at the time of writing.
+- **Found: the outliers preset read past its buffers with fewer than 8 keys.** `topk(min(8, n_keys))` gave fewer
+  outliers than the kernel reads per head (8, at a fixed stride): an illegal address, which ends the process's CUDA
+  context, ComfyUI with it. Fixed: the missing outliers are none (−1) and zero rows.
+- **Found: the fast preset gave NaN with one query and one key.** Q's and K's scales, both clamped to 1e-30 (q − q̄
+  and k − k̄ are 0), multiply to 1e-60, which is 0 in float32, and the smoothing bias became 0 / 0. Fixed: the
+  product has its own floor.
+
+**2. The ComfyUI nodes:**
+
+- **A K and V with fewer heads than Q (GQA) ended the render**: the view to [batch, tokens, heads, 128] failed outside
+  the fallback's `try`. Now only calls with q, k and v of one shape go to unica.
+- **The native node fell back only on RuntimeError**; a ValueError or TypeError from unica.attention's checks ended
+  the render. Now all three.
+- **The WanVideo node had no fallback at all.** Now as the native node: the first failure is logged, that call and
+  every later one go to sdpa.
+- **The kernel settings were one for the process**: the node that ran last decided for every model (two models in
+  one workflow, WAN 2.2's high and low noise, could not run two V scales). Now they belong to each patched model: in
+  the native node's override (a second patch replaces it over the original, not stacked), in WanVideoWrapper's mode
+  name (`unica_<v_scale>`, `unica_fast`; plain `unica` is per token; WanVideoWrapper checks modes only for "flash",
+  "sage" and "flash_attn", checked in its source). The VRAM reserve stays one for the machine.
+- **Several GPUs:** the module was loaded into the context of the device current at the first call, and every launch
+  went there, whatever device the tensors were on. Now a module is loaded per device on first use there, and
+  `attention` and `kernel_inputs` run with their tensors' device current. (One GPU here: tested for no change only.)
+- **The node imported bench/ (the emulator) at load**, so it needed the repository. Now only when measuring
+  (measure_every > 0), and the repository's unica only when the node sits inside it: the node runs on the installed
+  package, as a separate node repository will need.
+
+**3. The package:** the cubins come from csrc/ at every build (not in git); the compatibility check holds (sm_120
+only, driver for CUDA 13, clear reasons); the wave rule reads the SM count per device (an RTX 5090's 170 SMs too).
+The shipped cubins carry `-lineinfo` (~2.4 MB each, 7 of them): a later size option.
+
+**4. Legacy.** Of 22 kernels in flash.cu production launched 8 (attention_int8pv_tma, attention_fp4 and 6
+quantizers); of 22 build settings it used 5. Split:
+
+- `csrc/legacy.cu`: flash.cu as it was, frozen: the step kernels of M1–M4, every measured setting, the TRACE
+  timeline. Not shipped.
+- `csrc/flash.cu`: the 8 kernels and what they use, the settings WARPS_PER_BLOCK, V_TOKEN, PRODUCER, V_OUTLIERS,
+  SMOOTH_Q; every other setting fixed at its default. 2703 → 1525 lines. **Every one of the 8 kernels compiles to
+  the same SASS as its copy in legacy.cu, in all 7 shipped combinations** (checked after each step of the cut).
+- unica builds legacy.cu for a legacy kernel, for any other setting away from its default, or with LEGACY=1; a legacy
+  setting's test compares against legacy.cu's own default, so changes to production cannot break the record of M1–M4.
+  A test checks that every preset, and the 8-warp layout, builds flash.cu.
+
+All test files pass (12), and `python -m unica`.

@@ -37,7 +37,7 @@ def timeline(variant: str, heads: int, tokens: int) -> tuple[torch.Tensor, list[
     clocks = torch.empty(TRACE_SLOTS, TRACE_TILES, TRACE_POINTS, dtype=torch.int64, device="cuda")
     warps = torch.empty(TRACE_SLOTS, dtype=torch.int32, device="cuda")
     used = torch.empty(1, dtype=torch.int32, device="cuda")
-    read = module("flash", **defines)["trace_read"]
+    read = module("legacy", **defines)["trace_read"]  # TRACE is legacy.cu's
     unica.attention(q, k, v, kernel, inputs, **tile)  # builds the cubin, warms up
     read(1, 1, clocks, warps, used)  # and clears the slots
     unica.attention(q, k, v, kernel, inputs, **tile)

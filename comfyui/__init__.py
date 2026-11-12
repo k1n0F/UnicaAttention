@@ -4,9 +4,11 @@ UnicaAttention for ComfyUI: nodes that run the self-attention of a WAN model on 
     WanVideoModelLoader -> Unica Attention (WanVideo) -> WanVideoSampler          (ComfyUI-WanVideoWrapper)
     model -> PathchSageAttentionKJ -> Unica Attention (native) -> sampler        (ComfyUI's own WAN model)
 
-Unica Attention (WanVideo) clones the model and sets WanVideoWrapper's attention-mode override to "unica".
-WanVideoWrapper passes that mode down to the self-attention of every block; the `attention` function its
-model.py imported is wrapped once, so "unica" goes to unica.attention and every other mode to the original.
+Unica Attention (WanVideo) clones the model and sets WanVideoWrapper's attention-mode override to "unica_<v_scale>"
+or "unica_fast". WanVideoWrapper passes that mode down to the self-attention of every block; the `attention` function
+its model.py imported is wrapped once, so a "unica" mode goes to unica.attention with the settings its name says, and
+every other mode to the original. The settings belong to each patched model (two models, two settings), the VRAM
+reserve to the machine (the last node that ran sets it).
 Cross-attention to the text keeps the loader's attention_mode.
 
 Unica Attention (native) puts an `optimized_attention_override` on the model, the hook every attention call of
@@ -40,21 +42,19 @@ from pathlib import Path
 import torch
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(REPO / "bench"))
+# audit: the repository's unica only when this folder sits in it (a junction from custom_nodes); otherwise unica is the
+# installed package. bench/ (the emulator, the FP32 reference) only when measuring, in Measurement.measure.
+if (REPO / "unica").is_dir():
+    sys.path.insert(0, str(REPO))
 
 import unica  # noqa: E402
 from .rife import UnicaRIFE  # noqa: E402
-from emulate import TODAY, emulate, errors, reference  # noqa: E402
 
-MODE = "unica"
+MODE = "unica"  # WanVideoWrapper's attention mode for unica: MODE alone (per token) or MODE_<v_scale>, MODE_fast
 ERRORS_CSV = REPO / "build" / "attention_errors_v_modes.csv"  # each set of columns its own file (M5.3, M4.6, M4.7)
 # while this file exists, every measured call also saves its q, k, v (the measured heads) to build/dumps/
 DUMP_FLAG = REPO / "build" / "dumps.flag"
 OUTLIER_KEYS = unica.PRESETS["outliers"]["V_OUTLIERS"]  # M4.25: keys per head v_scale "outliers" takes out of INT8
-# attention_fp4pv as the emulator computes it (LOG M4.8, tests/test_fp4.py)
-FP4PV = TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4", p_local=False, p_mul=1024.0, p_outer=1.0, v_outer="channel",
-                     fp4_slots=True)
 # The fast mode's kernels, measured themselves on the same real Q, K, V (M4.21): attention_fp4, and with Q smoothed per
 # 512 queries (M4.20 emulated it below SageAttention 3 in 22 of 22 blocks)
 KERNELS = {
@@ -64,10 +64,8 @@ KERNELS = {
     "fp4": dict(kernel="attention_fp4"),
     "fp4_smooth512": dict(kernel="attention_fp4", SMOOTH_Q=512),
 }
-# Emulated next to them, so that the kernel can be checked against the emulator on real data
-EMULATED = {
-    "emu_fp4_both_smoothq512": FP4PV | dict(qk="nvfp4", smooth_q=512),
-}
+# Emulated next to them, so that the kernel can be checked against the emulator on real data (configs: measuring_tools)
+EMULATED = ["emu_fp4_both_smoothq512"]
 CSV_FIELDS = ["time", "tag", "v_scale", "routes", "node", "call", "step", "block", "batch", "tokens", "keys", "heads_measured", "unica_rel_l2", "unica_cos",
               "sage2_rel_l2", "sage2_cos", "sage3_rel_l2", "sage3_cos",
               *(f"{name}_{e}" for name in KERNELS for e in ("rel_l2", "cos")),
@@ -82,17 +80,29 @@ log = logging.getLogger("UnicaAttention")
 V_SCALES = {name: unica.PRESETS[name] for name in ("per_token", "outliers", "per_channel")}
 # The fast mode (M4.21): Q·Kᵀ and P·V in NVFP4, Q smoothed per 512 queries; real WAN 7.45 % vs SageAttention 3 8.65 %
 FAST = unica.PRESETS["fast"]
-SETTINGS: dict = {}  # what unica.attention gets in the node: the accurate mode with one of V_SCALES, or FAST
 
 
-def unica_nhd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def unica_nhd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, settings: dict) -> torch.Tensor:
     """unica.attention on the layout [batch, tokens, heads, 128] (WanVideoWrapper's and ComfyUI's), any float dtype in
     and out. No copy for bf16 and fp16: the kernels read the tensors through a transpose and write their output in the
     same layout (M4.17), and unica.attention converts fp16 to bf16 a few heads at a time (M4.31). Float32 is converted
     once each way, keeping the layout."""
     half = q.dtype if q.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16  # float32: once each way
-    out = unica.attention(*(x.transpose(1, 2).to(half) for x in (q, k, v)), **SETTINGS)
+    out = unica.attention(*(x.transpose(1, 2).to(half) for x in (q, k, v)), **settings)
     return out.transpose(1, 2).to(q.dtype).contiguous()  # no-ops for bf16 and fp16
+
+
+@functools.cache
+def measuring_tools():
+    """bench/emulate.py's emulate, errors and reference, and the configs of EMULATED: the measurement needs the
+    repository. attention_fp4pv as the emulator computes it: LOG M4.8, tests/test_fp4.py."""
+    if not (REPO / "bench" / "emulate.py").is_file():
+        raise RuntimeError("measure_every needs the UnicaAttention repository (bench/emulate.py)")
+    sys.path.insert(0, str(REPO / "bench"))
+    from emulate import TODAY, emulate, errors, reference
+    fp4pv = TODAY | dict(p_fmt="nvfp4", v_fmt="nvfp4", p_local=False, p_mul=1024.0, p_outer=1.0, v_outer="channel",
+                         fp4_slots=True)
+    return emulate, errors, reference, {"emu_fp4_both_smoothq512": fp4pv | dict(qk="nvfp4", smooth_q=512)}
 
 
 def timed(function, *args):
@@ -175,25 +185,28 @@ class Measurement:
             self.calls = self.step * options.get("total_blocks", 40) + block + 1
         return self.every > 0 and self.calls % self.every == 0
 
-    def __call__(self, q, k, v, options: dict | None = None) -> None:
-        """q, k, v in [batch, tokens, heads, 128]; options: the call's transformer_options, if any."""
+    def __call__(self, q, k, v, settings: dict, options: dict | None = None) -> None:
+        """q, k, v in [batch, tokens, heads, 128]; settings: what unica ran the call with; options: the call's
+        transformer_options, if any."""
         if self.due(options):
-            self.measure(q, k, v)
+            self.measure(q, k, v, settings)
 
-    def measure(self, q, k, v) -> None:
+    def measure(self, q, k, v, settings: dict) -> None:
         from sageattention import sageattn
+
+        emulate, errors, reference, emulated = measuring_tools()
 
         h = min(self.heads, q.shape[2])
         sub = [x[:, :, :h].contiguous() for x in (q, k, v)]
         bhnd = [x.transpose(1, 2).contiguous() for x in sub]
         ref = reference(*bhnd)  # FP32, [batch, heads, tokens, 128]
         row = {"time": time.strftime("%H:%M:%S"), "tag": self.tag,
-               "v_scale": "fast" if SETTINGS == FAST else next(n for n, s in V_SCALES.items() if s == SETTINGS),
+               "v_scale": "fast" if settings == FAST else next(n for n, s in V_SCALES.items() if s == settings),
                "routes": " ".join(f"{key}={n}" for key, n in sorted(self.routes.items())),
                "node": self.node, "call": self.calls, "step": self.step,
                "block": self.block, "batch": q.shape[0],
                "tokens": q.shape[1], "keys": k.shape[1], "heads_measured": h}
-        mine, row["unica_ms"] = timed(unica_nhd, *sub)
+        mine, row["unica_ms"] = timed(unica_nhd, *sub, settings)
         sage2, row["sage2_ms"] = timed(lambda *x: sageattn(*(t.clone() for t in x), tensor_layout="NHD"), *sub)
         results = {"unica": mine.transpose(1, 2), "sage2": sage2.transpose(1, 2)}
         if (sage3 := sage3_bhnd()) is not None:
@@ -203,7 +216,7 @@ class Measurement:
         for name, out in results.items():
             e = errors(out.float(), ref)
             row[f"{name}_rel_l2"], row[f"{name}_cos"] = e["rel_l2"], e["cos"]
-        for name, config in EMULATED.items():
+        for name, config in emulated.items():
             row[f"{name}_rel_l2"] = errors(emulate(*bhnd, **config), ref)["rel_l2"]
         row["q_channel_spread"], row["k_channel_spread"] = channel_spread(bhnd[0]), channel_spread(bhnd[1])
         row["v_offset"], row["q_offset"] = v_offset(bhnd[2]), v_offset(bhnd[0])
@@ -241,11 +254,18 @@ def wrap_attention() -> int:
             continue
 
         def attention(q, k, v, *args, attention_mode="sdpa", original=original, **kwargs):
-            if attention_mode != MODE:
+            settings = mode_settings(attention_mode)
+            if settings is None:
                 return original(q, k, v, *args, attention_mode=attention_mode, **kwargs)
-            out = unica_nhd(q, k, v)
-            measurement(q, k, v)
-            return out
+            if not FAILED:
+                try:
+                    out = unica_nhd(q, k, v, settings)
+                    measurement(q, k, v, settings)
+                    return out
+                except UNICA_ERRORS as error:  # audit: as the native node, the call and every later one on sdpa
+                    log.error("unica failed, sdpa takes over: %s", error)
+                    FAILED.append(error)
+            return original(q, k, v, *args, attention_mode="sdpa", **kwargs)
 
         attention.unica = True
         module.attention = attention
@@ -253,8 +273,8 @@ def wrap_attention() -> int:
     return wrapped
 
 
-# The kernel both nodes run, chosen by these optional inputs. Both set the one SETTINGS: in a workflow with both
-# nodes, the one that ran last decides.
+# The kernel both nodes run, chosen by these optional inputs, for the model each node patches (audit: once one setting
+# for the process, the node that ran last deciding for every model)
 KERNEL_INPUTS = {
     "v_scale": (list(V_SCALES), {"default": "per_token",
                                  "tooltip": "V's INT8 scale: per token (folded into P, the most accurate; ~11 % slower "
@@ -273,10 +293,24 @@ KERNEL_INPUTS = {
 }
 
 
-def choose_kernel(v_scale: str, mode: str, vram_reserve_mb: int) -> None:
-    SETTINGS.clear()
-    SETTINGS.update(FAST if mode == "fast" else V_SCALES[v_scale])
+def choose_kernel(v_scale: str, mode: str, vram_reserve_mb: int) -> dict:
+    """The settings unica.attention gets for these inputs: the accurate mode with one of V_SCALES, or FAST. The VRAM
+    reserve is the machine's, not a model's: set here for every call."""
     unica.VRAM_RESERVE = vram_reserve_mb * 2**20 if vram_reserve_mb else None
+    return FAST if mode == "fast" else V_SCALES[v_scale]
+
+
+def mode_name(v_scale: str, mode: str) -> str:
+    """WanVideoWrapper's attention mode that runs unica with these inputs."""
+    return f"{MODE}_fast" if mode == "fast" else f"{MODE}_{v_scale}"
+
+
+def mode_settings(attention_mode: str) -> dict | None:
+    """The settings a WanVideoWrapper attention mode stands for (MODE alone: per token), or None if it is not unica's."""
+    if attention_mode == MODE:
+        return V_SCALES["per_token"]
+    name = attention_mode.removeprefix(f"{MODE}_") if attention_mode.startswith(f"{MODE}_") else None
+    return FAST if name == "fast" else V_SCALES.get(name)
 
 
 class UnicaAttentionWanVideo:
@@ -304,14 +338,14 @@ class UnicaAttentionWanVideo:
               vram_reserve_mb=0):
         if not enabled or checked().status == unica.check.UNSUPPORTED:
             return (model,)
-        choose_kernel(v_scale, mode, vram_reserve_mb)
+        choose_kernel(v_scale, mode, vram_reserve_mb)  # the VRAM reserve; the settings go in the mode's name
         if not wrap_attention() and not any(getattr(getattr(m, "attention", None), "unica", False)
                                             for n, m in sys.modules.items() if n.endswith("wanvideo.modules.model")):
             raise RuntimeError("ComfyUI-WanVideoWrapper's wanvideo.modules.model is not loaded")
         measurement.every, measurement.heads = measure_every, measure_heads
         patched = model.clone()
         patched.model_options["transformer_options"]["attention_mode_override"] = {
-            "mode": MODE, "start_step": 0, "end_step": 10000, "verbose": False}
+            "mode": mode_name(v_scale, mode), "start_step": 0, "end_step": 10000, "verbose": False}
         return (patched,)
 
 
@@ -320,6 +354,9 @@ POSITIONAL = ("heads", "mask", "attn_precision", "skip_reshape", "skip_output_re
 
 
 FAILED: list = []  # the error, once a call to unica has failed: every call after it goes to the model's own attention
+# what unica.attention raises for a call it cannot take (its checks) or cannot run (the driver); audit: not only
+# RuntimeError, so that a check that rejects a call falls back instead of ending the render
+UNICA_ERRORS = (RuntimeError, ValueError, TypeError)
 
 
 @functools.cache
@@ -333,8 +370,8 @@ def checked() -> unica.check.Compatibility:
     return status
 
 
-def native_override(previous):
-    """An optimized_attention_override for ComfyUI's own models. ComfyUI calls it as (func, q, k, v, heads=, ...):
+def native_override(previous, settings: dict):
+    """An optimized_attention_override for ComfyUI's own models, running unica with `settings`. ComfyUI calls it as (func, q, k, v, heads=, ...):
     q, k, v are [batch, tokens, heads · dim], or [batch, heads, tokens, dim] with skip_reshape. Self-attention
     with head_dim 128, as many keys as queries, no mask and the default scale goes to unica; everything else
     to `previous` (the override that was on the model), or to func."""
@@ -352,6 +389,7 @@ def native_override(previous):
             tokens = (lambda x: x.shape[2]) if skip_reshape else (lambda x: x.shape[1])
             reason = (f"head size {dim}" if dim != HEAD_DIM else
                       "cross-attention" if tokens(k) != tokens(q) else
+                      "q, k, v shapes differ" if not q.shape == k.shape == v.shape else  # audit: e.g. GQA
                       "scale" if named.get("scale") not in (None, HEAD_DIM**-0.5) else None)
         native_measurement.route(reason, q, k)
         if reason is not None:  # anything unusual: as before
@@ -361,20 +399,20 @@ def native_override(previous):
         # [batch, tokens, heads, 128], WanVideoWrapper's layout, as views
         nhd = [x.transpose(1, 2) if skip_reshape else x.view(x.shape[0], x.shape[1], heads, dim) for x in (q, k, v)]
         try:
-            out = unica_nhd(*nhd)
-        except RuntimeError as error:  # e.g. a driver that cannot load the cubins: this call and every later one as before
+            out = unica_nhd(*nhd, settings)
+        except UNICA_ERRORS as error:  # e.g. a driver that cannot load the cubins: this call and every later one as before
             if not FAILED:
                 log.error("unica failed, the model's own attention takes over: %s", error)
             FAILED.append(error)
             return previous(func, q, k, v, *args, **kwargs) if previous else func(q, k, v, *args, **kwargs)
-        native_measurement(*nhd, options=kwargs.get("transformer_options"))
+        native_measurement(*nhd, settings, options=kwargs.get("transformer_options"))
         return out.transpose(1, 2) if skip_output_reshape else out.view(out.shape[0], out.shape[1], heads * dim)
 
-    override.unica = True
+    override.unica, override.previous = True, previous  # a later patch wraps `previous` again, not this one
     return override
 
 
-def fused_rope_forward(module, original):
+def fused_rope_forward(module, original, settings: dict):
     """M4.18–M4.19: a forward for ComfyUI's WanSelfAttention (comfy/ldm/wan/model.py, ComfyUI 0.42) that hands q and k
     to unica before RoPE, with the model's own table: the quantization rotates them on the way in, so apply_rope1's
     pass over q and k (~1.9 ms per call) goes. Everything else as the original: q = norm_q(q(x)), k = norm_k(k(x)),
@@ -392,15 +430,15 @@ def fused_rope_forward(module, original):
         # the measurement compares on the rotated q and k: rotate them only for a call it will measure
         if native_measurement.due(transformer_options):
             from comfy.ldm.flux.math import apply_rope1
-            native_measurement.measure(apply_rope1(q, freqs), apply_rope1(k, freqs), v)
-        out = unica.attention(*(t.transpose(1, 2).to(torch.bfloat16) for t in (q, k, v)), rope=freqs, **SETTINGS)
+            native_measurement.measure(apply_rope1(q, freqs), apply_rope1(k, freqs), v, settings)
+        out = unica.attention(*(t.transpose(1, 2).to(torch.bfloat16) for t in (q, k, v)), rope=freqs, **settings)
         return module.o(out.transpose(1, 2).reshape(b, s, n * d).to(x.dtype))
 
-    forward.unica = True
+    forward.unica, forward.original = True, original
     return forward
 
 
-def patch_self_attention_forward(patched) -> int:
+def patch_self_attention_forward(patched, settings: dict) -> int:
     """fused_rope_forward on every WanSelfAttention of the model, as object patches of this clone only. Returns how many."""
     blocks = patched.get_model_object("diffusion_model.blocks")
     count = 0
@@ -410,9 +448,8 @@ def patch_self_attention_forward(patched) -> int:
         if type(module).__name__ != "WanSelfAttention":  # cross-attention classes derive from it: leave them
             continue
         original = patched.object_patches.get(f"{name}.forward", module.forward)
-        if getattr(original, "unica", False):
-            continue
-        patched.add_object_patch(f"{name}.forward", fused_rope_forward(module, original))
+        original = getattr(original, "original", original) if getattr(original, "unica", False) else original
+        patched.add_object_patch(f"{name}.forward", fused_rope_forward(module, original, settings))
         count += 1
     return count
 
@@ -450,7 +487,7 @@ class UnicaAttentionNative:
               v_scale="per_token", mode="accurate", vram_reserve_mb=0):
         if not enabled or checked().status == unica.check.UNSUPPORTED:
             return (model,)
-        choose_kernel(v_scale, mode, vram_reserve_mb)
+        settings = choose_kernel(v_scale, mode, vram_reserve_mb)
         native_measurement.every, native_measurement.heads = measure_every, measure_heads
         native_measurement.tag = measure_tag
         native_measurement.routes.clear()
@@ -458,10 +495,11 @@ class UnicaAttentionNative:
         patched = model.clone()
         options = patched.model_options["transformer_options"]
         previous = options.get("optimized_attention_override")
-        if not getattr(previous, "unica", False):
-            options["optimized_attention_override"] = native_override(previous)
+        if getattr(previous, "unica", False):  # patched before: wrap what was there before it, with these settings
+            previous = previous.previous
+        options["optimized_attention_override"] = native_override(previous, settings)
         if fuse_rope:
-            log.info("fuse_rope: %d self-attention blocks patched", patch_self_attention_forward(patched))
+            log.info("fuse_rope: %d self-attention blocks patched", patch_self_attention_forward(patched, settings))
         return (patched,)
 
 

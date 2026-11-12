@@ -26,7 +26,7 @@ def test_one_mma_matches_torch_exactly():
     a, b = small_ints(16, 16), small_ints(8, 16)  # row-major B = the "col" operand
     d = torch.empty(16, 8, device="cuda")
 
-    module("flash")["mma_16x8x16"](1, WARP_SIZE, a, b, d)
+    module("legacy")["mma_16x8x16"](1, WARP_SIZE, a, b, d)
     torch.cuda.synchronize()
 
     expected = a.float() @ b.float().T
@@ -39,7 +39,7 @@ def test_one_int8_mma_matches_torch_exactly():
     b = torch.randint(-127, 128, (8, 32), device="cuda", dtype=torch.int8)
     d = torch.empty(16, 8, device="cuda", dtype=torch.int32)
 
-    module("flash")["mma_s8_16x8x32"](1, WARP_SIZE, a, b, d)
+    module("legacy")["mma_s8_16x8x32"](1, WARP_SIZE, a, b, d)
     torch.cuda.synchronize()
 
     expected = (a.double() @ b.double().T).int()  # |sum| <= 127² · 32 < 2^53: float64 is exact
@@ -53,7 +53,7 @@ def test_pv_int8_tile_matches_torch_exactly():
     v = torch.randint(-127, 128, (KEYS_PER_TILE, HEAD_DIM), device="cuda", dtype=torch.int8)
     out = torch.empty(16, HEAD_DIM, device="cuda")
 
-    module("flash")["pv_int8_tile"](1, 4 * WARP_SIZE, p, v, out)
+    module("legacy")["pv_int8_tile"](1, 4 * WARP_SIZE, p, v, out)
     torch.cuda.synchronize()
 
     expected = (p.round().double() @ v.double()).float()  # |sum| <= 64 · 255 · 127 < 2^24: exact in float
@@ -65,7 +65,7 @@ def test_qk_tile_matches_torch_exactly():
     q, k = small_ints(16, HEAD_DIM), small_ints(KEYS_PER_TILE, HEAD_DIM)  # |q·k| <= 16 · 128, exact
     s = torch.empty(16, KEYS_PER_TILE, device="cuda")
 
-    module("flash")["qk_tile"](1, WARP_SIZE, q, k, s)
+    module("legacy")["qk_tile"](1, WARP_SIZE, q, k, s)
     torch.cuda.synchronize()
 
     expected = q.float() @ k.float().T
@@ -81,7 +81,7 @@ def test_softmax_stats_match_logsumexp():
         k = torch.randn(n_keys, HEAD_DIM, device="cuda").bfloat16()
         lse = torch.empty(16, device="cuda")
 
-        module("flash")["softmax_stats"](1, WARP_SIZE, q, k, lse, n_keys, scale * LOG2E)
+        module("legacy")["softmax_stats"](1, WARP_SIZE, q, k, lse, n_keys, scale * LOG2E)
         torch.cuda.synchronize()
 
         expected = torch.logsumexp(q.float() @ k.float().T * scale, dim=-1) * LOG2E  # log2-sum-exp2
@@ -94,7 +94,7 @@ def test_attention_warp_matches_fp32():
     q, k, v = (torch.randn(n, HEAD_DIM, device="cuda").bfloat16() for n in (16, n_keys, n_keys))
     out = torch.empty(16, HEAD_DIM, device="cuda")
 
-    module("flash")["attention_warp"](1, WARP_SIZE, q, k, v, out, n_keys, HEAD_DIM**-0.5 * LOG2E)
+    module("legacy")["attention_warp"](1, WARP_SIZE, q, k, v, out, n_keys, HEAD_DIM**-0.5 * LOG2E)
     torch.cuda.synchronize()
 
     expected = torch.softmax(q.float() @ k.float().T * HEAD_DIM**-0.5, dim=-1) @ v.float()
@@ -105,7 +105,7 @@ def test_attention_warp_matches_fp32():
 
 def test_bare_exp2_equals_exp2f_down_to_minus_126():
     count = torch.zeros(2, device="cuda", dtype=torch.int32)
-    module("flash")["exp2_ftz_mismatches"](84 * 16, 256, count)  # all 2^32 float bit patterns
+    module("legacy")["exp2_ftz_mismatches"](84 * 16, 256, count)  # all 2^32 float bit patterns
     in_range, below = count.tolist()
     print(f"exp2_ftz vs exp2f over all 2^32 floats: {in_range} differ at x ≥ −126, {below} below or NaN")
     assert in_range == 0, in_range

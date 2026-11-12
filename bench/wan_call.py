@@ -52,11 +52,11 @@ def sage3(q, k, v):  # KJNodes attention_sage, "sageattn3"
 
 
 def node(mode):  # the native node's override with its kernel chosen, as a render runs it
-    override = comfyui.native_override(None)
+    settings = comfyui.choose_kernel("per_token" if mode == "fast" else mode, "fast" if mode == "fast" else "accurate",
+                                     (unica.VRAM_RESERVE or 0) // 2**20)
+    override = comfyui.native_override(None, settings)
 
     def call(q, k, v):
-        comfyui.choose_kernel("per_token" if mode == "fast" else mode, "fast" if mode == "fast" else "accurate",
-                              (unica.VRAM_RESERVE or 0) // 2**20)
         return override(None, q, k, v, heads=HEADS)
     return call
 

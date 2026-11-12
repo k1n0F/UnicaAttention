@@ -68,12 +68,13 @@ def cubin(name, defines=None):
 
 
 @functools.cache
-def _context():
-    """The device's primary context, the one torch works in. Retained once per process and never released:
-    torch keeps it alive anyway, and the driver frees it at exit."""
+def _context(ordinal: int):
+    """The primary context of device `ordinal`, the one torch works in there. Retained once per process and never
+    released: torch keeps it alive anyway, and the driver frees it at exit."""
     _check(driver().cuInit(0))
-    ctx = ctypes.c_void_p()
-    _check(driver().cuDevicePrimaryCtxRetain(ctypes.byref(ctx), torch.cuda.current_device()))
+    device, ctx = ctypes.c_int(), ctypes.c_void_p()
+    _check(driver().cuDeviceGet(ctypes.byref(device), ordinal))
+    _check(driver().cuDevicePrimaryCtxRetain(ctypes.byref(ctx), device))
     return ctx
 
 
@@ -86,17 +87,25 @@ def module(name, **defines):
 
 
 class Module:
-    """One .cubin loaded into torch's context. module["name"] gives a kernel. Use module(), not this directly."""
+    """One .cubin, loaded into the context of each device it is used on. module["name"] gives the kernel on torch's
+    current device. Use module(), not this directly."""
 
     def __init__(self, name, defines=None):
-        _check(driver().cuCtxSetCurrent(_context()))
         self._image = cubin(name, defines)  # keeps the bytes alive while the module exists
-        self._mod = ctypes.c_void_p()
-        _check(driver().cuModuleLoadData(ctypes.byref(self._mod), self._image))
+        self._loaded: dict[int, ctypes.c_void_p] = {}  # device ordinal -> CUmodule (audit: once one, the first device's)
+
+    def _module(self) -> ctypes.c_void_p:
+        ordinal = torch.cuda.current_device()
+        if ordinal not in self._loaded:
+            _check(driver().cuCtxSetCurrent(_context(ordinal)))
+            loaded = ctypes.c_void_p()
+            _check(driver().cuModuleLoadData(ctypes.byref(loaded), self._image))
+            self._loaded[ordinal] = loaded
+        return self._loaded[ordinal]
 
     def __getitem__(self, name):
         f = ctypes.c_void_p()
-        _check(driver().cuModuleGetFunction(ctypes.byref(f), self._mod, name.encode()))
+        _check(driver().cuModuleGetFunction(ctypes.byref(f), self._module(), name.encode()))
         return Kernel(f, self)
 
 
