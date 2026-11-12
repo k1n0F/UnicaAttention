@@ -4965,7 +4965,19 @@ and what production does not need.
 per token with 4 and 8, outliers, fast; shapes 1 × 1, 1 query × 200 keys, one full tile so that the producer's loop
 never runs, a second tile of 1 key, 130 × 129, batch 2 × 3 heads × 129 × 1000, 300 queries × 30 keys):
 
-- memcheck and synccheck: **0 errors**. racecheck: still running at the time of writing.
+- memcheck and synccheck: **0 errors**. racecheck, restricted to unica's kernels (`--kernel-name`; the FP32
+  reference is torch's SDPA, whose own kernel racecheck reports by the thousand): **3 reports, all one pattern, all
+  in the per token layout with 8 computing warps** (PRODUCER and the token scales): the producer's `cp.async.bulk`
+  of a tile's token scales against the softmax's reads of the scales two tiles before, in the same buffer. Not
+  with 4 warps (no producer), not per channel with 8 (no token scales). Two probe kernels
+  (`build/audit_racecheck_unica.txt`; the probes in the session's scratch) tell what it is: racecheck accepts a
+  bulk copy ordered by an mbarrier wait (0 reports; reading before the wait: reported, so it models mbarriers),
+  and it accepts a buffer given back by an arrive from every thread (0 reports), but it reports the same buffer
+  given back by `__syncwarp()` and one arrive from lane 0 (1 report), which is how the producer path gives
+  buffers back (M4.48), as CUTLASS's and FlashAttention 3's pipelines do with one arrive per warp or warpgroup.
+  By PTX's memory model the warp barrier orders every lane's reads before lane 0's release: **racecheck does not
+  follow the ordering through `__syncwarp`; not a race.** The K and V tiles are given back the same way, but
+  read by `ldmatrix`, which racecheck does not track. Bit for bit over runs and against the emulator (tests).
 - **Found: the outliers preset read past its buffers with fewer than 8 keys.** `topk(min(8, n_keys))` gave fewer
   outliers than the kernel reads per head (8, at a fixed stride): an illegal address, which ends the process's CUDA
   context, ComfyUI with it. Fixed: the missing outliers are none (−1) and zero rows.
