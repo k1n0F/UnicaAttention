@@ -1,6 +1,6 @@
 [project]
 name = "unica-attention"
-version = "0.1.0b2"
+version = "0.1.0"
 description = "Attention kernel made for one GPU: RTX 5080 (sm_120)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# the kernels need a CUDA build of torch; any version runs, 2.14 is the tested one (unica.compatibility() says so)
+# the kernels need a CUDA build of torch; any version runs, 2.14 and 2.15 are the tested ones (unica.compatibility() says so)
 dependencies = ["torch"]
 
 [project.urls]

@@ -12,11 +12,13 @@ def judge(**changes):
 def test_the_tested_machine_is_ok():
     assert judge() == (OK, ())
     assert judge(driver=13050).status == OK  # a newer driver runs older cubins
+    assert judge(torch="2.15.0+cu132").status == OK
 
 
 def test_untested_but_runs():
     for changes in ({"gpu": "NVIDIA GeForce RTX 5090"}, {"gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"},
-                    {"driver": 13020}, {"torch": "2.15.0+cu132"}, {"platform": "freebsd"}):
+                    {"driver": 13020}, {"torch": "2.16.0+cu132"}, {"torch": "2.1.0+cu121"},
+                    {"platform": "freebsd"}):
         status = judge(**changes)
         assert status.status == UNTESTED and len(status.reasons) == 1, changes
     assert len(judge(platform="freebsd", gpu="NVIDIA GeForce RTX 5060").reasons) == 2

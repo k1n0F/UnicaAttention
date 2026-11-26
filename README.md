@@ -156,11 +156,11 @@ tests/               against FP32, the emulator and each other, bit for bit wher
 
 ## Use
 
-You need an RTX 5080 or another sm_120 card, a driver for CUDA 13, and PyTorch with CUDA. The package ships the compiled kernels, so nvcc is not needed to run them; it works on Windows and on Linux (checked in WSL2 on the same card). The current release is a beta, so pip needs `--pre`.
+You need an RTX 5080 or another sm_120 card, a driver for CUDA 13, and PyTorch with CUDA. The package ships the compiled kernels, so nvcc is not needed to run them; it works on Windows and on Linux (checked in WSL2 on the same card).
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu132   # first, or pip brings a CPU-only torch
-pip install --pre unica-attention
+pip install unica-attention
 python -m unica                       # is this machine supported? then each mode against FP32
 ```
 

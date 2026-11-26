@@ -18,7 +18,7 @@ MIN_DRIVER = 13000  # the cubins come from CUDA 13.2; a driver for CUDA 12 does 
 # What the kernels have been measured on. Anything else that can load them runs, with a warning.
 TESTED_GPU = "NVIDIA GeForce RTX 5080"
 TESTED_DRIVER = 13040  # 617.14
-TESTED_TORCH = "2.14"
+TESTED_TORCH = ("2.14", "2.15")  # 2.15: the test suite and `python -m unica` on a clean install (LOG release 0.1.0)
 TESTED_PLATFORMS = {"win32", "linux"}  # Linux: WSL2 on the same card (LOG M4.29); a native Linux driver is not yet
 
 OK, UNTESTED, UNSUPPORTED = "ok", "untested", "unsupported"
@@ -69,8 +69,8 @@ def compatibility(found: dict | None = None) -> Compatibility:
                       f"the kernels are built for {'.'.join(map(str, CAPABILITY))} only (RTX 50xx, RTX PRO Blackwell)")
     elif found["gpu"] != TESTED_GPU:
         untested.append(f"{found['gpu']}: same compute capability, measured only on the {TESTED_GPU}")
-    if not found["torch"].startswith(TESTED_TORCH + "."):
-        untested.append(f"torch {found['torch']}, tested with {TESTED_TORCH}")
+    if not found["torch"].startswith(tuple(version + "." for version in TESTED_TORCH)):
+        untested.append(f"torch {found['torch']}, tested with {', '.join(TESTED_TORCH)}")
     if found["platform"] not in TESTED_PLATFORMS:
         untested.append(f"platform {found['platform']}, tested on {', '.join(sorted(TESTED_PLATFORMS))}")
     status = UNSUPPORTED if cannot else UNTESTED if untested else OK

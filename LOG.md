@@ -5022,3 +5022,16 @@ quantizers); of 22 build settings it used 5. Split:
   A test checks that every preset, and the 8-warp layout, builds flash.cu.
 
 All test files pass (12), and `python -m unica`.
+
+## Release 0.1.0 — the first release that is not a beta
+
+0.1.0b2 (2026-11-09) was built before M4.49–M4.55 and the audit; 0.1.0 ships them. Nothing in the kernels changed:
+the version, README's install line (no `--pre`), and the tested torch.
+
+**A clean install now brings torch 2.15**, while `unica.compatibility()` called only 2.14 tested, so every new user
+would have read "untested, may be unstable". Checked on 2.15 in a new venv (torch 2.15.0+cu132 from the PyTorch
+index, no nvcc on PATH): the wheel's `python -m unica` passes all four modes (rel L2 per token 1.58 %, per channel
+1.67 %, outliers 1.66 %, fast 19.26 %), and the whole test suite against the repository passes (61 tests, 1 min 54 s).
+TESTED_TORCH is now 2.14 and 2.15.
+
+The wheel: 7 cubins, 1.4 MB.
